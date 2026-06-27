@@ -15,12 +15,34 @@ pub struct DirectoryRecord {
     pub path: PathBuf,
     pub total_size: u64,
     pub direct_file_count: u64,
+    pub direct_file_size: u64,
     pub descendant_file_count: u64,
 }
 
 impl DirectoryRecord {
     pub fn name(&self) -> String {
         path_label(&self.path)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DirectoryNode {
+    pub record: DirectoryRecord,
+    pub parent: Option<usize>,
+    pub children: Vec<usize>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DirectoryTree {
+    pub root_index: usize,
+    pub nodes: Vec<DirectoryNode>,
+    #[serde(skip, default)]
+    pub path_index: HashMap<PathBuf, usize>,
+}
+
+impl DirectoryTree {
+    pub fn node_index_for_path(&self, path: &std::path::Path) -> Option<usize> {
+        self.path_index.get(path).copied()
     }
 }
 
@@ -42,6 +64,8 @@ pub struct ScanStats {
     pub largest_dirs: Vec<DirectoryRecord>,
     pub extensions: Vec<ExtensionRecord>,
     pub errors: Vec<String>,
+    #[serde(default)]
+    pub directory_tree: Option<DirectoryTree>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -79,6 +103,7 @@ impl ScanAccumulator {
                 path,
                 total_size: 0,
                 direct_file_count: 0,
+                direct_file_size: 0,
                 descendant_file_count: 0,
             },
         );
@@ -104,6 +129,8 @@ impl ScanAccumulator {
             self.record_directory(parent.clone());
             if let Some(parent_record) = self.dir_sizes.get_mut(&parent) {
                 parent_record.direct_file_count += 1;
+                parent_record.direct_file_size =
+                    parent_record.direct_file_size.saturating_add(file.size);
             }
 
             for ancestor in parent.ancestors() {
@@ -130,7 +157,15 @@ impl ScanAccumulator {
         }
     }
 
-    pub fn snapshot(&self) -> ScanStats {
+    pub fn progress_snapshot(&self) -> ScanStats {
+        self.snapshot(false)
+    }
+
+    pub fn final_snapshot(&self) -> ScanStats {
+        self.snapshot(true)
+    }
+
+    fn snapshot(&self, include_tree: bool) -> ScanStats {
         let mut largest_dirs: Vec<_> = self.dir_sizes.values().cloned().collect();
         largest_dirs.sort_by(compare_size_then_path_dir);
         largest_dirs.truncate(250);
@@ -152,6 +187,64 @@ impl ScanAccumulator {
             largest_dirs,
             extensions,
             errors: self.errors.clone(),
+            directory_tree: include_tree.then(|| self.build_directory_tree()),
+        }
+    }
+
+    fn build_directory_tree(&self) -> DirectoryTree {
+        let mut records: Vec<_> = self.dir_sizes.values().cloned().collect();
+        records.sort_by(|left, right| left.path.cmp(&right.path));
+
+        let mut path_index = HashMap::with_capacity(records.len());
+        for (index, record) in records.iter().enumerate() {
+            path_index.insert(record.path.clone(), index);
+        }
+
+        let mut nodes: Vec<_> = records
+            .into_iter()
+            .map(|record| DirectoryNode {
+                record,
+                parent: None,
+                children: Vec::new(),
+            })
+            .collect();
+
+        let root_index = path_index.get(&self.root).copied().unwrap_or(0);
+        let node_count = nodes.len();
+        for index in 0..node_count {
+            if index == root_index {
+                continue;
+            }
+
+            let parent_index = nodes[index]
+                .record
+                .path
+                .parent()
+                .and_then(|parent| path_index.get(parent).copied());
+
+            if let Some(parent_index) = parent_index {
+                nodes[index].parent = Some(parent_index);
+                nodes[parent_index].children.push(index);
+            }
+        }
+
+        let sort_keys: Vec<_> = nodes
+            .iter()
+            .map(|node| (node.record.total_size, node.record.path.clone()))
+            .collect();
+        for node in &mut nodes {
+            node.children.sort_by(|left, right| {
+                sort_keys[*right]
+                    .0
+                    .cmp(&sort_keys[*left].0)
+                    .then_with(|| sort_keys[*left].1.cmp(&sort_keys[*right].1))
+            });
+        }
+
+        DirectoryTree {
+            root_index,
+            nodes,
+            path_index,
         }
     }
 }
@@ -201,4 +294,69 @@ fn compare_size_then_extension(left: &ExtensionRecord, right: &ExtensionRecord) 
         .total_size
         .cmp(&left.total_size)
         .then_with(|| left.extension.cmp(&right.extension))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn directory_tree_preserves_direct_file_sizes() {
+        let root = PathBuf::from("C:\\test-root");
+        let child = root.join("child");
+        let grandchild = child.join("grandchild");
+        let mut accumulator = ScanAccumulator::new(root.clone());
+        accumulator.record_directory(child.clone());
+        accumulator.record_directory(grandchild.clone());
+        accumulator.record_file(FileRecord {
+            path: root.join("root.bin"),
+            size: 10,
+            modified: None,
+            extension: ".bin".to_owned(),
+        });
+        accumulator.record_file(FileRecord {
+            path: child.join("child.bin"),
+            size: 20,
+            modified: None,
+            extension: ".bin".to_owned(),
+        });
+        accumulator.record_file(FileRecord {
+            path: grandchild.join("grandchild.bin"),
+            size: 30,
+            modified: None,
+            extension: ".bin".to_owned(),
+        });
+
+        let stats = accumulator.final_snapshot();
+        let tree = stats.directory_tree.as_ref().unwrap();
+        assert_directory_size_invariant(tree, tree.root_index);
+
+        let root_node = &tree.nodes[tree.node_index_for_path(&root).unwrap()];
+        assert_eq!(root_node.record.direct_file_size, 10);
+        assert_eq!(root_node.record.total_size, 60);
+
+        let child_node = &tree.nodes[tree.node_index_for_path(&child).unwrap()];
+        assert_eq!(child_node.record.direct_file_size, 20);
+        assert_eq!(child_node.record.total_size, 50);
+
+        let grandchild_node = &tree.nodes[tree.node_index_for_path(&grandchild).unwrap()];
+        assert_eq!(grandchild_node.record.direct_file_size, 30);
+        assert_eq!(grandchild_node.record.total_size, 30);
+    }
+
+    fn assert_directory_size_invariant(tree: &DirectoryTree, index: usize) -> u64 {
+        let node = &tree.nodes[index];
+        let child_total: u64 = node
+            .children
+            .iter()
+            .map(|child| assert_directory_size_invariant(tree, *child))
+            .sum();
+        assert_eq!(
+            node.record.total_size,
+            node.record.direct_file_size + child_total,
+            "size invariant failed for {}",
+            node.record.path.display()
+        );
+        node.record.total_size
+    }
 }

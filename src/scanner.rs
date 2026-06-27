@@ -38,7 +38,7 @@ pub enum ScanEvent {
 
 #[derive(Debug, Clone)]
 pub struct ScanProgress {
-    pub stats: ScanStats,
+    pub stats: Arc<ScanStats>,
     pub current_path: Option<PathBuf>,
     pub finished: bool,
     pub cancelled: bool,
@@ -46,7 +46,7 @@ pub struct ScanProgress {
 
 #[derive(Debug, Clone)]
 pub struct ScanFinished {
-    pub stats: ScanStats,
+    pub stats: Arc<ScanStats>,
     pub cancelled: bool,
 }
 
@@ -105,7 +105,7 @@ pub fn spawn_scan(options: ScanOptions) -> ScanHandle {
                         entries_since_update = 0;
                         last_progress_at = Instant::now();
                         let _ = sender.send(ScanEvent::Progress(ScanProgress {
-                            stats: accumulator.snapshot(),
+                            stats: Arc::new(accumulator.progress_snapshot()),
                             current_path: Some(entry.path().to_path_buf()),
                             finished: false,
                             cancelled: false,
@@ -119,9 +119,9 @@ pub fn spawn_scan(options: ScanOptions) -> ScanHandle {
             }
         }
 
-        let final_stats = accumulator.snapshot();
+        let final_stats = Arc::new(accumulator.final_snapshot());
         let _ = sender.send(ScanEvent::Progress(ScanProgress {
-            stats: final_stats.clone(),
+            stats: Arc::new(accumulator.progress_snapshot()),
             current_path: None,
             finished: true,
             cancelled,

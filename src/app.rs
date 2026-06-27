@@ -1,6 +1,7 @@
 use std::{
     cmp::Ordering,
     path::{Path, PathBuf},
+    sync::Arc,
     time::Duration,
 };
 
@@ -8,7 +9,7 @@ use eframe::egui::{self, RichText};
 
 use crate::{
     format,
-    model::{DirectoryRecord, ExtensionRecord, FileRecord, ScanStats},
+    model::{DirectoryRecord, DirectoryTree, ExtensionRecord, FileRecord, ScanStats},
     scanner::{ScanEvent, ScanFinished, ScanHandle, ScanOptions, ScanProgress, spawn_scan},
     treemap::{TreemapAction, TreemapItem, draw_treemap},
 };
@@ -19,7 +20,7 @@ pub struct CDriveManagerApp {
     scan_in_progress: bool,
     cancel_requested: bool,
     progress: Option<ScanProgress>,
-    stats: Option<ScanStats>,
+    stats: Option<Arc<ScanStats>>,
     status_message: String,
     selected_tab: ResultTab,
     search_query: String,
@@ -250,10 +251,12 @@ impl CDriveManagerApp {
         self.scan_handle = None;
     }
 
-    fn current_stats(&self) -> Option<&ScanStats> {
-        self.stats
-            .as_ref()
-            .or_else(|| self.progress.as_ref().map(|progress| &progress.stats))
+    fn current_stats(&self) -> Option<Arc<ScanStats>> {
+        self.stats.as_ref().map(Arc::clone).or_else(|| {
+            self.progress
+                .as_ref()
+                .map(|progress| Arc::clone(&progress.stats))
+        })
     }
 
     fn draw_top_bar(&mut self, ctx: &egui::Context) {
@@ -410,14 +413,34 @@ impl CDriveManagerApp {
     }
 
     fn draw_treemap_panel(&mut self, ui: &mut egui::Ui, stats: &ScanStats) {
+        let Some(tree) = stats.directory_tree.as_ref() else {
+            ui.heading("空间占用图");
+            ui.label(
+                RichText::new(
+                    "完整目录树会在扫描完成或取消后生成。扫描中仍可查看下方 Top 结果列表。",
+                )
+                .small()
+                .weak(),
+            );
+            draw_treemap(
+                ui,
+                &[],
+                stats.total_size,
+                "完整目录树会在扫描完成或取消后显示",
+            );
+            return;
+        };
+
         let current_dir = self.treemap_current_dir(stats);
-        let current_size = treemap_current_size(stats, &current_dir);
-        let treemap_dirs = treemap_child_dirs(stats, &current_dir);
-        let treemap_items: Vec<TreemapItem> = treemap_dirs
-            .iter()
-            .take(36)
-            .map(|dir| TreemapItem::from(*dir))
-            .collect();
+        let current_index = tree
+            .node_index_for_path(&current_dir)
+            .unwrap_or(tree.root_index);
+        let current_node = &tree.nodes[current_index];
+        let current_size = current_node.record.total_size;
+        let child_count = current_node.children.len();
+        let mut treemap_items = treemap_items_for_node(tree, current_index);
+        let item_count = treemap_items.len();
+        treemap_items.truncate(36);
 
         ui.horizontal_wrapped(|ui| {
             ui.heading("空间占用图");
@@ -443,16 +466,18 @@ impl CDriveManagerApp {
         );
         ui.label(
             RichText::new(format!(
-                "显示当前目录下已保留的最大直接子目录：{} / {}，当前目录大小 {}。",
+                "完整目录树：{} 个直接子目录，直属文件 {} 个 / {}，Treemap 显示前 {} / {} 个块。",
+                format::count(child_count as u64),
+                format::count(current_node.record.direct_file_count),
+                format::bytes(current_node.record.direct_file_size),
                 format::count(treemap_items.len() as u64),
-                format::count(treemap_dirs.len() as u64),
-                format::bytes(current_size)
+                format::count(item_count as u64),
             ))
             .small()
             .weak(),
         );
         ui.label(
-            RichText::new("提示：Treemap 下钻基于当前保留的最大 250 个目录，可能不是完整目录树；不包含直属大文件的单独块。")
+            RichText::new("提示：Treemap 基于完整目录树；为保持可读性，矩形图最多显示当前目录下最大的 36 个块。")
                 .small()
                 .weak(),
         );
@@ -460,7 +485,7 @@ impl CDriveManagerApp {
         let empty_message = if stats.total_size == 0 {
             "扫描后显示目录空间占用图"
         } else {
-            "当前目录没有可显示的已保留子目录\n可能子目录未进入 Top 250，或空间主要来自直属文件"
+            "当前目录没有可显示的子目录或直属文件"
         };
 
         if let Some(action) = draw_treemap(ui, &treemap_items, current_size, empty_message) {
@@ -469,6 +494,11 @@ impl CDriveManagerApp {
     }
 
     fn treemap_current_dir(&mut self, stats: &ScanStats) -> PathBuf {
+        let Some(tree) = stats.directory_tree.as_ref() else {
+            self.treemap_current_dir = None;
+            return stats.root.clone();
+        };
+
         let Some(current) = &self.treemap_current_dir else {
             return stats.root.clone();
         };
@@ -477,8 +507,8 @@ impl CDriveManagerApp {
             return stats.root.clone();
         }
 
-        let exists = current.starts_with(&stats.root)
-            && stats.largest_dirs.iter().any(|dir| dir.path == *current);
+        let exists =
+            current.starts_with(&stats.root) && tree.node_index_for_path(current).is_some();
         if exists {
             current.clone()
         } else {
@@ -515,7 +545,7 @@ impl eframe::App for CDriveManagerApp {
             .default_width(300.0)
             .show(ctx, |ui| {
                 if let Some(stats) = self.current_stats() {
-                    self.draw_summary(ui, stats);
+                    self.draw_summary(ui, stats.as_ref());
                 } else {
                     ui.heading("概览");
                     ui.label("点击“开始扫描”后，这里会显示统计信息。");
@@ -525,7 +555,7 @@ impl eframe::App for CDriveManagerApp {
             });
 
         egui::CentralPanel::default().show(ctx, |ui| {
-            let Some(stats) = self.current_stats().cloned() else {
+            let Some(stats) = self.current_stats() else {
                 ui.vertical_centered(|ui| {
                     ui.add_space(80.0);
                     ui.heading("参考 WinDirStat / QDirStat 的 Rust 桌面空间分析工具");
@@ -535,10 +565,10 @@ impl eframe::App for CDriveManagerApp {
                 return;
             };
 
-            self.draw_treemap_panel(ui, &stats);
+            self.draw_treemap_panel(ui, stats.as_ref());
 
             ui.separator();
-            self.draw_tabs(ui, &stats);
+            self.draw_tabs(ui, stats.as_ref());
         });
     }
 }
@@ -563,34 +593,36 @@ fn tab_button(ui: &mut egui::Ui, selected: &mut ResultTab, value: ResultTab, lab
     }
 }
 
-fn treemap_current_size(stats: &ScanStats, current_dir: &Path) -> u64 {
-    if current_dir == stats.root {
-        return stats.total_size;
-    }
-
-    stats
-        .largest_dirs
+fn treemap_items_for_node(tree: &DirectoryTree, node_index: usize) -> Vec<TreemapItem> {
+    let node = &tree.nodes[node_index];
+    let mut items: Vec<_> = node
+        .children
         .iter()
-        .find(|dir| dir.path == current_dir)
-        .map(|dir| dir.total_size)
-        .unwrap_or(0)
-}
-
-fn treemap_child_dirs<'a>(stats: &'a ScanStats, current_dir: &Path) -> Vec<&'a DirectoryRecord> {
-    let mut children: Vec<_> = stats
-        .largest_dirs
-        .iter()
-        .filter(|dir| dir.path != current_dir)
-        .filter(|dir| dir.path.parent() == Some(current_dir))
+        .filter_map(|child_index| tree.nodes.get(*child_index))
+        .map(|child| {
+            TreemapItem::directory(
+                child.record.name(),
+                child.record.path.clone(),
+                child.record.total_size,
+            )
+        })
         .collect();
 
-    children.sort_by(|left, right| {
+    if node.record.direct_file_size > 0 {
+        items.push(TreemapItem::direct_files(
+            node.record.path.clone(),
+            node.record.direct_file_count,
+            node.record.direct_file_size,
+        ));
+    }
+
+    items.sort_by(|left, right| {
         right
-            .total_size
-            .cmp(&left.total_size)
-            .then_with(|| left.path.cmp(&right.path))
+            .size
+            .cmp(&left.size)
+            .then_with(|| left.label.cmp(&right.label))
     });
-    children
+    items
 }
 
 fn treemap_parent_dir(stats: &ScanStats, current_dir: &Path) -> PathBuf {

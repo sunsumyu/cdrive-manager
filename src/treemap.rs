@@ -2,13 +2,80 @@ use std::path::PathBuf;
 
 use egui::{Align2, Color32, FontId, Pos2, Rect, Sense, Stroke, Ui, Vec2};
 
-use crate::{format, model::DirectoryRecord};
+use crate::format;
 
 #[derive(Debug, Clone)]
 pub struct TreemapItem {
     pub label: String,
-    pub path: PathBuf,
     pub size: u64,
+    pub kind: TreemapItemKind,
+}
+
+#[derive(Debug, Clone)]
+pub enum TreemapItemKind {
+    Directory { path: PathBuf },
+    DirectFiles { dir: PathBuf, file_count: u64 },
+}
+
+impl TreemapItem {
+    pub fn directory(label: String, path: PathBuf, size: u64) -> Self {
+        Self {
+            label,
+            size,
+            kind: TreemapItemKind::Directory { path },
+        }
+    }
+
+    pub fn direct_files(dir: PathBuf, file_count: u64, size: u64) -> Self {
+        Self {
+            label: format!("直属文件 ({})", format::count(file_count)),
+            size,
+            kind: TreemapItemKind::DirectFiles { dir, file_count },
+        }
+    }
+
+    fn path(&self) -> &PathBuf {
+        match &self.kind {
+            TreemapItemKind::Directory { path } => path,
+            TreemapItemKind::DirectFiles { dir, .. } => dir,
+        }
+    }
+
+    fn can_enter(&self) -> bool {
+        matches!(self.kind, TreemapItemKind::Directory { .. })
+    }
+
+    fn type_label(&self) -> &'static str {
+        match self.kind {
+            TreemapItemKind::Directory { .. } => "目录",
+            TreemapItemKind::DirectFiles { .. } => "直属文件合计",
+        }
+    }
+
+    fn hover_text(&self, total_size: u64) -> String {
+        let mut lines = vec![
+            self.label.clone(),
+            self.type_label().to_owned(),
+            self.path().display().to_string(),
+            format!(
+                "{} ({})",
+                format::bytes(self.size),
+                format::percent(self.size, total_size)
+            ),
+        ];
+
+        match &self.kind {
+            TreemapItemKind::Directory { .. } => {
+                lines.push("左键进入目录，右键查看更多操作".to_owned());
+            }
+            TreemapItemKind::DirectFiles { file_count, .. } => {
+                lines.push(format!("直属文件数：{}", format::count(*file_count)));
+                lines.push("右键可复制或打开当前目录".to_owned());
+            }
+        }
+
+        lines.join("\n")
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -16,16 +83,6 @@ pub enum TreemapAction {
     Enter(PathBuf),
     CopyPath(PathBuf),
     OpenLocation(PathBuf),
-}
-
-impl From<&DirectoryRecord> for TreemapItem {
-    fn from(value: &DirectoryRecord) -> Self {
-        Self {
-            label: value.name(),
-            path: value.path.clone(),
-            size: value.total_size,
-        }
-    }
 }
 
 pub fn draw_treemap(
@@ -77,7 +134,10 @@ pub fn draw_treemap(
             continue;
         }
 
-        let color = palette(index);
+        let color = match item.kind {
+            TreemapItemKind::Directory { .. } => palette(index),
+            TreemapItemKind::DirectFiles { .. } => Color32::from_rgb(96, 125, 139),
+        };
         painter.rect_filled(item_rect, 4.0, color);
         painter.rect_stroke(
             item_rect,
@@ -86,40 +146,33 @@ pub fn draw_treemap(
             egui::StrokeKind::Inside,
         );
 
-        let path_text = item.path.display().to_string();
         let response = ui
             .interact(
                 item_rect,
-                ui.make_persistent_id(("treemap", index, &item.path)),
+                ui.make_persistent_id(("treemap", index, item.path(), item.type_label())),
                 Sense::click(),
             )
-            .on_hover_text(format!(
-                "{}\n{}\n{} ({})\n左键进入目录，右键查看更多操作",
-                item.label,
-                path_text,
-                format::bytes(item.size),
-                format::percent(item.size, total_size)
-            ));
+            .on_hover_text(item.hover_text(total_size));
 
-        if response.clicked() {
-            action = Some(TreemapAction::Enter(item.path.clone()));
+        if response.clicked() && item.can_enter() {
+            action = Some(TreemapAction::Enter(item.path().clone()));
         }
 
         response.context_menu(|ui| {
-            if ui.button("进入目录").clicked() {
-                action = Some(TreemapAction::Enter(item.path.clone()));
+            if item.can_enter() && ui.button("进入目录").clicked() {
+                action = Some(TreemapAction::Enter(item.path().clone()));
                 ui.close();
             }
 
             if ui.button("复制路径").clicked() {
-                action = Some(TreemapAction::CopyPath(item.path.clone()));
+                action = Some(TreemapAction::CopyPath(item.path().clone()));
                 ui.close();
             }
 
             ui.separator();
 
             if ui.button("打开位置").clicked() {
-                action = Some(TreemapAction::OpenLocation(item.path.clone()));
+                action = Some(TreemapAction::OpenLocation(item.path().clone()));
                 ui.close();
             }
         });
