@@ -1,4 +1,5 @@
 mod app;
+mod cleanup;
 mod format;
 mod model;
 mod scanner;

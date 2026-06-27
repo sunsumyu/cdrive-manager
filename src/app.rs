@@ -11,6 +11,10 @@ use eframe::egui::{self, RichText};
 use rfd::FileDialog;
 
 use crate::{
+    cleanup::{
+        CleanupCandidate, CleanupPreview, CleanupPreviewEvent, CleanupPreviewFinished,
+        CleanupPreviewHandle, CleanupPreviewOptions, CleanupPreviewProgress, spawn_cleanup_preview,
+    },
     format,
     model::{DirectoryRecord, DirectoryTree, ExtensionRecord, FileRecord, ScanStats},
     scanner::{ScanEvent, ScanFinished, ScanHandle, ScanOptions, ScanProgress, spawn_scan},
@@ -24,12 +28,18 @@ pub struct CDriveManagerApp {
     cancel_requested: bool,
     progress: Option<ScanProgress>,
     stats: Option<Arc<ScanStats>>,
+    cleanup_handle: Option<CleanupPreviewHandle>,
+    cleanup_in_progress: bool,
+    cleanup_cancel_requested: bool,
+    cleanup_progress: Option<CleanupPreviewProgress>,
+    cleanup_preview: Option<Arc<CleanupPreview>>,
     status_message: String,
     selected_tab: ResultTab,
     search_query: String,
     directory_sort: SortState<DirectorySortKey>,
     file_sort: SortState<FileSortKey>,
     extension_sort: SortState<ExtensionSortKey>,
+    cleanup_sort: SortState<CleanupSortKey>,
     treemap_current_dir: Option<PathBuf>,
 }
 
@@ -38,6 +48,7 @@ enum ResultTab {
     Directories,
     Files,
     Types,
+    CleanupPreview,
     Errors,
 }
 
@@ -112,6 +123,15 @@ enum ExtensionSortKey {
     FileCount,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CleanupSortKey {
+    Rule,
+    Risk,
+    Protected,
+    Size,
+    Path,
+}
+
 impl CDriveManagerApp {
     pub fn new(_cc: &eframe::CreationContext<'_>) -> Self {
         Self {
@@ -121,12 +141,18 @@ impl CDriveManagerApp {
             cancel_requested: false,
             progress: None,
             stats: None,
+            cleanup_handle: None,
+            cleanup_in_progress: false,
+            cleanup_cancel_requested: false,
+            cleanup_progress: None,
+            cleanup_preview: None,
             status_message: "准备扫描。第一版只分析空间占用，不删除任何文件。".to_owned(),
             selected_tab: ResultTab::Directories,
             search_query: String::new(),
             directory_sort: SortState::new(DirectorySortKey::Size, SortDirection::Desc),
             file_sort: SortState::new(FileSortKey::Size, SortDirection::Desc),
             extension_sort: SortState::new(ExtensionSortKey::Size, SortDirection::Desc),
+            cleanup_sort: SortState::new(CleanupSortKey::Size, SortDirection::Desc),
             treemap_current_dir: None,
         }
     }
@@ -141,6 +167,8 @@ impl CDriveManagerApp {
         self.cancel_requested = false;
         self.progress = None;
         self.stats = None;
+        self.cleanup_preview = None;
+        self.cleanup_progress = None;
         self.treemap_current_dir = None;
         self.status_message = format!("正在后台扫描：{}", root.display());
     }
@@ -150,6 +178,35 @@ impl CDriveManagerApp {
             handle.cancel();
             self.cancel_requested = true;
             self.status_message = "正在取消扫描，已扫描结果会保留……".to_owned();
+        }
+    }
+
+    fn start_cleanup_preview(&mut self) {
+        let Some(stats) = self.stats.as_ref() else {
+            self.status_message = "请先完成扫描或打开已保存的扫描结果，再生成清理预览。".to_owned();
+            return;
+        };
+
+        let root = stats.root.clone();
+        self.cleanup_handle = Some(spawn_cleanup_preview(CleanupPreviewOptions {
+            root: root.clone(),
+        }));
+        self.cleanup_in_progress = true;
+        self.cleanup_cancel_requested = false;
+        self.cleanup_progress = None;
+        self.cleanup_preview = None;
+        self.selected_tab = ResultTab::CleanupPreview;
+        self.status_message = format!(
+            "正在生成 dry-run 清理预览：{}。不会删除、移动或修改任何文件。",
+            root.display()
+        );
+    }
+
+    fn cancel_cleanup_preview(&mut self) {
+        if let Some(handle) = &self.cleanup_handle {
+            handle.cancel();
+            self.cleanup_cancel_requested = true;
+            self.status_message = "正在取消清理预览，已发现的候选会保留……".to_owned();
         }
     }
 
@@ -229,6 +286,11 @@ impl CDriveManagerApp {
                 self.scan_in_progress = false;
                 self.cancel_requested = false;
                 self.scan_handle = None;
+                self.cleanup_preview = None;
+                self.cleanup_progress = None;
+                self.cleanup_in_progress = false;
+                self.cleanup_cancel_requested = false;
+                self.cleanup_handle = None;
                 self.treemap_current_dir = None;
                 self.status_message = format!("已打开扫描结果：{}", path.display());
             }
@@ -263,6 +325,32 @@ impl CDriveManagerApp {
         }
     }
 
+    fn export_cleanup_preview_csv(&mut self) {
+        let Some(preview) = self.current_cleanup_preview() else {
+            self.status_message = "没有可导出的清理预览。".to_owned();
+            return;
+        };
+
+        let Some(path) = FileDialog::new()
+            .set_title("导出清理预览 CSV")
+            .add_filter("CSV 报告", &["csv"])
+            .set_file_name("cdrive-cleanup-preview.csv")
+            .save_file()
+        else {
+            return;
+        };
+
+        match export_cleanup_preview_to_path(&path, preview.as_ref()) {
+            Ok(summary) => {
+                self.status_message =
+                    format!("已导出清理预览 CSV：{} ({})", path.display(), summary);
+            }
+            Err(error) => {
+                self.status_message = format!("导出清理预览失败：{} ({:#})", path.display(), error);
+            }
+        }
+    }
+
     fn poll_scan_events(&mut self, ctx: &egui::Context) {
         let Some(receiver) = self
             .scan_handle
@@ -291,6 +379,38 @@ impl CDriveManagerApp {
         }
 
         if self.scan_in_progress {
+            ctx.request_repaint_after(Duration::from_millis(120));
+        }
+    }
+
+    fn poll_cleanup_preview_events(&mut self, ctx: &egui::Context) {
+        let Some(receiver) = self
+            .cleanup_handle
+            .as_ref()
+            .map(|handle| handle.receiver.clone())
+        else {
+            return;
+        };
+
+        let mut latest_progress = None;
+        let mut finished = None;
+
+        while let Ok(event) = receiver.try_recv() {
+            match event {
+                CleanupPreviewEvent::Progress(progress) => latest_progress = Some(progress),
+                CleanupPreviewEvent::Finished(result) => finished = Some(result),
+            }
+        }
+
+        if let Some(progress) = latest_progress {
+            self.apply_cleanup_preview_progress(progress);
+        }
+
+        if let Some(result) = finished {
+            self.apply_cleanup_preview_finished(result);
+        }
+
+        if self.cleanup_in_progress {
             ctx.request_repaint_after(Duration::from_millis(120));
         }
     }
@@ -330,11 +450,58 @@ impl CDriveManagerApp {
         self.scan_handle = None;
     }
 
+    fn apply_cleanup_preview_progress(&mut self, progress: CleanupPreviewProgress) {
+        self.status_message = if progress.cancelled {
+            "清理预览已取消，当前显示的是部分 dry-run 结果。".to_owned()
+        } else if progress.finished {
+            "清理预览完成。".to_owned()
+        } else if let Some(path) = &progress.current_path {
+            format!("正在预览：{}", path.display())
+        } else {
+            "正在生成清理预览……".to_owned()
+        };
+        self.cleanup_progress = Some(progress);
+    }
+
+    fn apply_cleanup_preview_finished(&mut self, result: CleanupPreviewFinished) {
+        self.status_message = if result.cancelled {
+            format!(
+                "清理预览已取消：{} 下发现 {} 个候选，dry-run 预计可清理 {}，受保护 {}，错误 {} 条。",
+                result.preview.root.display(),
+                format::count(result.preview.candidate_count),
+                format::bytes(result.preview.reclaimable_size),
+                format::bytes(result.preview.protected_size),
+                format::count(result.preview.error_count)
+            )
+        } else {
+            format!(
+                "清理预览完成：{} 下发现 {} 个候选，dry-run 预计可清理 {}，受保护 {}，错误 {} 条。当前版本不会执行清理。",
+                result.preview.root.display(),
+                format::count(result.preview.candidate_count),
+                format::bytes(result.preview.reclaimable_size),
+                format::bytes(result.preview.protected_size),
+                format::count(result.preview.error_count)
+            )
+        };
+        self.cleanup_preview = Some(result.preview);
+        self.cleanup_in_progress = false;
+        self.cleanup_cancel_requested = false;
+        self.cleanup_handle = None;
+    }
+
     fn current_stats(&self) -> Option<Arc<ScanStats>> {
         self.stats.as_ref().map(Arc::clone).or_else(|| {
             self.progress
                 .as_ref()
                 .map(|progress| Arc::clone(&progress.stats))
+        })
+    }
+
+    fn current_cleanup_preview(&self) -> Option<Arc<CleanupPreview>> {
+        self.cleanup_preview.as_ref().map(Arc::clone).or_else(|| {
+            self.cleanup_progress
+                .as_ref()
+                .map(|progress| Arc::clone(&progress.preview))
         })
     }
 
@@ -348,19 +515,26 @@ impl CDriveManagerApp {
                 if input.lost_focus()
                     && ui.input(|input| input.key_pressed(egui::Key::Enter))
                     && !self.scan_in_progress
+                    && !self.cleanup_in_progress
                 {
                     self.start_scan();
                 }
 
                 if ui
-                    .add_enabled(!self.scan_in_progress, egui::Button::new("选择目录"))
+                    .add_enabled(
+                        !self.scan_in_progress && !self.cleanup_in_progress,
+                        egui::Button::new("选择目录"),
+                    )
                     .clicked()
                 {
                     self.choose_directory();
                 }
 
                 if ui
-                    .add_enabled(!self.scan_in_progress, egui::Button::new("开始扫描"))
+                    .add_enabled(
+                        !self.scan_in_progress && !self.cleanup_in_progress,
+                        egui::Button::new("开始扫描"),
+                    )
                     .clicked()
                 {
                     self.start_scan();
@@ -379,7 +553,10 @@ impl CDriveManagerApp {
                 ui.separator();
 
                 if ui
-                    .add_enabled(!self.scan_in_progress, egui::Button::new("打开结果"))
+                    .add_enabled(
+                        !self.scan_in_progress && !self.cleanup_in_progress,
+                        egui::Button::new("打开结果"),
+                    )
                     .clicked()
                 {
                     self.open_scan_result();
@@ -388,7 +565,7 @@ impl CDriveManagerApp {
                 let has_final_stats = self.stats.is_some();
                 if ui
                     .add_enabled(
-                        !self.scan_in_progress && has_final_stats,
+                        !self.scan_in_progress && !self.cleanup_in_progress && has_final_stats,
                         egui::Button::new("保存结果"),
                     )
                     .clicked()
@@ -398,7 +575,7 @@ impl CDriveManagerApp {
 
                 if ui
                     .add_enabled(
-                        !self.scan_in_progress && has_final_stats,
+                        !self.scan_in_progress && !self.cleanup_in_progress && has_final_stats,
                         egui::Button::new("导出 CSV"),
                     )
                     .clicked()
@@ -406,12 +583,52 @@ impl CDriveManagerApp {
                     self.export_csv_report();
                 }
 
-                if self.scan_in_progress {
+                ui.separator();
+
+                if ui
+                    .add_enabled(
+                        !self.scan_in_progress && !self.cleanup_in_progress && has_final_stats,
+                        egui::Button::new("生成清理预览"),
+                    )
+                    .clicked()
+                {
+                    self.start_cleanup_preview();
+                }
+
+                if ui
+                    .add_enabled(
+                        self.cleanup_in_progress && !self.cleanup_cancel_requested,
+                        egui::Button::new("取消预览"),
+                    )
+                    .clicked()
+                {
+                    self.cancel_cleanup_preview();
+                }
+
+                if ui
+                    .add_enabled(
+                        !self.scan_in_progress
+                            && !self.cleanup_in_progress
+                            && self.current_cleanup_preview().is_some(),
+                        egui::Button::new("导出预览 CSV"),
+                    )
+                    .clicked()
+                {
+                    self.export_cleanup_preview_csv();
+                }
+
+                if self.scan_in_progress || self.cleanup_in_progress {
                     ui.spinner();
-                    let text = if self.cancel_requested {
-                        "取消中"
+                    let text = if self.scan_in_progress {
+                        if self.cancel_requested {
+                            "取消扫描中"
+                        } else {
+                            "扫描中"
+                        }
+                    } else if self.cleanup_cancel_requested {
+                        "取消预览中"
                     } else {
-                        "扫描中"
+                        "预览中"
                     };
                     ui.label(RichText::new(text).strong());
                 }
@@ -453,11 +670,34 @@ impl CDriveManagerApp {
                         );
                     }
                 }
+
+                if let Some(preview) = self.current_cleanup_preview() {
+                    label_value(ui, "预览候选", format::count(preview.candidate_count));
+                    label_value(ui, "预计可清理", format::bytes(preview.reclaimable_size));
+                    label_value(ui, "受保护候选", format::bytes(preview.protected_size));
+                    if self.cleanup_in_progress {
+                        let state = if self.cleanup_cancel_requested {
+                            "正在取消预览"
+                        } else {
+                            "正在预览"
+                        };
+                        label_value(ui, "预览状态", state.to_owned());
+                    }
+                }
             });
         ui.add_space(8.0);
-        ui.label(RichText::new("安全提示：当前版本只分析空间占用，不提供删除功能。").small());
+        ui.label(
+            RichText::new(
+                "安全提示：当前版本只分析空间占用，并且清理功能仅 dry-run 预览，不提供删除功能。",
+            )
+            .small(),
+        );
         if self.scan_in_progress {
             ui.label(RichText::new("进度提示：程序不预扫描总文件数，因此不显示百分比。列表会持续刷新已扫描到的部分结果。").small());
+        }
+        if self.cleanup_in_progress {
+            ui.label(RichText::new("清理预览提示：预览只读取文件元数据，不删除、移动或修改任何文件。受保护候选不计入预计可清理空间。")
+                .small());
         }
     }
 
@@ -471,6 +711,12 @@ impl CDriveManagerApp {
             );
             tab_button(ui, &mut self.selected_tab, ResultTab::Files, "最大文件");
             tab_button(ui, &mut self.selected_tab, ResultTab::Types, "文件类型");
+            tab_button(
+                ui,
+                &mut self.selected_tab,
+                ResultTab::CleanupPreview,
+                "清理预览",
+            );
             tab_button(ui, &mut self.selected_tab, ResultTab::Errors, "错误");
         });
         ui.separator();
@@ -495,6 +741,13 @@ impl CDriveManagerApp {
             ResultTab::Types => {
                 extension_table(ui, stats, &self.search_query, &mut self.extension_sort)
             }
+            ResultTab::CleanupPreview => cleanup_preview_table(
+                ui,
+                self.current_cleanup_preview().as_deref(),
+                &self.search_query,
+                &mut self.cleanup_sort,
+                &mut self.status_message,
+            ),
             ResultTab::Errors => error_list(ui, stats, &self.search_query),
         }
     }
@@ -647,6 +900,7 @@ impl CDriveManagerApp {
 impl eframe::App for CDriveManagerApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_scan_events(ctx);
+        self.poll_cleanup_preview_events(ctx);
         self.draw_top_bar(ctx);
 
         egui::SidePanel::left("summary_panel")
@@ -1271,14 +1525,217 @@ fn compare_directories_for_export(left: &DirectoryRecord, right: &DirectoryRecor
 }
 
 fn modified_unix_secs(file: &FileRecord) -> String {
-    file.modified
-        .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+    system_time_unix_secs(file.modified)
+}
+
+fn system_time_unix_secs(time: Option<std::time::SystemTime>) -> String {
+    time.and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
         .map(|duration| duration.as_secs().to_string())
         .unwrap_or_default()
 }
 
 fn path_text(path: &Path) -> String {
     path.display().to_string()
+}
+
+fn export_cleanup_preview_to_path(path: &Path, preview: &CleanupPreview) -> anyhow::Result<String> {
+    let file = File::create(path)?;
+    let mut writer = BufWriter::new(file);
+
+    write_csv_row(
+        &mut writer,
+        [
+            "mode",
+            "action_taken",
+            "rule_id",
+            "rule_label",
+            "risk",
+            "protected",
+            "candidate_kind",
+            "path",
+            "size_bytes",
+            "size_display",
+            "modified_unix_secs",
+            "reason",
+        ],
+    )?;
+
+    for candidate in &preview.candidates {
+        write_cleanup_candidate_csv_row(&mut writer, candidate)?;
+    }
+
+    writer.flush()?;
+
+    Ok(format!(
+        "dry-run，保留 {} / 总计 {} 个候选，候选总大小 {}，预计可清理 {}，受保护 {} 个 / {}",
+        format::count(preview.candidates.len() as u64),
+        format::count(preview.candidate_count),
+        format::bytes(preview.total_candidate_size),
+        format::bytes(preview.reclaimable_size),
+        format::count(preview.protected_count),
+        format::bytes(preview.protected_size)
+    ))
+}
+
+fn write_cleanup_candidate_csv_row(
+    writer: &mut impl Write,
+    candidate: &CleanupCandidate,
+) -> anyhow::Result<()> {
+    write_csv_row(
+        writer,
+        [
+            "dry-run".to_owned(),
+            "none".to_owned(),
+            candidate.rule_id.to_owned(),
+            candidate.rule_label.to_owned(),
+            candidate.risk.as_str().to_owned(),
+            candidate.protected.to_string(),
+            candidate.kind.as_str().to_owned(),
+            path_text(&candidate.path),
+            candidate.size.to_string(),
+            format::bytes(candidate.size),
+            system_time_unix_secs(candidate.modified),
+            candidate.reason.clone(),
+        ],
+    )
+}
+
+fn cleanup_preview_table(
+    ui: &mut egui::Ui,
+    preview: Option<&CleanupPreview>,
+    search_query: &str,
+    sort: &mut SortState<CleanupSortKey>,
+    status_message: &mut String,
+) {
+    let Some(preview) = preview else {
+        ui.label("点击“生成清理预览”后，这里会显示 dry-run 候选。当前版本不会删除任何文件。");
+        return;
+    };
+
+    ui.label(
+        RichText::new(format!(
+            "Dry-run 预览：根目录 {}，候选总大小 {}，预计可清理 {}，受保护 {} 个 / {}。总候选 {} 个，访问错误 {} 个。当前版本不提供执行清理功能。",
+            preview.root.display(),
+            format::bytes(preview.total_candidate_size),
+            format::bytes(preview.reclaimable_size),
+            format::count(preview.protected_count),
+            format::bytes(preview.protected_size),
+            format::count(preview.candidate_count),
+            format::count(preview.error_count)
+        ))
+        .small()
+        .strong(),
+    );
+    ui.label(
+        RichText::new("受保护候选会显示在列表中，但不会计入预计可清理空间。")
+            .small()
+            .weak(),
+    );
+    if !preview.errors.is_empty() {
+        ui.label(
+            RichText::new(format!(
+                "预览过程中记录了 {} 条访问错误，当前保留 {} 条；可在导出报告前先确认扫描权限。",
+                format::count(preview.error_count),
+                format::count(preview.errors.len() as u64)
+            ))
+            .small()
+            .weak(),
+        );
+    }
+
+    let query = normalized_query(search_query);
+    let mut candidates: Vec<_> = preview
+        .candidates
+        .iter()
+        .filter(|candidate| cleanup_candidate_matches(candidate, &query))
+        .collect();
+    candidates.sort_by(|left, right| compare_cleanup_candidates(left, right, *sort));
+
+    result_count_label(
+        ui,
+        candidates.len().min(120),
+        candidates.len(),
+        preview.candidates.len(),
+        "候选",
+    );
+
+    if candidates.is_empty() {
+        ui.label("没有匹配的清理预览候选。 ");
+        return;
+    }
+
+    egui::ScrollArea::vertical()
+        .max_height(360.0)
+        .show(ui, |ui| {
+            egui::Grid::new("cleanup_preview_table")
+                .striped(true)
+                .num_columns(8)
+                .spacing([12.0, 4.0])
+                .show(ui, |ui| {
+                    sortable_header(ui, "规则", CleanupSortKey::Rule, SortDirection::Asc, sort);
+                    sortable_header(ui, "风险", CleanupSortKey::Risk, SortDirection::Desc, sort);
+                    sortable_header(
+                        ui,
+                        "保护",
+                        CleanupSortKey::Protected,
+                        SortDirection::Desc,
+                        sort,
+                    );
+                    sortable_header(ui, "大小", CleanupSortKey::Size, SortDirection::Desc, sort);
+                    plain_header(ui, "类型");
+                    sortable_header(ui, "路径", CleanupSortKey::Path, SortDirection::Asc, sort);
+                    plain_header(ui, "原因");
+                    plain_header(ui, "操作");
+                    ui.end_row();
+
+                    for candidate in candidates.into_iter().take(120) {
+                        cleanup_candidate_row(ui, candidate, status_message);
+                    }
+                });
+        });
+}
+
+fn cleanup_candidate_matches(candidate: &CleanupCandidate, query: &str) -> bool {
+    query.is_empty()
+        || text_matches(candidate.rule_label, query)
+        || text_matches(candidate.risk.label(), query)
+        || text_matches(candidate.kind.label(), query)
+        || text_matches(&candidate.path.display().to_string(), query)
+        || text_matches(&candidate.reason, query)
+}
+
+fn cleanup_candidate_row(
+    ui: &mut egui::Ui,
+    candidate: &CleanupCandidate,
+    status_message: &mut String,
+) {
+    ui.label(candidate.rule_label);
+    ui.label(candidate.risk.label());
+    ui.label(if candidate.protected {
+        RichText::new("受保护").strong()
+    } else {
+        RichText::new("可估算")
+    });
+    ui.label(format::bytes(candidate.size));
+    ui.label(candidate.kind.label());
+
+    let path_text = candidate.path.display().to_string();
+    let open_target = candidate.path.parent().unwrap_or(candidate.path.as_path());
+    let path_response = ui
+        .label(compact_text(&path_text, 72))
+        .on_hover_text(path_text.clone());
+    path_context_menu(
+        path_response,
+        &candidate.path,
+        open_target,
+        &file_name(&candidate.path),
+        status_message,
+    );
+
+    ui.label(compact_text(&candidate.reason, 42))
+        .on_hover_text(candidate.reason.clone());
+    path_actions(ui, &candidate.path, open_target, status_message);
+    ui.end_row();
 }
 
 fn extension_table(
@@ -1485,6 +1942,22 @@ fn compare_extensions(
     };
 
     apply_direction(primary, sort.direction).then_with(|| left.extension.cmp(&right.extension))
+}
+
+fn compare_cleanup_candidates(
+    left: &CleanupCandidate,
+    right: &CleanupCandidate,
+    sort: SortState<CleanupSortKey>,
+) -> Ordering {
+    let primary = match sort.key {
+        CleanupSortKey::Rule => compare_text(left.rule_label, right.rule_label),
+        CleanupSortKey::Risk => left.risk.rank().cmp(&right.risk.rank()),
+        CleanupSortKey::Protected => left.protected.cmp(&right.protected),
+        CleanupSortKey::Size => left.size.cmp(&right.size),
+        CleanupSortKey::Path => left.path.cmp(&right.path),
+    };
+
+    apply_direction(primary, sort.direction).then_with(|| left.path.cmp(&right.path))
 }
 
 fn apply_direction(ordering: Ordering, direction: SortDirection) -> Ordering {
