@@ -1,11 +1,14 @@
 use std::{
     cmp::Ordering,
+    fs::File,
+    io::{BufWriter, Write},
     path::{Path, PathBuf},
     sync::Arc,
-    time::Duration,
+    time::{Duration, UNIX_EPOCH},
 };
 
 use eframe::egui::{self, RichText};
+use rfd::FileDialog;
 
 use crate::{
     format,
@@ -172,7 +175,7 @@ impl CDriveManagerApp {
     }
 
     fn choose_directory(&mut self) {
-        let mut dialog = rfd::FileDialog::new().set_title("选择要扫描的目录");
+        let mut dialog = FileDialog::new().set_title("选择要扫描的目录");
         let current = PathBuf::from(self.root_input.trim());
         if current.is_dir() {
             dialog = dialog.set_directory(current);
@@ -181,6 +184,82 @@ impl CDriveManagerApp {
         if let Some(path) = dialog.pick_folder() {
             self.root_input = path.display().to_string();
             self.status_message = format!("已选择目录：{}", path.display());
+        }
+    }
+
+    fn save_scan_result(&mut self) {
+        let Some(stats) = self.stats.as_ref().map(Arc::clone) else {
+            self.status_message = "没有可保存的扫描结果。".to_owned();
+            return;
+        };
+
+        let Some(path) = FileDialog::new()
+            .set_title("保存扫描结果")
+            .add_filter("扫描结果 JSON", &["json"])
+            .set_file_name("cdrive-scan-result.json")
+            .save_file()
+        else {
+            return;
+        };
+
+        match save_scan_result_to_path(&path, stats.as_ref()) {
+            Ok(()) => {
+                self.status_message = format!("已保存扫描结果：{}", path.display());
+            }
+            Err(error) => {
+                self.status_message = format!("保存扫描结果失败：{} ({:#})", path.display(), error);
+            }
+        }
+    }
+
+    fn open_scan_result(&mut self) {
+        let Some(path) = FileDialog::new()
+            .set_title("打开扫描结果")
+            .add_filter("扫描结果 JSON", &["json"])
+            .pick_file()
+        else {
+            return;
+        };
+
+        match load_scan_result_from_path(&path) {
+            Ok(stats) => {
+                self.root_input = stats.root.display().to_string();
+                self.stats = Some(Arc::new(stats));
+                self.progress = None;
+                self.scan_in_progress = false;
+                self.cancel_requested = false;
+                self.scan_handle = None;
+                self.treemap_current_dir = None;
+                self.status_message = format!("已打开扫描结果：{}", path.display());
+            }
+            Err(error) => {
+                self.status_message = format!("打开扫描结果失败：{} ({:#})", path.display(), error);
+            }
+        }
+    }
+
+    fn export_csv_report(&mut self) {
+        let Some(stats) = self.stats.as_ref().map(Arc::clone) else {
+            self.status_message = "没有可导出的扫描结果。".to_owned();
+            return;
+        };
+
+        let Some(path) = FileDialog::new()
+            .set_title("导出 CSV 报告")
+            .add_filter("CSV 报告", &["csv"])
+            .set_file_name("cdrive-scan-report.csv")
+            .save_file()
+        else {
+            return;
+        };
+
+        match export_csv_report_to_path(&path, stats.as_ref()) {
+            Ok(summary) => {
+                self.status_message = format!("已导出 CSV 报告：{} ({})", path.display(), summary);
+            }
+            Err(error) => {
+                self.status_message = format!("导出 CSV 失败：{} ({:#})", path.display(), error);
+            }
         }
     }
 
@@ -295,6 +374,36 @@ impl CDriveManagerApp {
                     .clicked()
                 {
                     self.cancel_scan();
+                }
+
+                ui.separator();
+
+                if ui
+                    .add_enabled(!self.scan_in_progress, egui::Button::new("打开结果"))
+                    .clicked()
+                {
+                    self.open_scan_result();
+                }
+
+                let has_final_stats = self.stats.is_some();
+                if ui
+                    .add_enabled(
+                        !self.scan_in_progress && has_final_stats,
+                        egui::Button::new("保存结果"),
+                    )
+                    .clicked()
+                {
+                    self.save_scan_result();
+                }
+
+                if ui
+                    .add_enabled(
+                        !self.scan_in_progress && has_final_stats,
+                        egui::Button::new("导出 CSV"),
+                    )
+                    .clicked()
+                {
+                    self.export_csv_report();
                 }
 
                 if self.scan_in_progress {
@@ -895,6 +1004,281 @@ fn open_path(open_target: &Path, status_message: &mut String) {
             *status_message = format!("打开位置失败：{} ({})", open_target.display(), error);
         }
     }
+}
+
+fn save_scan_result_to_path(path: &Path, stats: &ScanStats) -> anyhow::Result<()> {
+    let file = File::create(path)?;
+    let writer = BufWriter::new(file);
+    serde_json::to_writer_pretty(writer, stats)?;
+    Ok(())
+}
+
+fn load_scan_result_from_path(path: &Path) -> anyhow::Result<ScanStats> {
+    let file = File::open(path)?;
+    let mut stats: ScanStats = serde_json::from_reader(file)?;
+    stats.rebuild_indexes();
+    Ok(stats)
+}
+
+fn export_csv_report_to_path(path: &Path, stats: &ScanStats) -> anyhow::Result<String> {
+    let file = File::create(path)?;
+    let mut writer = BufWriter::new(file);
+
+    write_csv_row(
+        &mut writer,
+        [
+            "kind",
+            "name",
+            "path",
+            "size_bytes",
+            "size_display",
+            "file_count",
+            "extension",
+            "modified_unix_secs",
+            "message",
+        ],
+    )?;
+
+    write_summary_csv_rows(&mut writer, stats)?;
+
+    let directory_count = if let Some(tree) = &stats.directory_tree {
+        let mut directories: Vec<_> = tree.nodes.iter().map(|node| &node.record).collect();
+        directories.sort_by(|left, right| compare_directories_for_export(left, right));
+        for directory in &directories {
+            write_directory_csv_row(&mut writer, directory)?;
+        }
+        directories.len()
+    } else {
+        for directory in &stats.largest_dirs {
+            write_directory_csv_row(&mut writer, directory)?;
+        }
+        stats.largest_dirs.len()
+    };
+
+    for file in &stats.largest_files {
+        write_file_csv_row(&mut writer, file)?;
+    }
+
+    for extension in &stats.extensions {
+        write_extension_csv_row(&mut writer, extension)?;
+    }
+
+    for error in &stats.errors {
+        write_error_csv_row(&mut writer, error)?;
+    }
+
+    writer.flush()?;
+
+    let directory_scope = if stats.directory_tree.is_some() {
+        "完整目录"
+    } else {
+        "Top 目录"
+    };
+    Ok(format!(
+        "{} {}，{} 个最大文件，{} 个类型，{} 条错误",
+        format::count(directory_count as u64),
+        directory_scope,
+        format::count(stats.largest_files.len() as u64),
+        format::count(stats.extensions.len() as u64),
+        format::count(stats.errors.len() as u64)
+    ))
+}
+
+fn write_summary_csv_rows(writer: &mut impl Write, stats: &ScanStats) -> anyhow::Result<()> {
+    write_csv_row(
+        writer,
+        [
+            "summary".to_owned(),
+            "root".to_owned(),
+            path_text(&stats.root),
+            String::new(),
+            String::new(),
+            String::new(),
+            String::new(),
+            String::new(),
+            String::new(),
+        ],
+    )?;
+    write_csv_row(
+        writer,
+        [
+            "summary".to_owned(),
+            "total_size_bytes".to_owned(),
+            String::new(),
+            stats.total_size.to_string(),
+            format::bytes(stats.total_size),
+            String::new(),
+            String::new(),
+            String::new(),
+            String::new(),
+        ],
+    )?;
+    write_csv_row(
+        writer,
+        [
+            "summary".to_owned(),
+            "file_count".to_owned(),
+            String::new(),
+            String::new(),
+            String::new(),
+            stats.file_count.to_string(),
+            String::new(),
+            String::new(),
+            String::new(),
+        ],
+    )?;
+    write_csv_row(
+        writer,
+        [
+            "summary".to_owned(),
+            "dir_count".to_owned(),
+            String::new(),
+            String::new(),
+            String::new(),
+            stats.dir_count.to_string(),
+            String::new(),
+            String::new(),
+            String::new(),
+        ],
+    )?;
+    write_csv_row(
+        writer,
+        [
+            "summary".to_owned(),
+            "error_count".to_owned(),
+            String::new(),
+            String::new(),
+            String::new(),
+            stats.error_count.to_string(),
+            String::new(),
+            String::new(),
+            String::new(),
+        ],
+    )?;
+    Ok(())
+}
+
+fn write_directory_csv_row(
+    writer: &mut impl Write,
+    directory: &DirectoryRecord,
+) -> anyhow::Result<()> {
+    write_csv_row(
+        writer,
+        [
+            "directory".to_owned(),
+            directory.name(),
+            path_text(&directory.path),
+            directory.total_size.to_string(),
+            format::bytes(directory.total_size),
+            directory.descendant_file_count.to_string(),
+            String::new(),
+            String::new(),
+            format!(
+                "direct_file_size={}; direct_file_count={}",
+                directory.direct_file_size, directory.direct_file_count
+            ),
+        ],
+    )
+}
+
+fn write_file_csv_row(writer: &mut impl Write, file: &FileRecord) -> anyhow::Result<()> {
+    write_csv_row(
+        writer,
+        [
+            "file".to_owned(),
+            file_name(&file.path),
+            path_text(&file.path),
+            file.size.to_string(),
+            format::bytes(file.size),
+            String::new(),
+            file.extension.clone(),
+            modified_unix_secs(file),
+            String::new(),
+        ],
+    )
+}
+
+fn write_extension_csv_row(
+    writer: &mut impl Write,
+    extension: &ExtensionRecord,
+) -> anyhow::Result<()> {
+    write_csv_row(
+        writer,
+        [
+            "extension".to_owned(),
+            extension.extension.clone(),
+            String::new(),
+            extension.total_size.to_string(),
+            format::bytes(extension.total_size),
+            extension.file_count.to_string(),
+            extension.extension.clone(),
+            String::new(),
+            String::new(),
+        ],
+    )
+}
+
+fn write_error_csv_row(writer: &mut impl Write, error: &str) -> anyhow::Result<()> {
+    write_csv_row(
+        writer,
+        [
+            "error".to_owned(),
+            String::new(),
+            String::new(),
+            String::new(),
+            String::new(),
+            String::new(),
+            String::new(),
+            String::new(),
+            error.to_owned(),
+        ],
+    )
+}
+
+fn write_csv_row<S>(
+    writer: &mut impl Write,
+    cells: impl IntoIterator<Item = S>,
+) -> anyhow::Result<()>
+where
+    S: AsRef<str>,
+{
+    let mut first = true;
+    for cell in cells {
+        if first {
+            first = false;
+        } else {
+            writer.write_all(b",")?;
+        }
+        writer.write_all(csv_cell(cell.as_ref()).as_bytes())?;
+    }
+    writer.write_all(b"\n")?;
+    Ok(())
+}
+
+fn csv_cell(value: &str) -> String {
+    if value.contains([',', '"', '\n', '\r']) {
+        format!("\"{}\"", value.replace('"', "\"\""))
+    } else {
+        value.to_owned()
+    }
+}
+
+fn compare_directories_for_export(left: &DirectoryRecord, right: &DirectoryRecord) -> Ordering {
+    right
+        .total_size
+        .cmp(&left.total_size)
+        .then_with(|| left.path.cmp(&right.path))
+}
+
+fn modified_unix_secs(file: &FileRecord) -> String {
+    file.modified
+        .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+        .map(|duration| duration.as_secs().to_string())
+        .unwrap_or_default()
+}
+
+fn path_text(path: &Path) -> String {
+    path.display().to_string()
 }
 
 fn extension_table(

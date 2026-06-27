@@ -41,8 +41,24 @@ pub struct DirectoryTree {
 }
 
 impl DirectoryTree {
+    pub fn rebuild_path_index(&mut self) {
+        self.path_index.clear();
+        self.path_index.reserve(self.nodes.len());
+        for (index, node) in self.nodes.iter().enumerate() {
+            self.path_index.insert(node.record.path.clone(), index);
+        }
+    }
+
     pub fn node_index_for_path(&self, path: &std::path::Path) -> Option<usize> {
         self.path_index.get(path).copied()
+    }
+}
+
+impl ScanStats {
+    pub fn rebuild_indexes(&mut self) {
+        if let Some(tree) = &mut self.directory_tree {
+            tree.rebuild_path_index();
+        }
     }
 }
 
