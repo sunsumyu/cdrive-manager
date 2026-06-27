@@ -1,0 +1,16 @@
+[package]
+name = "cdrive-manager"
+version = "0.1.0"
+edition = "2024"
+description = "A safe Rust desktop GUI for analyzing Windows C drive space usage"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+anyhow = "1"
+crossbeam-channel = "0.5"
+eframe = "0.32"
+egui = "0.32"
+open = "5"
+rfd = "0.15"
+serde = { version = "1", features = ["derive"] }
+walkdir = "2"

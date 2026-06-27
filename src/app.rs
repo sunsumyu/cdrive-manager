@@ -1,0 +1,1120 @@
+use std::{
+    cmp::Ordering,
+    path::{Path, PathBuf},
+    time::Duration,
+};
+
+use eframe::egui::{self, RichText};
+
+use crate::{
+    format,
+    model::{DirectoryRecord, ExtensionRecord, FileRecord, ScanStats},
+    scanner::{ScanEvent, ScanFinished, ScanHandle, ScanOptions, ScanProgress, spawn_scan},
+    treemap::{TreemapAction, TreemapItem, draw_treemap},
+};
+
+pub struct CDriveManagerApp {
+    root_input: String,
+    scan_handle: Option<ScanHandle>,
+    scan_in_progress: bool,
+    cancel_requested: bool,
+    progress: Option<ScanProgress>,
+    stats: Option<ScanStats>,
+    status_message: String,
+    selected_tab: ResultTab,
+    search_query: String,
+    directory_sort: SortState<DirectorySortKey>,
+    file_sort: SortState<FileSortKey>,
+    extension_sort: SortState<ExtensionSortKey>,
+    treemap_current_dir: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResultTab {
+    Directories,
+    Files,
+    Types,
+    Errors,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SortDirection {
+    Asc,
+    Desc,
+}
+
+impl SortDirection {
+    fn toggled(self) -> Self {
+        match self {
+            Self::Asc => Self::Desc,
+            Self::Desc => Self::Asc,
+        }
+    }
+
+    fn arrow(self) -> &'static str {
+        match self {
+            Self::Asc => "↑",
+            Self::Desc => "↓",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SortState<K> {
+    key: K,
+    direction: SortDirection,
+}
+
+impl<K> SortState<K>
+where
+    K: Copy + PartialEq,
+{
+    fn new(key: K, direction: SortDirection) -> Self {
+        Self { key, direction }
+    }
+
+    fn select(&mut self, key: K, default_direction: SortDirection) {
+        if self.key == key {
+            self.direction = self.direction.toggled();
+        } else {
+            self.key = key;
+            self.direction = default_direction;
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DirectorySortKey {
+    Name,
+    Size,
+    Percent,
+    Files,
+    Path,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FileSortKey {
+    Name,
+    Size,
+    Extension,
+    Path,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExtensionSortKey {
+    Extension,
+    Size,
+    Percent,
+    FileCount,
+}
+
+impl CDriveManagerApp {
+    pub fn new(_cc: &eframe::CreationContext<'_>) -> Self {
+        Self {
+            root_input: default_root(),
+            scan_handle: None,
+            scan_in_progress: false,
+            cancel_requested: false,
+            progress: None,
+            stats: None,
+            status_message: "准备扫描。第一版只分析空间占用，不删除任何文件。".to_owned(),
+            selected_tab: ResultTab::Directories,
+            search_query: String::new(),
+            directory_sort: SortState::new(DirectorySortKey::Size, SortDirection::Desc),
+            file_sort: SortState::new(FileSortKey::Size, SortDirection::Desc),
+            extension_sort: SortState::new(ExtensionSortKey::Size, SortDirection::Desc),
+            treemap_current_dir: None,
+        }
+    }
+
+    fn start_scan(&mut self) {
+        let Some(root) = self.validate_root_input() else {
+            return;
+        };
+
+        self.scan_handle = Some(spawn_scan(ScanOptions { root: root.clone() }));
+        self.scan_in_progress = true;
+        self.cancel_requested = false;
+        self.progress = None;
+        self.stats = None;
+        self.treemap_current_dir = None;
+        self.status_message = format!("正在后台扫描：{}", root.display());
+    }
+
+    fn cancel_scan(&mut self) {
+        if let Some(handle) = &self.scan_handle {
+            handle.cancel();
+            self.cancel_requested = true;
+            self.status_message = "正在取消扫描，已扫描结果会保留……".to_owned();
+        }
+    }
+
+    fn validate_root_input(&mut self) -> Option<PathBuf> {
+        let input = self.root_input.trim();
+        if input.is_empty() {
+            self.status_message = "请输入要扫描的目录。".to_owned();
+            return None;
+        }
+
+        let root = PathBuf::from(input);
+        if !root.exists() {
+            self.status_message = format!("路径不存在：{}", root.display());
+            return None;
+        }
+
+        if !root.is_dir() {
+            self.status_message = format!("路径不是目录：{}", root.display());
+            return None;
+        }
+
+        Some(root)
+    }
+
+    fn choose_directory(&mut self) {
+        let mut dialog = rfd::FileDialog::new().set_title("选择要扫描的目录");
+        let current = PathBuf::from(self.root_input.trim());
+        if current.is_dir() {
+            dialog = dialog.set_directory(current);
+        }
+
+        if let Some(path) = dialog.pick_folder() {
+            self.root_input = path.display().to_string();
+            self.status_message = format!("已选择目录：{}", path.display());
+        }
+    }
+
+    fn poll_scan_events(&mut self, ctx: &egui::Context) {
+        let Some(receiver) = self
+            .scan_handle
+            .as_ref()
+            .map(|handle| handle.receiver.clone())
+        else {
+            return;
+        };
+
+        let mut latest_progress = None;
+        let mut finished = None;
+
+        while let Ok(event) = receiver.try_recv() {
+            match event {
+                ScanEvent::Progress(progress) => latest_progress = Some(progress),
+                ScanEvent::Finished(result) => finished = Some(result),
+            }
+        }
+
+        if let Some(progress) = latest_progress {
+            self.apply_progress(progress);
+        }
+
+        if let Some(result) = finished {
+            self.apply_finished(result);
+        }
+
+        if self.scan_in_progress {
+            ctx.request_repaint_after(Duration::from_millis(120));
+        }
+    }
+
+    fn apply_progress(&mut self, progress: ScanProgress) {
+        self.status_message = if progress.cancelled {
+            "扫描已取消，当前显示的是部分结果。".to_owned()
+        } else if progress.finished {
+            "扫描完成。".to_owned()
+        } else if let Some(path) = &progress.current_path {
+            format!("正在扫描：{}", path.display())
+        } else {
+            "正在扫描……".to_owned()
+        };
+        self.progress = Some(progress);
+    }
+
+    fn apply_finished(&mut self, result: ScanFinished) {
+        self.status_message = if result.cancelled {
+            format!(
+                "扫描已取消：已统计 {} 个文件，{} 个目录，部分结果共 {}。",
+                format::count(result.stats.file_count),
+                format::count(result.stats.dir_count),
+                format::bytes(result.stats.total_size)
+            )
+        } else {
+            format!(
+                "扫描完成：{} 个文件，{} 个目录，总计 {}。",
+                format::count(result.stats.file_count),
+                format::count(result.stats.dir_count),
+                format::bytes(result.stats.total_size)
+            )
+        };
+        self.stats = Some(result.stats);
+        self.scan_in_progress = false;
+        self.cancel_requested = false;
+        self.scan_handle = None;
+    }
+
+    fn current_stats(&self) -> Option<&ScanStats> {
+        self.stats
+            .as_ref()
+            .or_else(|| self.progress.as_ref().map(|progress| &progress.stats))
+    }
+
+    fn draw_top_bar(&mut self, ctx: &egui::Context) {
+        egui::TopBottomPanel::top("top_bar").show(ctx, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                ui.heading("C 盘空间管理器");
+                ui.separator();
+                ui.label("扫描目录：");
+                let input = ui.text_edit_singleline(&mut self.root_input);
+                if input.lost_focus()
+                    && ui.input(|input| input.key_pressed(egui::Key::Enter))
+                    && !self.scan_in_progress
+                {
+                    self.start_scan();
+                }
+
+                if ui
+                    .add_enabled(!self.scan_in_progress, egui::Button::new("选择目录"))
+                    .clicked()
+                {
+                    self.choose_directory();
+                }
+
+                if ui
+                    .add_enabled(!self.scan_in_progress, egui::Button::new("开始扫描"))
+                    .clicked()
+                {
+                    self.start_scan();
+                }
+
+                if ui
+                    .add_enabled(
+                        self.scan_in_progress && !self.cancel_requested,
+                        egui::Button::new("取消扫描"),
+                    )
+                    .clicked()
+                {
+                    self.cancel_scan();
+                }
+
+                if self.scan_in_progress {
+                    ui.spinner();
+                    let text = if self.cancel_requested {
+                        "取消中"
+                    } else {
+                        "扫描中"
+                    };
+                    ui.label(RichText::new(text).strong());
+                }
+            });
+            ui.label(RichText::new(&self.status_message).small());
+        });
+    }
+
+    fn draw_summary(&self, ui: &mut egui::Ui, stats: &ScanStats) {
+        ui.heading("概览");
+        ui.add_space(4.0);
+        egui::Grid::new("summary_grid")
+            .num_columns(2)
+            .spacing([12.0, 6.0])
+            .show(ui, |ui| {
+                label_value(ui, "扫描根目录", stats.root.display().to_string());
+                label_value(ui, "累计大小", format::bytes(stats.total_size));
+                label_value(ui, "文件数量", format::count(stats.file_count));
+                label_value(ui, "目录数量", format::count(stats.dir_count));
+                label_value(ui, "访问错误", format::count(stats.error_count));
+
+                if self.scan_in_progress {
+                    let state = if self.cancel_requested {
+                        "正在取消"
+                    } else {
+                        "正在扫描"
+                    };
+                    label_value(ui, "扫描状态", state.to_owned());
+
+                    if let Some(path) = self
+                        .progress
+                        .as_ref()
+                        .and_then(|progress| progress.current_path.as_ref())
+                    {
+                        label_value(
+                            ui,
+                            "当前路径",
+                            compact_text(&path.display().to_string(), 48),
+                        );
+                    }
+                }
+            });
+        ui.add_space(8.0);
+        ui.label(RichText::new("安全提示：当前版本只分析空间占用，不提供删除功能。").small());
+        if self.scan_in_progress {
+            ui.label(RichText::new("进度提示：程序不预扫描总文件数，因此不显示百分比。列表会持续刷新已扫描到的部分结果。").small());
+        }
+    }
+
+    fn draw_tabs(&mut self, ui: &mut egui::Ui, stats: &ScanStats) {
+        ui.horizontal(|ui| {
+            tab_button(
+                ui,
+                &mut self.selected_tab,
+                ResultTab::Directories,
+                "最大目录",
+            );
+            tab_button(ui, &mut self.selected_tab, ResultTab::Files, "最大文件");
+            tab_button(ui, &mut self.selected_tab, ResultTab::Types, "文件类型");
+            tab_button(ui, &mut self.selected_tab, ResultTab::Errors, "错误");
+        });
+        ui.separator();
+        self.draw_search_bar(ui);
+        ui.add_space(4.0);
+
+        match self.selected_tab {
+            ResultTab::Directories => directory_table(
+                ui,
+                stats,
+                &self.search_query,
+                &mut self.directory_sort,
+                &mut self.status_message,
+            ),
+            ResultTab::Files => file_table(
+                ui,
+                stats,
+                &self.search_query,
+                &mut self.file_sort,
+                &mut self.status_message,
+            ),
+            ResultTab::Types => {
+                extension_table(ui, stats, &self.search_query, &mut self.extension_sort)
+            }
+            ResultTab::Errors => error_list(ui, stats, &self.search_query),
+        }
+    }
+
+    fn draw_search_bar(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.label("搜索当前结果：");
+            ui.add(
+                egui::TextEdit::singleline(&mut self.search_query)
+                    .hint_text("输入名称、路径、类型或错误文本")
+                    .desired_width(320.0),
+            );
+            if ui
+                .add_enabled(!self.search_query.is_empty(), egui::Button::new("清空"))
+                .clicked()
+            {
+                self.search_query.clear();
+            }
+        });
+        ui.label(
+            RichText::new("搜索和排序只作用于当前保留的 Top 结果，不是全盘全文搜索。")
+                .small()
+                .weak(),
+        );
+    }
+
+    fn draw_treemap_panel(&mut self, ui: &mut egui::Ui, stats: &ScanStats) {
+        let current_dir = self.treemap_current_dir(stats);
+        let current_size = treemap_current_size(stats, &current_dir);
+        let treemap_dirs = treemap_child_dirs(stats, &current_dir);
+        let treemap_items: Vec<TreemapItem> = treemap_dirs
+            .iter()
+            .take(36)
+            .map(|dir| TreemapItem::from(*dir))
+            .collect();
+
+        ui.horizontal_wrapped(|ui| {
+            ui.heading("空间占用图");
+            ui.separator();
+            if ui
+                .add_enabled(current_dir != stats.root, egui::Button::new("返回上级"))
+                .clicked()
+            {
+                self.treemap_current_dir = Some(treemap_parent_dir(stats, &current_dir));
+            }
+            if ui
+                .add_enabled(current_dir != stats.root, egui::Button::new("返回根目录"))
+                .clicked()
+            {
+                self.treemap_current_dir = None;
+            }
+        });
+
+        ui.label(
+            RichText::new(format!("当前目录：{}", current_dir.display()))
+                .small()
+                .strong(),
+        );
+        ui.label(
+            RichText::new(format!(
+                "显示当前目录下已保留的最大直接子目录：{} / {}，当前目录大小 {}。",
+                format::count(treemap_items.len() as u64),
+                format::count(treemap_dirs.len() as u64),
+                format::bytes(current_size)
+            ))
+            .small()
+            .weak(),
+        );
+        ui.label(
+            RichText::new("提示：Treemap 下钻基于当前保留的最大 250 个目录，可能不是完整目录树；不包含直属大文件的单独块。")
+                .small()
+                .weak(),
+        );
+
+        let empty_message = if stats.total_size == 0 {
+            "扫描后显示目录空间占用图"
+        } else {
+            "当前目录没有可显示的已保留子目录\n可能子目录未进入 Top 250，或空间主要来自直属文件"
+        };
+
+        if let Some(action) = draw_treemap(ui, &treemap_items, current_size, empty_message) {
+            self.handle_treemap_action(action, ui.ctx());
+        }
+    }
+
+    fn treemap_current_dir(&mut self, stats: &ScanStats) -> PathBuf {
+        let Some(current) = &self.treemap_current_dir else {
+            return stats.root.clone();
+        };
+
+        if current == &stats.root {
+            return stats.root.clone();
+        }
+
+        let exists = current.starts_with(&stats.root)
+            && stats.largest_dirs.iter().any(|dir| dir.path == *current);
+        if exists {
+            current.clone()
+        } else {
+            self.treemap_current_dir = None;
+            stats.root.clone()
+        }
+    }
+
+    fn handle_treemap_action(&mut self, action: TreemapAction, ctx: &egui::Context) {
+        match action {
+            TreemapAction::Enter(path) => {
+                self.status_message = format!("Treemap 已进入目录：{}", path.display());
+                self.treemap_current_dir = Some(path);
+            }
+            TreemapAction::CopyPath(path) => {
+                let text = path.display().to_string();
+                ctx.copy_text(text.clone());
+                self.status_message = format!("已复制路径：{}", text);
+            }
+            TreemapAction::OpenLocation(path) => {
+                open_path(&path, &mut self.status_message);
+            }
+        }
+    }
+}
+
+impl eframe::App for CDriveManagerApp {
+    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.poll_scan_events(ctx);
+        self.draw_top_bar(ctx);
+
+        egui::SidePanel::left("summary_panel")
+            .resizable(true)
+            .default_width(300.0)
+            .show(ctx, |ui| {
+                if let Some(stats) = self.current_stats() {
+                    self.draw_summary(ui, stats);
+                } else {
+                    ui.heading("概览");
+                    ui.label("点击“开始扫描”后，这里会显示统计信息。");
+                    ui.add_space(8.0);
+                    ui.label("建议首次扫描小目录测试，再扫描整个 C 盘。  ");
+                }
+            });
+
+        egui::CentralPanel::default().show(ctx, |ui| {
+            let Some(stats) = self.current_stats().cloned() else {
+                ui.vertical_centered(|ui| {
+                    ui.add_space(80.0);
+                    ui.heading("参考 WinDirStat / QDirStat 的 Rust 桌面空间分析工具");
+                    ui.label("输入目录并开始扫描，程序会在后台统计空间占用。  ");
+                    ui.label("第一版不会删除任何文件。  ");
+                });
+                return;
+            };
+
+            self.draw_treemap_panel(ui, &stats);
+
+            ui.separator();
+            self.draw_tabs(ui, &stats);
+        });
+    }
+}
+
+fn default_root() -> String {
+    if cfg!(windows) {
+        "C:\\".to_owned()
+    } else {
+        "/".to_owned()
+    }
+}
+
+fn label_value(ui: &mut egui::Ui, label: &str, value: String) {
+    ui.label(RichText::new(label).strong());
+    ui.label(value);
+    ui.end_row();
+}
+
+fn tab_button(ui: &mut egui::Ui, selected: &mut ResultTab, value: ResultTab, label: &str) {
+    if ui.selectable_label(*selected == value, label).clicked() {
+        *selected = value;
+    }
+}
+
+fn treemap_current_size(stats: &ScanStats, current_dir: &Path) -> u64 {
+    if current_dir == stats.root {
+        return stats.total_size;
+    }
+
+    stats
+        .largest_dirs
+        .iter()
+        .find(|dir| dir.path == current_dir)
+        .map(|dir| dir.total_size)
+        .unwrap_or(0)
+}
+
+fn treemap_child_dirs<'a>(stats: &'a ScanStats, current_dir: &Path) -> Vec<&'a DirectoryRecord> {
+    let mut children: Vec<_> = stats
+        .largest_dirs
+        .iter()
+        .filter(|dir| dir.path != current_dir)
+        .filter(|dir| dir.path.parent() == Some(current_dir))
+        .collect();
+
+    children.sort_by(|left, right| {
+        right
+            .total_size
+            .cmp(&left.total_size)
+            .then_with(|| left.path.cmp(&right.path))
+    });
+    children
+}
+
+fn treemap_parent_dir(stats: &ScanStats, current_dir: &Path) -> PathBuf {
+    if current_dir == stats.root {
+        return stats.root.clone();
+    }
+
+    current_dir
+        .parent()
+        .filter(|parent| parent.starts_with(&stats.root))
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| stats.root.clone())
+}
+
+fn directory_table(
+    ui: &mut egui::Ui,
+    stats: &ScanStats,
+    search_query: &str,
+    sort: &mut SortState<DirectorySortKey>,
+    status_message: &mut String,
+) {
+    let query = normalized_query(search_query);
+    let mut directories: Vec<_> = stats
+        .largest_dirs
+        .iter()
+        .filter(|dir| directory_matches(dir, &query))
+        .collect();
+    directories.sort_by(|left, right| compare_directories(left, right, *sort));
+
+    result_count_label(
+        ui,
+        directories.len().min(120),
+        directories.len(),
+        stats.largest_dirs.len(),
+        "目录",
+    );
+
+    if directories.is_empty() {
+        ui.label("没有匹配的目录。");
+        return;
+    }
+
+    egui::ScrollArea::vertical()
+        .max_height(320.0)
+        .show(ui, |ui| {
+            egui::Grid::new("directory_table")
+                .striped(true)
+                .num_columns(6)
+                .spacing([12.0, 4.0])
+                .show(ui, |ui| {
+                    sortable_header(ui, "目录", DirectorySortKey::Name, SortDirection::Asc, sort);
+                    sortable_header(
+                        ui,
+                        "大小",
+                        DirectorySortKey::Size,
+                        SortDirection::Desc,
+                        sort,
+                    );
+                    sortable_header(
+                        ui,
+                        "占比",
+                        DirectorySortKey::Percent,
+                        SortDirection::Desc,
+                        sort,
+                    );
+                    sortable_header(
+                        ui,
+                        "文件",
+                        DirectorySortKey::Files,
+                        SortDirection::Desc,
+                        sort,
+                    );
+                    sortable_header(ui, "路径", DirectorySortKey::Path, SortDirection::Asc, sort);
+                    plain_header(ui, "操作");
+                    ui.end_row();
+                    for dir in directories.into_iter().take(120) {
+                        directory_row(ui, dir, stats.total_size, status_message);
+                    }
+                });
+        });
+}
+
+fn directory_matches(dir: &DirectoryRecord, query: &str) -> bool {
+    query.is_empty()
+        || text_matches(&dir.name(), query)
+        || text_matches(&dir.path.display().to_string(), query)
+}
+
+fn directory_row(
+    ui: &mut egui::Ui,
+    dir: &DirectoryRecord,
+    total_size: u64,
+    status_message: &mut String,
+) {
+    let name = dir.name();
+    let name_response = ui
+        .label(compact_text(&name, 32))
+        .on_hover_text(name.clone());
+    path_context_menu(name_response, &dir.path, &dir.path, &name, status_message);
+
+    ui.label(format::bytes(dir.total_size));
+    ui.label(format::percent(dir.total_size, total_size));
+    ui.label(format::count(dir.descendant_file_count));
+
+    let path_text = dir.path.display().to_string();
+    let path_response = ui
+        .label(compact_text(&path_text, 72))
+        .on_hover_text(path_text.clone());
+    path_context_menu(path_response, &dir.path, &dir.path, &name, status_message);
+
+    path_actions(ui, &dir.path, &dir.path, status_message);
+    ui.end_row();
+}
+
+fn file_table(
+    ui: &mut egui::Ui,
+    stats: &ScanStats,
+    search_query: &str,
+    sort: &mut SortState<FileSortKey>,
+    status_message: &mut String,
+) {
+    let query = normalized_query(search_query);
+    let mut files: Vec<_> = stats
+        .largest_files
+        .iter()
+        .filter(|file| file_matches(file, &query))
+        .collect();
+    files.sort_by(|left, right| compare_files(left, right, *sort));
+
+    result_count_label(
+        ui,
+        files.len().min(120),
+        files.len(),
+        stats.largest_files.len(),
+        "文件",
+    );
+
+    if files.is_empty() {
+        ui.label("没有匹配的文件。");
+        return;
+    }
+
+    egui::ScrollArea::vertical()
+        .max_height(320.0)
+        .show(ui, |ui| {
+            egui::Grid::new("file_table")
+                .striped(true)
+                .num_columns(5)
+                .spacing([12.0, 4.0])
+                .show(ui, |ui| {
+                    sortable_header(ui, "文件", FileSortKey::Name, SortDirection::Asc, sort);
+                    sortable_header(ui, "大小", FileSortKey::Size, SortDirection::Desc, sort);
+                    sortable_header(ui, "类型", FileSortKey::Extension, SortDirection::Asc, sort);
+                    sortable_header(ui, "路径", FileSortKey::Path, SortDirection::Asc, sort);
+                    plain_header(ui, "操作");
+                    ui.end_row();
+                    for file in files.into_iter().take(120) {
+                        file_row(ui, file, status_message);
+                    }
+                });
+        });
+}
+
+fn file_matches(file: &FileRecord, query: &str) -> bool {
+    query.is_empty()
+        || text_matches(&file_name(&file.path), query)
+        || text_matches(&file.path.display().to_string(), query)
+        || text_matches(&file.extension, query)
+}
+
+fn file_row(ui: &mut egui::Ui, file: &FileRecord, status_message: &mut String) {
+    let name = file_name(&file.path);
+    let open_target = file.path.parent().unwrap_or(file.path.as_path());
+
+    let name_response = ui
+        .label(compact_text(&name, 36))
+        .on_hover_text(name.clone());
+    path_context_menu(
+        name_response,
+        &file.path,
+        open_target,
+        &name,
+        status_message,
+    );
+
+    ui.label(format::bytes(file.size));
+    ui.label(&file.extension);
+
+    let path_text = file.path.display().to_string();
+    let path_response = ui
+        .label(compact_text(&path_text, 72))
+        .on_hover_text(path_text.clone());
+    path_context_menu(
+        path_response,
+        &file.path,
+        open_target,
+        &name,
+        status_message,
+    );
+
+    path_actions(ui, &file.path, open_target, status_message);
+    ui.end_row();
+}
+
+fn path_actions(
+    ui: &mut egui::Ui,
+    copy_path: &Path,
+    open_target: &Path,
+    status_message: &mut String,
+) {
+    ui.horizontal(|ui| {
+        if ui.small_button("复制路径").clicked() {
+            copy_path_to_clipboard(ui, copy_path, status_message);
+        }
+
+        if ui.small_button("打开位置").clicked() {
+            open_path(open_target, status_message);
+        }
+    });
+}
+
+fn path_context_menu(
+    response: egui::Response,
+    copy_path: &Path,
+    open_target: &Path,
+    name: &str,
+    status_message: &mut String,
+) {
+    response.context_menu(|ui| {
+        if ui.button("复制路径").clicked() {
+            copy_path_to_clipboard(ui, copy_path, status_message);
+            ui.close();
+        }
+
+        if ui.button("复制名称").clicked() {
+            copy_text_to_clipboard(ui, name.to_owned(), "已复制名称", status_message);
+            ui.close();
+        }
+
+        ui.separator();
+
+        if ui.button("打开位置").clicked() {
+            open_path(open_target, status_message);
+            ui.close();
+        }
+    });
+}
+
+fn copy_path_to_clipboard(ui: &egui::Ui, path: &Path, status_message: &mut String) {
+    let text = path.display().to_string();
+    copy_text_to_clipboard(ui, text, "已复制路径", status_message);
+}
+
+fn copy_text_to_clipboard(
+    ui: &egui::Ui,
+    text: String,
+    success_prefix: &str,
+    status_message: &mut String,
+) {
+    ui.ctx().copy_text(text.clone());
+    *status_message = format!("{}：{}", success_prefix, text);
+}
+
+fn open_path(open_target: &Path, status_message: &mut String) {
+    match open::that_detached(open_target) {
+        Ok(()) => {
+            *status_message = format!("已请求打开：{}", open_target.display());
+        }
+        Err(error) => {
+            *status_message = format!("打开位置失败：{} ({})", open_target.display(), error);
+        }
+    }
+}
+
+fn extension_table(
+    ui: &mut egui::Ui,
+    stats: &ScanStats,
+    search_query: &str,
+    sort: &mut SortState<ExtensionSortKey>,
+) {
+    let query = normalized_query(search_query);
+    let mut extensions: Vec<_> = stats
+        .extensions
+        .iter()
+        .filter(|extension| extension_matches(extension, &query))
+        .collect();
+    extensions.sort_by(|left, right| compare_extensions(left, right, *sort));
+
+    result_count_label(
+        ui,
+        extensions.len().min(120),
+        extensions.len(),
+        stats.extensions.len(),
+        "类型",
+    );
+
+    if extensions.is_empty() {
+        ui.label("没有匹配的文件类型。");
+        return;
+    }
+
+    egui::ScrollArea::vertical()
+        .max_height(320.0)
+        .show(ui, |ui| {
+            egui::Grid::new("extension_table")
+                .striped(true)
+                .num_columns(4)
+                .spacing([12.0, 4.0])
+                .show(ui, |ui| {
+                    sortable_header(
+                        ui,
+                        "类型",
+                        ExtensionSortKey::Extension,
+                        SortDirection::Asc,
+                        sort,
+                    );
+                    sortable_header(
+                        ui,
+                        "大小",
+                        ExtensionSortKey::Size,
+                        SortDirection::Desc,
+                        sort,
+                    );
+                    sortable_header(
+                        ui,
+                        "占比",
+                        ExtensionSortKey::Percent,
+                        SortDirection::Desc,
+                        sort,
+                    );
+                    sortable_header(
+                        ui,
+                        "文件数",
+                        ExtensionSortKey::FileCount,
+                        SortDirection::Desc,
+                        sort,
+                    );
+                    ui.end_row();
+                    for extension in extensions.into_iter().take(120) {
+                        extension_row(ui, extension, stats.total_size);
+                    }
+                });
+        });
+}
+
+fn extension_matches(extension: &ExtensionRecord, query: &str) -> bool {
+    query.is_empty() || text_matches(&extension.extension, query)
+}
+
+fn extension_row(ui: &mut egui::Ui, extension: &ExtensionRecord, total_size: u64) {
+    ui.label(&extension.extension);
+    ui.label(format::bytes(extension.total_size));
+    ui.label(format::percent(extension.total_size, total_size));
+    ui.label(format::count(extension.file_count));
+    ui.end_row();
+}
+
+fn error_list(ui: &mut egui::Ui, stats: &ScanStats, search_query: &str) {
+    if stats.errors.is_empty() {
+        ui.label("没有记录到访问错误。");
+        return;
+    }
+
+    let query = normalized_query(search_query);
+    let errors: Vec<_> = stats
+        .errors
+        .iter()
+        .filter(|error| query.is_empty() || text_matches(error, &query))
+        .collect();
+
+    ui.label(format!(
+        "共 {} 个访问错误，当前保留 {} 条，匹配 {} 条。",
+        format::count(stats.error_count),
+        format::count(stats.errors.len() as u64),
+        format::count(errors.len() as u64),
+    ));
+
+    if errors.is_empty() {
+        ui.label("没有匹配的错误记录。");
+        return;
+    }
+
+    egui::ScrollArea::vertical()
+        .max_height(320.0)
+        .show(ui, |ui| {
+            for error in errors {
+                ui.label(error);
+            }
+        });
+}
+
+fn result_count_label(
+    ui: &mut egui::Ui,
+    visible: usize,
+    matched: usize,
+    retained: usize,
+    unit: &str,
+) {
+    ui.label(
+        RichText::new(format!(
+            "显示 {} / 匹配 {} / 当前保留 {} 个{}。",
+            format::count(visible as u64),
+            format::count(matched as u64),
+            format::count(retained as u64),
+            unit
+        ))
+        .small()
+        .weak(),
+    );
+}
+
+fn sortable_header<K>(
+    ui: &mut egui::Ui,
+    label: &str,
+    key: K,
+    default_direction: SortDirection,
+    state: &mut SortState<K>,
+) where
+    K: Copy + PartialEq,
+{
+    let selected = state.key == key;
+    let text = if selected {
+        format!("{} {}", label, state.direction.arrow())
+    } else {
+        label.to_owned()
+    };
+
+    if ui.button(RichText::new(text).strong()).clicked() {
+        state.select(key, default_direction);
+    }
+}
+
+fn plain_header(ui: &mut egui::Ui, label: &str) {
+    ui.label(RichText::new(label).strong());
+}
+
+fn compare_directories(
+    left: &DirectoryRecord,
+    right: &DirectoryRecord,
+    sort: SortState<DirectorySortKey>,
+) -> Ordering {
+    let primary = match sort.key {
+        DirectorySortKey::Name => compare_text(&left.name(), &right.name()),
+        DirectorySortKey::Size | DirectorySortKey::Percent => {
+            left.total_size.cmp(&right.total_size)
+        }
+        DirectorySortKey::Files => left.descendant_file_count.cmp(&right.descendant_file_count),
+        DirectorySortKey::Path => left.path.cmp(&right.path),
+    };
+
+    apply_direction(primary, sort.direction).then_with(|| left.path.cmp(&right.path))
+}
+
+fn compare_files(left: &FileRecord, right: &FileRecord, sort: SortState<FileSortKey>) -> Ordering {
+    let primary = match sort.key {
+        FileSortKey::Name => compare_text(&file_name(&left.path), &file_name(&right.path)),
+        FileSortKey::Size => left.size.cmp(&right.size),
+        FileSortKey::Extension => compare_text(&left.extension, &right.extension),
+        FileSortKey::Path => left.path.cmp(&right.path),
+    };
+
+    apply_direction(primary, sort.direction).then_with(|| left.path.cmp(&right.path))
+}
+
+fn compare_extensions(
+    left: &ExtensionRecord,
+    right: &ExtensionRecord,
+    sort: SortState<ExtensionSortKey>,
+) -> Ordering {
+    let primary = match sort.key {
+        ExtensionSortKey::Extension => compare_text(&left.extension, &right.extension),
+        ExtensionSortKey::Size | ExtensionSortKey::Percent => {
+            left.total_size.cmp(&right.total_size)
+        }
+        ExtensionSortKey::FileCount => left.file_count.cmp(&right.file_count),
+    };
+
+    apply_direction(primary, sort.direction).then_with(|| left.extension.cmp(&right.extension))
+}
+
+fn apply_direction(ordering: Ordering, direction: SortDirection) -> Ordering {
+    match direction {
+        SortDirection::Asc => ordering,
+        SortDirection::Desc => ordering.reverse(),
+    }
+}
+
+fn normalized_query(query: &str) -> String {
+    query.trim().to_ascii_lowercase()
+}
+
+fn text_matches(text: &str, query: &str) -> bool {
+    text.to_ascii_lowercase().contains(query)
+}
+
+fn compare_text(left: &str, right: &str) -> Ordering {
+    left.to_ascii_lowercase()
+        .cmp(&right.to_ascii_lowercase())
+        .then_with(|| left.cmp(right))
+}
+
+fn file_name(path: &Path) -> String {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("[未知文件名]")
+        .to_owned()
+}
+
+fn compact_text(text: &str, max_chars: usize) -> String {
+    let chars: Vec<_> = text.chars().collect();
+    if chars.len() <= max_chars {
+        return text.to_owned();
+    }
+
+    if max_chars <= 1 {
+        return "…".to_owned();
+    }
+
+    let keep_start = (max_chars / 3).max(1);
+    let keep_end = max_chars.saturating_sub(keep_start + 1).max(1);
+    let start: String = chars.iter().take(keep_start).collect();
+    let end: String = chars
+        .iter()
+        .skip(chars.len().saturating_sub(keep_end))
+        .collect();
+    format!("{}…{}", start, end)
+}
