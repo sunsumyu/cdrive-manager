@@ -1012,20 +1012,13 @@ impl CDriveManagerApp {
                     self.export_cleanup_preview_csv();
                 }
 
-                if ui
-                    .add_enabled(!busy, egui::Button::new("导出重复 CSV"))
-                    .clicked()
-                {
-                    self.export_duplicate_preview_csv();
-                }
-
                 ui.separator();
 
                 if ui
-                    .add_enabled(!busy, egui::Button::new("缓存管理"))
+                    .add_enabled(!busy && has_final_stats, egui::Button::new("查找重复文件"))
                     .clicked()
                 {
-                    self.open_cache_manager();
+                    self.start_duplicate_preview();
                 }
 
                 if ui
@@ -1046,6 +1039,15 @@ impl CDriveManagerApp {
                     .clicked()
                 {
                     self.export_duplicate_preview_csv();
+                }
+
+                ui.separator();
+
+                if ui
+                    .add_enabled(!busy, egui::Button::new("缓存管理"))
+                    .clicked()
+                {
+                    self.open_cache_manager();
                 }
 
                 if busy {
