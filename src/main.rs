@@ -2,6 +2,8 @@ mod app;
 mod cleanup;
 mod duplicates;
 mod format;
+#[cfg(windows)]
+mod mft;
 mod model;
 mod scan_cache;
 mod scanner;

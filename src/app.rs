@@ -73,6 +73,11 @@ pub struct CDriveManagerApp {
     cache_db_path: Option<PathBuf>,
     cache_db_size: Option<u64>,
     cache_delete_confirmation: Option<String>,
+    // Scan timing and progress tracking
+    scan_start_time: Option<std::time::Instant>,
+    estimated_total_dirs: Option<u64>,
+    estimated_total_files: Option<u64>,
+    quick_scan_complete: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -239,6 +244,10 @@ impl CDriveManagerApp {
             cache_db_path: None,
             cache_db_size: None,
             cache_delete_confirmation: None,
+            scan_start_time: None,
+            estimated_total_dirs: None,
+            estimated_total_files: None,
+            quick_scan_complete: false,
         }
     }
 
@@ -248,10 +257,13 @@ impl CDriveManagerApp {
         };
 
         let filter_config = self.build_scan_filter_config();
-        self.scan_handle = Some(spawn_scan(ScanOptions {
-            root: root.clone(),
-            filter_config,
-        }));
+        
+        // Start detailed parallel scan immediately so the UI can show partial results
+        // instead of waiting for a full QuickCount pass on large drives.
+        let options = ScanOptions::new(root.clone(), filter_config)
+            .with_mode(crate::scanner::ScanMode::ParallelFullScan);
+        
+        self.scan_handle = Some(spawn_scan(options));
         self.scan_in_progress = true;
         self.cancel_requested = false;
         self.progress = None;
@@ -259,7 +271,41 @@ impl CDriveManagerApp {
         self.cleanup_preview = None;
         self.cleanup_progress = None;
         self.treemap_current_dir = None;
-        self.status_message = format!("正在后台扫描：{}", root.display());
+        self.quick_scan_complete = true;
+        self.estimated_total_dirs = None;
+        self.estimated_total_files = None;
+        self.scan_start_time = Some(std::time::Instant::now());
+        self.status_message = format!("多线程扫描中：{}", root.display());
+    }
+    
+    #[cfg(windows)]
+    fn start_mft_scan(&mut self) {
+        let Some(root) = self.validate_root_input() else {
+            return;
+        };
+        
+        // MFT scan only works for drive roots (e.g., C:\)
+        let drive_letter = root.to_string_lossy().chars().next().unwrap_or('C');
+        
+        let filter_config = self.build_scan_filter_config();
+        
+        let options = ScanOptions::new(root.clone(), filter_config)
+            .with_mode(crate::scanner::ScanMode::MftScan)
+            .with_drive_letter(drive_letter);
+        
+        self.scan_handle = Some(spawn_scan(options));
+        self.scan_in_progress = true;
+        self.cancel_requested = false;
+        self.progress = None;
+        self.stats = None;
+        self.cleanup_preview = None;
+        self.cleanup_progress = None;
+        self.treemap_current_dir = None;
+        self.quick_scan_complete = false;
+        self.estimated_total_dirs = None;
+        self.estimated_total_files = None;
+        self.scan_start_time = Some(std::time::Instant::now());
+        self.status_message = format!("MFT 高速扫描中：驱动器 {}:...", drive_letter);
     }
 
     fn build_scan_filter_config(&self) -> ScanFilterConfig {
@@ -660,52 +706,169 @@ impl CDriveManagerApp {
     }
 
     fn apply_progress(&mut self, progress: ScanProgress) {
+        use crate::scanner::ScanMode;
+
         self.status_message = if progress.cancelled {
             "扫描已取消，当前显示的是部分结果。".to_owned()
         } else if progress.finished {
             "扫描完成。".to_owned()
         } else if let Some(path) = &progress.current_path {
-            format!("正在扫描：{}", path.display())
+            match &progress.scan_mode {
+                ScanMode::QuickCount => format!("快速统计：{}", path.display()),
+                ScanMode::FullScan | ScanMode::ParallelFullScan | ScanMode::MftScan => {
+                    let mode_label = match &progress.scan_mode {
+                        ScanMode::ParallelFullScan => {
+                            if let Some(threads) = progress.active_threads {
+                                format!("多线程 ({}线程)", threads)
+                            } else {
+                                "多线程".to_string()
+                            }
+                        }
+                        ScanMode::MftScan => "MFT 高速".to_string(),
+                        _ => "单线程".to_string(),
+                    };
+                    
+                    // Show progress with ETA if we have estimates
+                    if let (Some(estimated), Some(start_time)) = (self.estimated_total_dirs, self.scan_start_time) {
+                        let current = progress.stats.dir_count;
+                        let ratio = current as f64 / estimated as f64;
+                        let pct = (ratio * 100.0).min(99.9);
+                        let elapsed = start_time.elapsed();
+                        
+                        let eta_str = if let Some(remaining) = self.estimated_remaining(ratio) {
+                            format!(", 剩余 {}", format::duration(remaining))
+                        } else {
+                            String::new()
+                        };
+                        
+                        format!(
+                            "{}扫描中：{:.1}% ({}秒{}) {}",
+                            mode_label,
+                            pct,
+                            elapsed.as_secs(),
+                            eta_str,
+                            path.display()
+                        )
+                    } else {
+                        format!("{}扫描：{}", mode_label, path.display())
+                    }
+                }
+            }
         } else {
-            "正在扫描……".to_owned()
+            match &progress.scan_mode {
+                ScanMode::QuickCount => "快速统计中...".to_owned(),
+                ScanMode::FullScan => "单线程详细扫描中...".to_owned(),
+                ScanMode::ParallelFullScan => {
+                    if let Some(threads) = progress.active_threads {
+                        format!("多线程详细扫描中 ({} 线程)...", threads)
+                    } else {
+                        "多线程详细扫描中...".to_owned()
+                    }
+                }
+                ScanMode::MftScan => "MFT 高速扫描中...".to_owned(),
+            }
         };
+        
+        // Store estimated totals from progress
+        if let Some(total_dirs) = progress.estimated_total_dirs {
+            self.estimated_total_dirs = Some(total_dirs);
+        }
+        if let Some(total_files) = progress.estimated_total_files {
+            self.estimated_total_files = Some(total_files);
+        }
+        
         self.progress = Some(progress);
     }
 
+    fn estimated_remaining(&self, progress_ratio: f64) -> Option<Duration> {
+        let start_time = self.scan_start_time?;
+        let elapsed = start_time.elapsed();
+        if progress_ratio <= 0.0 || progress_ratio >= 1.0 {
+            return None;
+        }
+        let total_estimated_secs = elapsed.as_secs_f64() / progress_ratio;
+        let total_estimated = Duration::from_secs_f64(total_estimated_secs);
+        total_estimated.checked_sub(elapsed)
+    }
+
     fn apply_finished(&mut self, result: ScanFinished) {
-        self.stats = Some(Arc::clone(&result.stats));
-        self.scan_in_progress = false;
-        self.cancel_requested = false;
-        self.scan_handle = None;
+        use crate::scanner::ScanMode;
 
-        let mut message = if result.cancelled {
-            format!(
-                "扫描已取消：已统计 {} 个文件，{} 个目录，部分结果共 {}。",
-                format::count(result.stats.file_count),
-                format::count(result.stats.dir_count),
-                format::bytes(result.stats.total_size)
-            )
-        } else {
-            format!(
-                "扫描完成：{} 个文件，{} 个目录，总计 {}。",
-                format::count(result.stats.file_count),
-                format::count(result.stats.dir_count),
-                format::bytes(result.stats.total_size)
-            )
-        };
+        match &result.scan_mode {
+            ScanMode::QuickCount => {
+                // First pass complete - store estimates and start full scan
+                self.estimated_total_dirs = Some(result.total_dirs);
+                self.estimated_total_files = Some(result.total_files);
+                self.quick_scan_complete = true;
+                
+                if result.cancelled {
+                    self.scan_in_progress = false;
+                    self.scan_handle = None;
+                    self.status_message = format!("快速统计已取消");
+                    return;
+                }
 
-        if !result.cancelled {
-            match save_latest_scan(result.stats.as_ref()) {
-                Ok(path) => {
-                    message.push_str(&format!(" 已写入 SQLite 最新缓存：{}。", path.display()));
+                // Start second pass (parallel full scan)
+                let root = PathBuf::from(&self.root_input);
+                let filter_config = self.build_scan_filter_config();
+                let options = ScanOptions::new(root.clone(), filter_config)
+                    .with_mode(ScanMode::ParallelFullScan);
+                
+                self.scan_handle = Some(spawn_scan(options));
+                self.status_message = format!(
+                    "快速统计完成：{} 个目录，{} 个文件。开始多线程详细扫描 ({} 线程)...",
+                    format::count(result.total_dirs),
+                    format::count(result.total_files),
+                    rayon::current_num_threads()
+                );
+            }
+            ScanMode::FullScan | ScanMode::ParallelFullScan | ScanMode::MftScan => {
+                // Second pass complete - show final results
+                self.stats = Some(Arc::clone(&result.stats));
+                self.scan_in_progress = false;
+                self.cancel_requested = false;
+                self.scan_handle = None;
+
+                let mode_name = match &result.scan_mode {
+                    ScanMode::ParallelFullScan => "多线程",
+                    ScanMode::MftScan => "MFT 高速",
+                    _ => "单线程",
+                };
+
+                let mut message = if result.cancelled {
+                    format!(
+                        "{}扫描已取消：已统计 {} 个文件，{} 个目录，部分结果共 {}。",
+                        mode_name,
+                        format::count(result.stats.file_count),
+                        format::count(result.stats.dir_count),
+                        format::bytes(result.stats.total_size)
+                    )
+                } else {
+                    format!(
+                        "{}扫描完成：{} 个文件，{} 个目录，总计 {}。",
+                        mode_name,
+                        format::count(result.stats.file_count),
+                        format::count(result.stats.dir_count),
+                        format::bytes(result.stats.total_size)
+                    )
+                };
+
+                message.push_str(&format!(" 耗时：{}", format::duration(result.elapsed_time)));
+
+                if !result.cancelled {
+                    match save_latest_scan(result.stats.as_ref()) {
+                        Ok(path) => {
+                            message.push_str(&format!(" 已写入 SQLite 最新缓存：{}。", path.display()));
+                        }
+                        Err(error) => {
+                            message.push_str(&format!(" SQLite 最新缓存写入失败：{:#}。", error));
+                        }
+                    }
                 }
-                Err(error) => {
-                    message.push_str(&format!(" SQLite 最新缓存写入失败：{:#}。", error));
-                }
+
+                self.status_message = message;
             }
         }
-
-        self.status_message = message;
     }
 
     fn apply_cleanup_preview_progress(&mut self, progress: CleanupPreviewProgress) {
@@ -938,6 +1101,19 @@ impl CDriveManagerApp {
                 {
                     self.start_scan();
                 }
+                
+                // MFT 高速扫描按钮 (仅 Windows)
+                #[cfg(windows)]
+                {
+                    let mft_tooltip = "直接读取 NTFS MFT，速度极快\n需要管理员权限";
+                    if ui
+                        .add_enabled(!busy, egui::Button::new("MFT 高速扫描"))
+                        .on_hover_text(mft_tooltip)
+                        .clicked()
+                    {
+                        self.start_mft_scan();
+                    }
+                }
 
                 if ui
                     .add_enabled(
@@ -1070,10 +1246,255 @@ impl CDriveManagerApp {
                         "重复检测中"
                     };
                     ui.label(RichText::new(text).strong());
+                    
+                    // Add progress bar for scanning
+                    if self.scan_in_progress {
+                        self.draw_progress_bar(ui);
+                    }
                 }
             });
             ui.label(RichText::new(&self.status_message).small());
         });
+    }
+
+    fn draw_progress_bar(&self, ui: &mut egui::Ui) {
+        use crate::scanner::ScanMode;
+
+        let Some(progress) = &self.progress else {
+            return;
+        };
+
+        let Some(start_time) = self.scan_start_time else {
+            return;
+        };
+
+        // Only show progress bar for FullScan mode
+        if let ScanMode::FullScan = &progress.scan_mode {
+            if let Some(estimated) = self.estimated_total_dirs {
+                let current = progress.stats.dir_count;
+                let ratio = (current as f64 / estimated as f64).clamp(0.0, 1.0);
+                let pct = ratio * 100.0;
+                
+                ui.add_space(4.0);
+                
+                // Progress bar
+                let progress_bar = egui::ProgressBar::new(ratio as f32)
+                    .text(format!("进度: {:.1}%", pct))
+                    .desired_width(200.0)
+                    .desired_height(12.0);
+                ui.add(progress_bar);
+                
+                // Time info
+                let elapsed = start_time.elapsed();
+                let time_text = if let Some(remaining) = self.estimated_remaining(ratio) {
+                    format!(
+                        "已用: {} | 剩余: {} | {}/{} 目录",
+                        format::duration(elapsed),
+                        format::duration(remaining),
+                        format::count(current),
+                        format::count(estimated)
+                    )
+                } else {
+                    format!(
+                        "已用: {} | {}/{} 目录",
+                        format::duration(elapsed),
+                        format::count(current),
+                        format::count(estimated)
+                    )
+                };
+                ui.label(RichText::new(time_text).small());
+            }
+        } else if let ScanMode::QuickCount = &progress.scan_mode {
+            // Quick count phase
+            ui.add_space(4.0);
+            ui.label(RichText::new("快速统计目录和文件数量...").small().weak());
+        }
+    }
+
+    /// WizTree-style three-column layout:
+    /// - Left: Directory tree
+    /// - Center: Treemap/Sunburst visualization
+    /// - Right: File type distribution
+    fn draw_wiztree_layout(&mut self, ui: &mut egui::Ui, stats: &ScanStats) {
+        let available_height = ui.available_height();
+        let top_height = (available_height * 0.55).max(280.0).min(520.0);
+
+        // Top: WizTree-style three columns. Do not use SidePanel/CentralPanel here;
+        // nested panels inside horizontal layouts collapse height in egui.
+        ui.allocate_ui_with_layout(
+            egui::vec2(ui.available_width(), top_height),
+            egui::Layout::left_to_right(egui::Align::Min),
+            |ui| {
+                let total_width = ui.available_width();
+                let gap = 8.0;
+                let left_width = 240.0;
+                let right_width = 230.0;
+                let center_width = (total_width - left_width - right_width - gap * 2.0).max(260.0);
+
+                ui.allocate_ui_with_layout(
+                    egui::vec2(left_width, top_height),
+                    egui::Layout::top_down(egui::Align::Min),
+                    |ui| {
+                        egui::Frame::group(ui.style()).show(ui, |ui| {
+                            ui.set_min_height(top_height - 8.0);
+                            self.draw_directory_tree_panel(ui, stats);
+                        });
+                    },
+                );
+                ui.add_space(gap);
+
+                ui.allocate_ui_with_layout(
+                    egui::vec2(center_width, top_height),
+                    egui::Layout::top_down(egui::Align::Min),
+                    |ui| {
+                        egui::Frame::group(ui.style()).show(ui, |ui| {
+                            ui.set_min_height(top_height - 8.0);
+                            self.draw_treemap_panel(ui, stats);
+                        });
+                    },
+                );
+                ui.add_space(gap);
+
+                ui.allocate_ui_with_layout(
+                    egui::vec2(right_width, top_height),
+                    egui::Layout::top_down(egui::Align::Min),
+                    |ui| {
+                        egui::Frame::group(ui.style()).show(ui, |ui| {
+                            ui.set_min_height(top_height - 8.0);
+                            self.draw_extension_panel(ui, stats);
+                        });
+                    },
+                );
+            },
+        );
+
+        // Bottom: Tab bar with detailed data tables.
+        ui.add_space(6.0);
+        ui.separator();
+        self.draw_tabs(ui, stats);
+    }
+
+    /// Left panel: Directory tree view
+    fn draw_directory_tree_panel(&mut self, ui: &mut egui::Ui, stats: &ScanStats) {
+        ui.heading("目录树");
+        ui.add_space(4.0);
+        
+        if let Some(tree) = &stats.directory_tree {
+            self.draw_tree_recursive(ui, tree, tree.root_index, 0, stats);
+        } else if self.scan_in_progress {
+            ui.label("扫描中，先显示已发现的顶层目录...");
+            ui.label(format!("目录: {}", format::count(stats.dir_count)));
+            ui.label(format!("文件: {}", format::count(stats.file_count)));
+            ui.add_space(6.0);
+
+            if stats.top_level_dirs.is_empty() {
+                ui.label("正在发现顶层目录...");
+            } else {
+                egui::ScrollArea::vertical()
+                    .id_salt("incremental_tree_scroll")
+                    .max_height(260.0)
+                    .show(ui, |ui| {
+                        for dir in stats.top_level_dirs.iter().take(80) {
+                            let name = dir
+                                .path
+                                .file_name()
+                                .and_then(|name| name.to_str())
+                                .unwrap_or_else(|| dir.path.to_str().unwrap_or("<unknown>"));
+                            let label = if dir.total_size > 0 {
+                                format!("{} ({})", name, format::bytes(dir.total_size))
+                            } else {
+                                name.to_owned()
+                            };
+
+                            if ui.small_button(label).clicked() {
+                                self.treemap_current_dir = Some(dir.path.clone());
+                            }
+                        }
+                    });
+            }
+        } else {
+            ui.label("无数据");
+        }
+    }
+
+    /// Recursive tree drawing
+    fn draw_tree_recursive(&mut self, ui: &mut egui::Ui, tree: &DirectoryTree, node_index: usize, depth: usize, stats: &ScanStats) {
+        if depth > 5 {
+            return; // Limit depth for performance
+        }
+
+        let node = &tree.nodes[node_index];
+        let indent = depth * 12;
+        ui.add_space(2.0);
+        
+        ui.horizontal(|ui| {
+            ui.add_space(indent as f32);
+            
+            let size_text = format::bytes(node.record.total_size);
+            let name = &node.record.name();
+            
+            let text = if depth == 0 {
+                format!("{} ({})", name, size_text)
+            } else {
+                format!("{} ({})", name, size_text)
+            };
+            
+            if ui.small_button(text).clicked() {
+                self.treemap_current_dir = Some(node.record.path.clone());
+            }
+        });
+
+        for &child_index in &node.children {
+            self.draw_tree_recursive(ui, tree, child_index, depth + 1, stats);
+        }
+    }
+
+    /// Right panel: File type distribution
+    fn draw_extension_panel(&self, ui: &mut egui::Ui, stats: &ScanStats) {
+        ui.heading("文件类型");
+        ui.add_space(4.0);
+        
+        if stats.extensions.is_empty() {
+            if self.scan_in_progress {
+                ui.label("统计中...");
+            } else {
+                ui.label("无数据");
+            }
+            return;
+        }
+
+        // Show top 10 extensions
+        let total = stats.total_size as f64;
+        for ext in stats.extensions.iter().take(10) {
+            let percentage = if total > 0.0 {
+                (ext.total_size as f64 / total) * 100.0
+            } else {
+                0.0
+            };
+
+            ui.horizontal(|ui| {
+                // Color bar
+                let color = match ext.extension.as_str() {
+                    "dll" | "exe" => egui::Color32::RED,
+                    "msi" | "cab" => egui::Color32::GREEN,
+                    "sys" | "cat" => egui::Color32::BLUE,
+                    "log" | "tmp" => egui::Color32::YELLOW,
+                    _ => egui::Color32::GRAY,
+                };
+                
+                ui.add(
+                    egui::ProgressBar::new((percentage / 100.0) as f32)
+                        .desired_width(80.0)
+                        .desired_height(8.0),
+                );
+                
+                ui.label(format!(".{}", ext.extension));
+                ui.label(format::bytes(ext.total_size));
+            });
+        }
+
+        ui.add_space(8.0);
+        ui.label(format!("共 {} 种类型", format::count(stats.extensions.len() as u64)));
     }
 
     fn draw_summary(&self, ui: &mut egui::Ui, stats: &ScanStats) {
@@ -1571,36 +1992,42 @@ impl CDriveManagerApp {
     }
 
     fn draw_treemap_panel(&mut self, ui: &mut egui::Ui, stats: &ScanStats) {
-        let Some(tree) = stats.directory_tree.as_ref() else {
-            ui.heading("空间占用图");
-            ui.label(
-                RichText::new(
-                    "完整目录树会在扫描完成或取消后生成。扫描中仍可查看下方 Top 结果列表。",
-                )
-                .small()
-                .weak(),
-            );
-            draw_treemap(
-                ui,
-                &[],
-                stats.total_size,
-                "完整目录树会在扫描完成或取消后显示",
-            );
-            return;
+        // During scanning, use top_level_dirs for incremental display (faster, hierarchical)
+        // After completion, use full directory tree
+        let (treemap_items, current_size, is_scanning) = if let Some(tree) = stats.directory_tree.as_ref() {
+            // Full tree available - use detailed visualization
+            let current_dir = self.treemap_current_dir(stats);
+            let current_index = tree
+                .node_index_for_path(&current_dir)
+                .unwrap_or(tree.root_index);
+            let current_node = &tree.nodes[current_index];
+            let current_size = current_node.record.total_size;
+            let mut treemap_items = treemap_items_for_node(tree, current_index);
+            let display_limit = 36;
+            treemap_items = treemap_items_with_other(treemap_items, current_dir.clone(), display_limit);
+            (treemap_items, current_size, false)
+        } else {
+            // Scanning in progress - use top_level_dirs for hierarchical incremental display
+            // This shows direct children of root, which is more meaningful than global largest_dirs
+            let items: Vec<TreemapItem> = stats
+                .top_level_dirs
+                .iter()
+                .map(|dir| TreemapItem::directory(
+                    dir.path
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .map(|s| s.to_string())
+                        .unwrap_or_else(|| dir.path.display().to_string()),
+                    dir.path.clone(),
+                    dir.total_size,
+                ))
+                .collect();
+            let display_limit = 36;
+            let items = treemap_items_with_other(items, stats.root.clone(), display_limit);
+            (items, stats.total_size, true)
         };
 
-        let current_dir = self.treemap_current_dir(stats);
-        let current_index = tree
-            .node_index_for_path(&current_dir)
-            .unwrap_or(tree.root_index);
-        let current_node = &tree.nodes[current_index];
-        let current_size = current_node.record.total_size;
-        let child_count = current_node.children.len();
-        let mut treemap_items = treemap_items_for_node(tree, current_index);
-        let item_count = treemap_items.len();
-        let display_limit = 36;
-        treemap_items = treemap_items_with_other(treemap_items, current_dir.clone(), display_limit);
-
+        // Draw header and visualization mode selector
         ui.horizontal_wrapped(|ui| {
             ui.heading("空间占用图");
             ui.separator();
@@ -1616,48 +2043,65 @@ impl CDriveManagerApp {
             );
         });
 
-        // Breadcrumb navigation
-        self.draw_breadcrumb_navigation(ui, stats, &current_dir);
+        // Show appropriate message based on scan state
+        if is_scanning {
+            ui.label(
+                RichText::new("扫描中实时预览：基于当前已发现的最大目录显示。扫描完成后可进入子目录查看详情。")
+                    .small()
+                    .weak(),
+            );
+        } else if let Some(tree) = stats.directory_tree.as_ref() {
+            let current_dir = self.treemap_current_dir(stats);
+            let current_index = tree
+                .node_index_for_path(&current_dir)
+                .unwrap_or(tree.root_index);
+            let current_node = &tree.nodes[current_index];
+            let child_count = current_node.children.len();
+            
+            self.draw_breadcrumb_navigation(ui, stats, &current_dir);
+            
+            ui.label(
+                RichText::new(format!(
+                    "完整目录树：{} 个直接子目录，直属文件 {} 个 / {}，当前图表显示 {} 个块。",
+                    format::count(child_count as u64),
+                    format::count(current_node.record.direct_file_count),
+                    format::bytes(current_node.record.direct_file_size),
+                    format::count(treemap_items.len() as u64),
+                ))
+                .small()
+                .weak(),
+            );
+        }
 
-        ui.label(
-            RichText::new(format!(
-                "完整目录树：{} 个直接子目录，直属文件 {} 个 / {}，当前图表显示 {} / {} 个块。",
-                format::count(child_count as u64),
-                format::count(current_node.record.direct_file_count),
-                format::bytes(current_node.record.direct_file_size),
-                format::count(treemap_items.len() as u64),
-                format::count(item_count as u64),
-            ))
-            .small()
-            .weak(),
-        );
-        let mode_hint = match self.visualization_mode {
-            VisualizationMode::Treemap => {
-                "提示：Treemap 基于完整目录树；为保持可读性，矩形图最多显示当前目录下最大的 36 个块。"
-            }
-            VisualizationMode::Sunburst => {
-                "提示：旭日图基于完整目录树；圆环从内到外展示最多 3 层目录，并聚合较小项目。"
-            }
-        };
-        ui.label(RichText::new(mode_hint).small().weak());
-
-        let empty_message = if stats.total_size == 0 {
+        let empty_message = if is_scanning {
+            "正在扫描中..."
+        } else if stats.total_size == 0 {
             "扫描后显示目录空间占用图"
         } else {
-            "当前目录没有可显示的子目录或直属文件"
+            "当前目录没有可显示的子目录"
         };
 
-        let action = match self.visualization_mode {
-            VisualizationMode::Treemap => {
-                draw_treemap(ui, &treemap_items, current_size, empty_message)
-            }
-            VisualizationMode::Sunburst => {
-                draw_sunburst(ui, tree, current_index, current_size, empty_message)
-            }
-        };
+        // Draw visualization (only Treemap during scanning, full options after completion)
+        if is_scanning {
+            draw_treemap(ui, &treemap_items, current_size, empty_message);
+        } else if let Some(tree) = stats.directory_tree.as_ref() {
+            let current_dir = self.treemap_current_dir(stats);
+            let current_index = tree
+                .node_index_for_path(&current_dir)
+                .unwrap_or(tree.root_index);
+            
+            let action = match self.visualization_mode {
+                VisualizationMode::Treemap => {
+                    draw_treemap(ui, &treemap_items, current_size, empty_message)
+                }
+                VisualizationMode::Sunburst => {
+                    draw_sunburst(ui, tree, current_index, current_size, empty_message)
+                }
+            };
 
-        if let Some(action) = action {
-            self.handle_treemap_action(action, ui.ctx());
+            if let Some(action) = action {
+                self.handle_treemap_action(action, ui.ctx());
+            }
         }
     }
 
@@ -1751,25 +2195,6 @@ impl eframe::App for CDriveManagerApp {
         self.draw_top_bar(ctx);
         self.draw_cache_manager_window(ctx);
 
-        egui::SidePanel::left("summary_panel")
-            .resizable(true)
-            .default_width(300.0)
-            .show(ctx, |ui| {
-                self.draw_scan_filter_config(ui);
-
-                ui.add_space(12.0);
-                ui.separator();
-
-                if let Some(stats) = self.current_stats() {
-                    self.draw_summary(ui, stats.as_ref());
-                } else {
-                    ui.heading("概览");
-                    ui.label("点击\"开始扫描\"后，这里会显示统计信息。");
-                    ui.add_space(8.0);
-                    ui.label("建议首次扫描小目录测试，再扫描整个 C 盘。");
-                }
-            });
-
         egui::CentralPanel::default().show(ctx, |ui| {
             let Some(stats) = self.current_stats() else {
                 ui.vertical_centered(|ui| {
@@ -1781,10 +2206,8 @@ impl eframe::App for CDriveManagerApp {
                 return;
             };
 
-            self.draw_treemap_panel(ui, stats.as_ref());
-
-            ui.separator();
-            self.draw_tabs(ui, stats.as_ref());
+            // WizTree-style three-column layout
+            self.draw_wiztree_layout(ui, stats.as_ref());
         });
     }
 }

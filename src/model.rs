@@ -2,7 +2,7 @@ use std::{
     cmp::Ordering,
     collections::HashMap,
     path::PathBuf,
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use serde::{Deserialize, Serialize};
@@ -160,6 +160,9 @@ pub struct ScanStats {
     pub errors: Vec<String>,
     #[serde(default)]
     pub directory_tree: Option<DirectoryTree>,
+    /// Top-level directories (direct children of root) for incremental display
+    #[serde(default)]
+    pub top_level_dirs: Vec<DirectoryRecord>,
 }
 
 impl Default for ScanStats {
@@ -180,6 +183,7 @@ impl Default for ScanStats {
             extensions: Vec::new(),
             errors: Vec::new(),
             directory_tree: None,
+            top_level_dirs: Vec::new(),
         }
     }
 }
@@ -188,7 +192,7 @@ fn default_schema_version() -> u32 {
     SCAN_STATS_SCHEMA_VERSION
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct ScanAccumulator {
     root: PathBuf,
     filter_config: ScanFilterConfig,
@@ -201,6 +205,33 @@ pub struct ScanAccumulator {
     all_files: Vec<FileRecord>,
     largest_files: Vec<FileRecord>,
     errors: Vec<String>,
+    /// Cached top-level directories (direct children of root), sorted by size
+    cached_top_level_dirs: Option<Vec<DirectoryRecord>>,
+    /// Cache invalidation flag
+    cache_dirty: bool,
+    /// Scan start time for ETA calculation
+    scan_started_at: Instant,
+}
+
+impl Default for ScanAccumulator {
+    fn default() -> Self {
+        Self {
+            root: PathBuf::new(),
+            filter_config: ScanFilterConfig::default(),
+            total_size: 0,
+            file_count: 0,
+            dir_count: 0,
+            error_count: 0,
+            dir_sizes: HashMap::new(),
+            extension_sizes: HashMap::new(),
+            all_files: Vec::new(),
+            largest_files: Vec::new(),
+            errors: Vec::new(),
+            cached_top_level_dirs: None,
+            cache_dirty: true,
+            scan_started_at: Instant::now(),
+        }
+    }
 }
 
 impl ScanAccumulator {
@@ -234,11 +265,14 @@ impl ScanAccumulator {
                 descendant_file_count: 0,
             },
         );
+        // Invalidate cache when new directory is added
+        self.cache_dirty = true;
     }
 
     pub fn record_file(&mut self, file: FileRecord) {
         self.total_size = self.total_size.saturating_add(file.size);
         self.file_count += 1;
+        self.cache_dirty = true; // Invalidate cache when file sizes change
 
         let extension = self
             .extension_sizes
@@ -278,6 +312,12 @@ impl ScanAccumulator {
         push_largest(&mut self.largest_files, file, 250, |item| item.size);
     }
 
+    /// Record a file in QuickCount mode (only count, no size metadata)
+    pub fn record_file_count(&mut self) {
+        self.file_count += 1;
+        self.cache_dirty = true;
+    }
+
     pub fn record_error(&mut self, message: String) {
         self.error_count += 1;
         if self.errors.len() < 300 {
@@ -285,15 +325,137 @@ impl ScanAccumulator {
         }
     }
 
-    pub fn progress_snapshot(&self) -> ScanStats {
-        self.snapshot(false, false)
+    /// Get elapsed time since scan started
+    pub fn elapsed_time(&self) -> Duration {
+        self.scan_started_at.elapsed()
     }
 
-    pub fn final_snapshot(&self) -> ScanStats {
+    /// Estimate remaining time based on progress ratio
+    pub fn estimated_remaining_time(&self, progress_ratio: f64) -> Option<Duration> {
+        if progress_ratio <= 0.0 || progress_ratio >= 1.0 {
+            return None;
+        }
+        let elapsed = self.elapsed_time();
+        let total_estimated_secs = elapsed.as_secs_f64() / progress_ratio;
+        let total_estimated = Duration::from_secs_f64(total_estimated_secs);
+        total_estimated.checked_sub(elapsed)
+    }
+
+    /// Get directory count (public accessor)
+    pub fn get_dir_count(&self) -> u64 {
+        self.dir_count
+    }
+
+    /// Get file count (public accessor)
+    pub fn get_file_count(&self) -> u64 {
+        self.file_count
+    }
+
+    pub fn progress_snapshot(&mut self) -> ScanStats {
+        // Progress snapshot: skip expensive sorting for real-time display
+        // Only compute top_level_dirs (cached) and essential data
+        self.snapshot_optimized(false, false)
+    }
+
+    pub fn final_snapshot(&mut self) -> ScanStats {
         self.snapshot(true, true)
     }
 
-    fn snapshot(&self, include_tree: bool, include_all_files: bool) -> ScanStats {
+    /// Get top-level directories (direct children of root) for incremental display.
+    /// This is much faster than sorting all directories - O(d) instead of O(n log n)
+    /// where d = number of direct children, n = total directories.
+    pub fn get_top_level_dirs(&mut self) -> Vec<DirectoryRecord> {
+        // Return cached result if still valid
+        if !self.cache_dirty {
+            if let Some(ref cached) = self.cached_top_level_dirs {
+                return cached.clone();
+            }
+        }
+
+        // Build list of direct children of root
+        let mut top_level: Vec<DirectoryRecord> = self
+            .dir_sizes
+            .values()
+            .filter(|dir| {
+                // Only include directories that are direct children of root
+                dir.path.parent() == Some(&self.root)
+            })
+            .cloned()
+            .collect();
+
+        // Sort by size (descending) then path
+        top_level.sort_by(compare_size_then_path_dir);
+        
+        // Cache the result
+        self.cached_top_level_dirs = Some(top_level.clone());
+        self.cache_dirty = false;
+        
+        top_level
+    }
+
+    /// Get children of a specific directory path for lazy loading
+    pub fn get_children_of(&self, parent_path: &std::path::Path) -> Vec<DirectoryRecord> {
+        let mut children: Vec<DirectoryRecord> = self
+            .dir_sizes
+            .values()
+            .filter(|dir| {
+                // Only include directories that are direct children
+                dir.path.parent() == Some(parent_path)
+            })
+            .cloned()
+            .collect();
+
+        children.sort_by(compare_size_then_path_dir);
+        children
+    }
+
+    /// Optimized snapshot for progress updates - skips expensive sorting
+    fn snapshot_optimized(&mut self, include_tree: bool, include_all_files: bool) -> ScanStats {
+        // Use incremental top-level dirs (cached, O(d) where d = direct children)
+        let top_level_dirs = self.get_top_level_dirs();
+
+        // Skip sorting all dirs during scanning - only keep recent updates
+        // This is O(1) instead of O(n log n)
+        let largest_dirs = Vec::new();
+
+        // Skip sorting extensions during scanning
+        let extensions = Vec::new();
+
+        let mut largest_files = self.largest_files.clone();
+        largest_files.sort_by(compare_size_then_path_file);
+
+        let all_files = if include_all_files {
+            let mut all_files = self.all_files.clone();
+            all_files.sort_by(compare_path_then_size_file);
+            all_files
+        } else {
+            Vec::new()
+        };
+
+        ScanStats {
+            schema_version: SCAN_STATS_SCHEMA_VERSION,
+            saved_at_unix_secs: None,
+            app_version: Some(env!("CARGO_PKG_VERSION").to_owned()),
+            root: self.root.clone(),
+            filter_config: self.filter_config.clone(),
+            total_size: self.total_size,
+            file_count: self.file_count,
+            dir_count: self.dir_count,
+            error_count: self.error_count,
+            largest_files,
+            all_files,
+            largest_dirs,
+            extensions,
+            errors: self.errors.clone(),
+            directory_tree: include_tree.then(|| self.build_directory_tree()),
+            top_level_dirs,
+        }
+    }
+
+    fn snapshot(&mut self, include_tree: bool, include_all_files: bool) -> ScanStats {
+        // Use incremental top-level dirs for real-time display (much faster than sorting all)
+        let top_level_dirs = self.get_top_level_dirs();
+
         let mut largest_dirs: Vec<_> = self.dir_sizes.values().cloned().collect();
         largest_dirs.sort_by(compare_size_then_path_dir);
         largest_dirs.truncate(250);
@@ -329,6 +491,7 @@ impl ScanAccumulator {
             extensions,
             errors: self.errors.clone(),
             directory_tree: include_tree.then(|| self.build_directory_tree()),
+            top_level_dirs,
         }
     }
 
