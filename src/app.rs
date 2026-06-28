@@ -16,9 +16,19 @@ use crate::{
         CleanupPreviewHandle, CleanupPreviewOptions, CleanupPreviewProgress, CleanupRule,
         default_cleanup_rules, spawn_cleanup_preview,
     },
+    duplicates::{
+        DuplicateFile, DuplicateGroup, DuplicatePreview, DuplicatePreviewEvent,
+        DuplicatePreviewFinished, DuplicatePreviewHandle, DuplicatePreviewOptions,
+        DuplicatePreviewProgress, spawn_duplicate_preview,
+    },
     format,
-    model::{DirectoryRecord, DirectoryTree, ExtensionRecord, FileRecord, ScanStats},
+    model::{
+        DirectoryRecord, DirectoryTree, ExtensionRecord, FileRecord, ScanFilterConfig, ScanStats,
+        normalize_extension_filter,
+    },
+    scan_cache::{load_latest_scan, save_latest_scan},
     scanner::{ScanEvent, ScanFinished, ScanHandle, ScanOptions, ScanProgress, spawn_scan},
+    sunburst::draw_sunburst,
     treemap::{TreemapAction, TreemapItem, draw_treemap},
 };
 
@@ -34,6 +44,11 @@ pub struct CDriveManagerApp {
     cleanup_cancel_requested: bool,
     cleanup_progress: Option<CleanupPreviewProgress>,
     cleanup_preview: Option<Arc<CleanupPreview>>,
+    duplicate_handle: Option<DuplicatePreviewHandle>,
+    duplicate_in_progress: bool,
+    duplicate_cancel_requested: bool,
+    duplicate_progress: Option<DuplicatePreviewProgress>,
+    duplicate_preview: Option<Arc<DuplicatePreview>>,
     cleanup_rules: Vec<CleanupRuleUiState>,
     status_message: String,
     selected_tab: ResultTab,
@@ -42,7 +57,13 @@ pub struct CDriveManagerApp {
     file_sort: SortState<FileSortKey>,
     extension_sort: SortState<ExtensionSortKey>,
     cleanup_sort: SortState<CleanupSortKey>,
+    duplicate_sort: SortState<DuplicateSortKey>,
     treemap_current_dir: Option<PathBuf>,
+    visualization_mode: VisualizationMode,
+    scan_filter_excluded_dirs: String,
+    scan_filter_excluded_extensions: String,
+    scan_filter_same_file_system: bool,
+    duplicate_min_size_bytes: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -51,7 +72,14 @@ enum ResultTab {
     Files,
     Types,
     CleanupPreview,
+    DuplicatePreview,
     Errors,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VisualizationMode {
+    Treemap,
+    Sunburst,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -134,6 +162,15 @@ enum CleanupSortKey {
     Path,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DuplicateSortKey {
+    Size,
+    Count,
+    Reclaimable,
+    Protected,
+    KeepPath,
+}
+
 #[derive(Debug, Clone)]
 struct CleanupRuleUiState {
     rule: CleanupRule,
@@ -149,6 +186,8 @@ impl CleanupRuleUiState {
     }
 }
 
+const DEFAULT_DUPLICATE_MIN_SIZE_BYTES: u64 = 1024;
+
 impl CDriveManagerApp {
     pub fn new(_cc: &eframe::CreationContext<'_>) -> Self {
         Self {
@@ -163,6 +202,11 @@ impl CDriveManagerApp {
             cleanup_cancel_requested: false,
             cleanup_progress: None,
             cleanup_preview: None,
+            duplicate_handle: None,
+            duplicate_in_progress: false,
+            duplicate_cancel_requested: false,
+            duplicate_progress: None,
+            duplicate_preview: None,
             cleanup_rules: default_cleanup_rules()
                 .into_iter()
                 .map(CleanupRuleUiState::new)
@@ -174,7 +218,13 @@ impl CDriveManagerApp {
             file_sort: SortState::new(FileSortKey::Size, SortDirection::Desc),
             extension_sort: SortState::new(ExtensionSortKey::Size, SortDirection::Desc),
             cleanup_sort: SortState::new(CleanupSortKey::Size, SortDirection::Desc),
+            duplicate_sort: SortState::new(DuplicateSortKey::Reclaimable, SortDirection::Desc),
             treemap_current_dir: None,
+            visualization_mode: VisualizationMode::Treemap,
+            scan_filter_excluded_dirs: String::new(),
+            scan_filter_excluded_extensions: String::new(),
+            scan_filter_same_file_system: false,
+            duplicate_min_size_bytes: DEFAULT_DUPLICATE_MIN_SIZE_BYTES,
         }
     }
 
@@ -183,7 +233,11 @@ impl CDriveManagerApp {
             return;
         };
 
-        self.scan_handle = Some(spawn_scan(ScanOptions { root: root.clone() }));
+        let filter_config = self.build_scan_filter_config();
+        self.scan_handle = Some(spawn_scan(ScanOptions {
+            root: root.clone(),
+            filter_config,
+        }));
         self.scan_in_progress = true;
         self.cancel_requested = false;
         self.progress = None;
@@ -192,6 +246,25 @@ impl CDriveManagerApp {
         self.cleanup_progress = None;
         self.treemap_current_dir = None;
         self.status_message = format!("正在后台扫描：{}", root.display());
+    }
+
+    fn build_scan_filter_config(&self) -> ScanFilterConfig {
+        let excluded_directories: Vec<String> = self
+            .scan_filter_excluded_dirs
+            .split([',', ';', '\n'])
+            .map(|part| part.trim().to_owned())
+            .filter(|part| !part.is_empty())
+            .collect();
+        let excluded_extensions: Vec<String> = self
+            .scan_filter_excluded_extensions
+            .split([',', ';', '\n'])
+            .filter_map(|part| normalize_extension_filter(part.trim()))
+            .collect();
+        ScanFilterConfig {
+            excluded_directories,
+            excluded_extensions,
+            same_file_system: self.scan_filter_same_file_system,
+        }
     }
 
     fn cancel_scan(&mut self) {
@@ -237,6 +310,38 @@ impl CDriveManagerApp {
             handle.cancel();
             self.cleanup_cancel_requested = true;
             self.status_message = "正在取消清理预览，已发现的候选会保留……".to_owned();
+        }
+    }
+
+    fn start_duplicate_preview(&mut self) {
+        let Some(stats) = self.stats.as_ref() else {
+            self.status_message = "请先完成扫描或打开已保存的扫描结果，再查找重复文件。".to_owned();
+            return;
+        };
+
+        let root = stats.root.clone();
+        let min_size = self.duplicate_min_size_bytes;
+        self.duplicate_handle = Some(spawn_duplicate_preview(DuplicatePreviewOptions {
+            root: root.clone(),
+            min_size,
+        }));
+        self.duplicate_in_progress = true;
+        self.duplicate_cancel_requested = false;
+        self.duplicate_progress = None;
+        self.duplicate_preview = None;
+        self.selected_tab = ResultTab::DuplicatePreview;
+        self.status_message = format!(
+            "正在 dry-run 查找重复文件：{}，仅哈希不小于 {} 的同大小候选；不会删除、移动或修改任何文件。",
+            root.display(),
+            format::bytes(min_size)
+        );
+    }
+
+    fn cancel_duplicate_preview(&mut self) {
+        if let Some(handle) = &self.duplicate_handle {
+            handle.cancel();
+            self.duplicate_cancel_requested = true;
+            self.status_message = "正在取消重复文件检测，已发现的重复组会保留……".to_owned();
         }
     }
 
@@ -311,24 +416,59 @@ impl CDriveManagerApp {
         match load_scan_result_from_path(&path) {
             Ok(stats) => {
                 let metadata = scan_cache_metadata_summary(&stats);
-                self.root_input = stats.root.display().to_string();
-                self.stats = Some(Arc::new(stats));
-                self.progress = None;
-                self.scan_in_progress = false;
-                self.cancel_requested = false;
-                self.scan_handle = None;
-                self.cleanup_preview = None;
-                self.cleanup_progress = None;
-                self.cleanup_in_progress = false;
-                self.cleanup_cancel_requested = false;
-                self.cleanup_handle = None;
-                self.treemap_current_dir = None;
+                self.set_loaded_stats(stats);
                 self.status_message = format!("已打开扫描结果：{} ({})", path.display(), metadata);
             }
             Err(error) => {
                 self.status_message = format!("打开扫描结果失败：{} ({:#})", path.display(), error);
             }
         }
+    }
+
+    fn open_cached_scan_result(&mut self) {
+        let Some(root) = self.validate_root_input() else {
+            return;
+        };
+
+        match load_latest_scan(&root) {
+            Ok(Some(stats)) => {
+                let metadata = scan_cache_metadata_summary(&stats);
+                self.set_loaded_stats(stats);
+                self.status_message = format!(
+                    "已打开 SQLite 最新扫描缓存：{} ({})",
+                    root.display(),
+                    metadata
+                );
+            }
+            Ok(None) => {
+                self.status_message =
+                    format!("没有找到该目录的 SQLite 扫描缓存：{}", root.display());
+            }
+            Err(error) => {
+                self.status_message =
+                    format!("打开 SQLite 扫描缓存失败：{} ({:#})", root.display(), error);
+            }
+        }
+    }
+
+    fn set_loaded_stats(&mut self, stats: ScanStats) {
+        self.root_input = stats.root.display().to_string();
+        self.stats = Some(Arc::new(stats));
+        self.progress = None;
+        self.scan_in_progress = false;
+        self.cancel_requested = false;
+        self.scan_handle = None;
+        self.cleanup_preview = None;
+        self.cleanup_progress = None;
+        self.cleanup_in_progress = false;
+        self.cleanup_cancel_requested = false;
+        self.cleanup_handle = None;
+        self.duplicate_preview = None;
+        self.duplicate_progress = None;
+        self.duplicate_in_progress = false;
+        self.duplicate_cancel_requested = false;
+        self.duplicate_handle = None;
+        self.treemap_current_dir = None;
     }
 
     fn export_csv_report(&mut self) {
@@ -378,6 +518,33 @@ impl CDriveManagerApp {
             }
             Err(error) => {
                 self.status_message = format!("导出清理预览失败：{} ({:#})", path.display(), error);
+            }
+        }
+    }
+
+    fn export_duplicate_preview_csv(&mut self) {
+        let Some(preview) = self.current_duplicate_preview() else {
+            self.status_message = "没有可导出的重复文件预览。".to_owned();
+            return;
+        };
+
+        let Some(path) = FileDialog::new()
+            .set_title("导出重复文件预览 CSV")
+            .add_filter("CSV 报告", &["csv"])
+            .set_file_name("cdrive-duplicate-preview.csv")
+            .save_file()
+        else {
+            return;
+        };
+
+        match export_duplicate_preview_to_path(&path, preview.as_ref()) {
+            Ok(summary) => {
+                self.status_message =
+                    format!("已导出重复文件预览 CSV：{} ({})", path.display(), summary);
+            }
+            Err(error) => {
+                self.status_message =
+                    format!("导出重复文件预览失败：{} ({:#})", path.display(), error);
             }
         }
     }
@@ -446,6 +613,38 @@ impl CDriveManagerApp {
         }
     }
 
+    fn poll_duplicate_preview_events(&mut self, ctx: &egui::Context) {
+        let Some(receiver) = self
+            .duplicate_handle
+            .as_ref()
+            .map(|handle| handle.receiver.clone())
+        else {
+            return;
+        };
+
+        let mut latest_progress = None;
+        let mut finished = None;
+
+        while let Ok(event) = receiver.try_recv() {
+            match event {
+                DuplicatePreviewEvent::Progress(progress) => latest_progress = Some(progress),
+                DuplicatePreviewEvent::Finished(result) => finished = Some(result),
+            }
+        }
+
+        if let Some(progress) = latest_progress {
+            self.apply_duplicate_preview_progress(progress);
+        }
+
+        if let Some(result) = finished {
+            self.apply_duplicate_preview_finished(result);
+        }
+
+        if self.duplicate_in_progress {
+            ctx.request_repaint_after(Duration::from_millis(120));
+        }
+    }
+
     fn apply_progress(&mut self, progress: ScanProgress) {
         self.status_message = if progress.cancelled {
             "扫描已取消，当前显示的是部分结果。".to_owned()
@@ -460,7 +659,12 @@ impl CDriveManagerApp {
     }
 
     fn apply_finished(&mut self, result: ScanFinished) {
-        self.status_message = if result.cancelled {
+        self.stats = Some(Arc::clone(&result.stats));
+        self.scan_in_progress = false;
+        self.cancel_requested = false;
+        self.scan_handle = None;
+
+        let mut message = if result.cancelled {
             format!(
                 "扫描已取消：已统计 {} 个文件，{} 个目录，部分结果共 {}。",
                 format::count(result.stats.file_count),
@@ -475,10 +679,19 @@ impl CDriveManagerApp {
                 format::bytes(result.stats.total_size)
             )
         };
-        self.stats = Some(result.stats);
-        self.scan_in_progress = false;
-        self.cancel_requested = false;
-        self.scan_handle = None;
+
+        if !result.cancelled {
+            match save_latest_scan(result.stats.as_ref()) {
+                Ok(path) => {
+                    message.push_str(&format!(" 已写入 SQLite 最新缓存：{}。", path.display()));
+                }
+                Err(error) => {
+                    message.push_str(&format!(" SQLite 最新缓存写入失败：{:#}。", error));
+                }
+            }
+        }
+
+        self.status_message = message;
     }
 
     fn apply_cleanup_preview_progress(&mut self, progress: CleanupPreviewProgress) {
@@ -520,6 +733,46 @@ impl CDriveManagerApp {
         self.cleanup_handle = None;
     }
 
+    fn apply_duplicate_preview_progress(&mut self, progress: DuplicatePreviewProgress) {
+        self.status_message = if progress.cancelled {
+            "重复文件检测已取消，当前显示的是部分 dry-run 结果。".to_owned()
+        } else if progress.finished {
+            "重复文件检测完成。".to_owned()
+        } else if let Some(path) = &progress.current_path {
+            format!("正在{}：{}", progress.phase.label(), path.display())
+        } else {
+            format!("正在{}……", progress.phase.label())
+        };
+        self.duplicate_progress = Some(progress);
+    }
+
+    fn apply_duplicate_preview_finished(&mut self, result: DuplicatePreviewFinished) {
+        self.status_message = if result.cancelled {
+            format!(
+                "重复文件检测已取消：{} 下发现 {} 个重复组，dry-run 预计可回收 {}，受保护 {}，错误 {} 条。",
+                result.preview.root.display(),
+                format::count(result.preview.duplicate_group_count),
+                format::bytes(result.preview.reclaimable_size),
+                format::bytes(result.preview.protected_size),
+                format::count(result.preview.error_count)
+            )
+        } else {
+            format!(
+                "重复文件检测完成：{} 下发现 {} 个重复组、{} 个重复副本，dry-run 预计可回收 {}，受保护 {}，错误 {} 条。当前版本不会执行删除。",
+                result.preview.root.display(),
+                format::count(result.preview.duplicate_group_count),
+                format::count(result.preview.duplicate_file_count),
+                format::bytes(result.preview.reclaimable_size),
+                format::bytes(result.preview.protected_size),
+                format::count(result.preview.error_count)
+            )
+        };
+        self.duplicate_preview = Some(result.preview);
+        self.duplicate_in_progress = false;
+        self.duplicate_cancel_requested = false;
+        self.duplicate_handle = None;
+    }
+
     fn current_stats(&self) -> Option<Arc<ScanStats>> {
         self.stats.as_ref().map(Arc::clone).or_else(|| {
             self.progress
@@ -531,6 +784,14 @@ impl CDriveManagerApp {
     fn current_cleanup_preview(&self) -> Option<Arc<CleanupPreview>> {
         self.cleanup_preview.as_ref().map(Arc::clone).or_else(|| {
             self.cleanup_progress
+                .as_ref()
+                .map(|progress| Arc::clone(&progress.preview))
+        })
+    }
+
+    fn current_duplicate_preview(&self) -> Option<Arc<DuplicatePreview>> {
+        self.duplicate_preview.as_ref().map(Arc::clone).or_else(|| {
+            self.duplicate_progress
                 .as_ref()
                 .map(|progress| Arc::clone(&progress.preview))
         })
@@ -576,36 +837,89 @@ impl CDriveManagerApp {
         }
     }
 
+    fn invalidate_duplicate_preview_after_config_change(&mut self) {
+        if !self.duplicate_in_progress
+            && (self.duplicate_preview.is_some() || self.duplicate_progress.is_some())
+        {
+            self.duplicate_preview = None;
+            self.duplicate_progress = None;
+            self.status_message = "重复检测配置已变化，请重新查找重复文件。".to_owned();
+        }
+    }
+
+    fn draw_scan_filter_config(&mut self, ui: &mut egui::Ui) {
+        ui.collapsing("扫描过滤配置", |ui| {
+            ui.label(
+                RichText::new("配置扫描时跳过的目录和文件类型，可减少扫描时间。")
+                    .small()
+                    .weak(),
+            );
+
+            let busy =
+                self.scan_in_progress || self.cleanup_in_progress || self.duplicate_in_progress;
+
+            ui.label(RichText::new("排除目录名称").strong());
+            ui.add_enabled(
+                !busy,
+                egui::TextEdit::multiline(&mut self.scan_filter_excluded_dirs)
+                    .hint_text("node_modules, target, .git")
+                    .desired_width(ui.available_width()),
+            );
+            ui.label(
+                RichText::new("目录名大小写不敏感，逗号/分号/换行分隔")
+                    .small()
+                    .weak(),
+            );
+
+            ui.add_space(6.0);
+            ui.label(RichText::new("排除文件扩展名").strong());
+            ui.add_enabled(
+                !busy,
+                egui::TextEdit::multiline(&mut self.scan_filter_excluded_extensions)
+                    .hint_text(".tmp, .log, [无扩展名]")
+                    .desired_width(ui.available_width()),
+            );
+            ui.label(
+                RichText::new("扩展名大小写不敏感，可带或不带点，逗号/分号/换行分隔")
+                    .small()
+                    .weak(),
+            );
+
+            ui.add_space(6.0);
+            ui.checkbox(&mut self.scan_filter_same_file_system, "限制在同一文件系统");
+            ui.label(
+                RichText::new("启用后不跨越挂载点扫描（如 C 盘不扫描 D 盘挂载目录）")
+                    .small()
+                    .weak(),
+            );
+        });
+    }
+
     fn draw_top_bar(&mut self, ctx: &egui::Context) {
         egui::TopBottomPanel::top("top_bar").show(ctx, |ui| {
             ui.horizontal_wrapped(|ui| {
+                let busy =
+                    self.scan_in_progress || self.cleanup_in_progress || self.duplicate_in_progress;
                 ui.heading("C 盘空间管理器");
                 ui.separator();
                 ui.label("扫描目录：");
                 let input = ui.text_edit_singleline(&mut self.root_input);
                 if input.lost_focus()
                     && ui.input(|input| input.key_pressed(egui::Key::Enter))
-                    && !self.scan_in_progress
-                    && !self.cleanup_in_progress
+                    && !busy
                 {
                     self.start_scan();
                 }
 
                 if ui
-                    .add_enabled(
-                        !self.scan_in_progress && !self.cleanup_in_progress,
-                        egui::Button::new("选择目录"),
-                    )
+                    .add_enabled(!busy, egui::Button::new("选择目录"))
                     .clicked()
                 {
                     self.choose_directory();
                 }
 
                 if ui
-                    .add_enabled(
-                        !self.scan_in_progress && !self.cleanup_in_progress,
-                        egui::Button::new("开始扫描"),
-                    )
+                    .add_enabled(!busy, egui::Button::new("开始扫描"))
                     .clicked()
                 {
                     self.start_scan();
@@ -624,31 +938,29 @@ impl CDriveManagerApp {
                 ui.separator();
 
                 if ui
-                    .add_enabled(
-                        !self.scan_in_progress && !self.cleanup_in_progress,
-                        egui::Button::new("打开结果"),
-                    )
+                    .add_enabled(!busy, egui::Button::new("打开结果"))
                     .clicked()
                 {
                     self.open_scan_result();
                 }
 
+                if ui
+                    .add_enabled(!busy, egui::Button::new("打开缓存"))
+                    .clicked()
+                {
+                    self.open_cached_scan_result();
+                }
+
                 let has_final_stats = self.stats.is_some();
                 if ui
-                    .add_enabled(
-                        !self.scan_in_progress && !self.cleanup_in_progress && has_final_stats,
-                        egui::Button::new("保存结果"),
-                    )
+                    .add_enabled(!busy && has_final_stats, egui::Button::new("保存结果"))
                     .clicked()
                 {
                     self.save_scan_result();
                 }
 
                 if ui
-                    .add_enabled(
-                        !self.scan_in_progress && !self.cleanup_in_progress && has_final_stats,
-                        egui::Button::new("导出 CSV"),
-                    )
+                    .add_enabled(!busy && has_final_stats, egui::Button::new("导出 CSV"))
                     .clicked()
                 {
                     self.export_csv_report();
@@ -658,10 +970,7 @@ impl CDriveManagerApp {
 
                 if ui
                     .add_enabled(
-                        !self.scan_in_progress
-                            && !self.cleanup_in_progress
-                            && has_final_stats
-                            && self.enabled_cleanup_rule_count() > 0,
+                        !busy && has_final_stats && self.enabled_cleanup_rule_count() > 0,
                         egui::Button::new("生成清理预览"),
                     )
                     .clicked()
@@ -681,9 +990,7 @@ impl CDriveManagerApp {
 
                 if ui
                     .add_enabled(
-                        !self.scan_in_progress
-                            && !self.cleanup_in_progress
-                            && self.current_cleanup_preview().is_some(),
+                        !busy && self.current_cleanup_preview().is_some(),
                         egui::Button::new("导出预览 CSV"),
                     )
                     .clicked()
@@ -691,7 +998,34 @@ impl CDriveManagerApp {
                     self.export_cleanup_preview_csv();
                 }
 
-                if self.scan_in_progress || self.cleanup_in_progress {
+                if ui
+                    .add_enabled(!busy && has_final_stats, egui::Button::new("查找重复文件"))
+                    .clicked()
+                {
+                    self.start_duplicate_preview();
+                }
+
+                if ui
+                    .add_enabled(
+                        self.duplicate_in_progress && !self.duplicate_cancel_requested,
+                        egui::Button::new("取消重复检测"),
+                    )
+                    .clicked()
+                {
+                    self.cancel_duplicate_preview();
+                }
+
+                if ui
+                    .add_enabled(
+                        !busy && self.current_duplicate_preview().is_some(),
+                        egui::Button::new("导出重复 CSV"),
+                    )
+                    .clicked()
+                {
+                    self.export_duplicate_preview_csv();
+                }
+
+                if busy {
                     ui.spinner();
                     let text = if self.scan_in_progress {
                         if self.cancel_requested {
@@ -699,10 +1033,16 @@ impl CDriveManagerApp {
                         } else {
                             "扫描中"
                         }
-                    } else if self.cleanup_cancel_requested {
-                        "取消预览中"
+                    } else if self.cleanup_in_progress {
+                        if self.cleanup_cancel_requested {
+                            "取消预览中"
+                        } else {
+                            "预览中"
+                        }
+                    } else if self.duplicate_cancel_requested {
+                        "取消重复检测中"
                     } else {
-                        "预览中"
+                        "重复检测中"
                     };
                     ui.label(RichText::new(text).strong());
                 }
@@ -758,6 +1098,46 @@ impl CDriveManagerApp {
                         label_value(ui, "预览状态", state.to_owned());
                     }
                 }
+
+                if let Some(preview) = self.current_duplicate_preview() {
+                    label_value(ui, "重复组", format::count(preview.duplicate_group_count));
+                    label_value(ui, "重复副本", format::count(preview.duplicate_file_count));
+                    label_value(ui, "预计可回收", format::bytes(preview.reclaimable_size));
+                    if self.duplicate_in_progress {
+                        let state = if self.duplicate_cancel_requested {
+                            "正在取消重复检测"
+                        } else if let Some(progress) = &self.duplicate_progress {
+                            progress.phase.label()
+                        } else {
+                            "正在检测重复文件"
+                        };
+                        label_value(ui, "重复检测", state.to_owned());
+                    }
+                }
+
+                if stats.filter_config.is_active() {
+                    ui.label(RichText::new("扫描过滤").strong());
+                    ui.label("已启用");
+                    ui.end_row();
+
+                    if !stats.filter_config.excluded_directories.is_empty() {
+                        label_value(
+                            ui,
+                            "排除目录",
+                            stats.filter_config.excluded_directories.join(", "),
+                        );
+                    }
+                    if !stats.filter_config.excluded_extensions.is_empty() {
+                        label_value(
+                            ui,
+                            "排除扩展名",
+                            stats.filter_config.excluded_extensions.join(", "),
+                        );
+                    }
+                    if stats.filter_config.same_file_system {
+                        label_value(ui, "同文件系统", "是".to_owned());
+                    }
+                }
             });
         ui.add_space(8.0);
         ui.label(
@@ -771,6 +1151,10 @@ impl CDriveManagerApp {
         }
         if self.cleanup_in_progress {
             ui.label(RichText::new("清理预览提示：预览只读取文件元数据，不删除、移动或修改任何文件。受保护候选不计入预计可清理空间。")
+                .small());
+        }
+        if self.duplicate_in_progress {
+            ui.label(RichText::new("重复检测提示：仅对同大小候选读取文件内容并计算 BLAKE3 哈希；当前版本只提供 dry-run 预览。")
                 .small());
         }
     }
@@ -790,6 +1174,12 @@ impl CDriveManagerApp {
                 &mut self.selected_tab,
                 ResultTab::CleanupPreview,
                 "清理预览",
+            );
+            tab_button(
+                ui,
+                &mut self.selected_tab,
+                ResultTab::DuplicatePreview,
+                "重复文件",
             );
             tab_button(ui, &mut self.selected_tab, ResultTab::Errors, "错误");
         });
@@ -825,6 +1215,7 @@ impl CDriveManagerApp {
                 extension_table(ui, stats, &self.search_query, &mut self.extension_sort)
             }
             ResultTab::CleanupPreview => self.draw_cleanup_preview_tab(ui),
+            ResultTab::DuplicatePreview => self.draw_duplicate_preview_tab(ui),
             ResultTab::Errors => error_list(ui, stats, &self.search_query),
         }
     }
@@ -845,7 +1236,7 @@ impl CDriveManagerApp {
             }
         });
         ui.label(
-            RichText::new("目录标签输入关键词后会搜索完整目录树；文件、类型、错误和清理预览搜索当前保留结果。")
+            RichText::new("目录标签输入关键词后会搜索完整目录树；文件标签在新扫描/新缓存中可搜索完整文件索引。类型、错误、清理预览和重复文件搜索当前保留结果。")
                 .small()
                 .weak(),
         );
@@ -859,6 +1250,41 @@ impl CDriveManagerApp {
             self.current_cleanup_preview().as_deref(),
             &self.search_query,
             &mut self.cleanup_sort,
+            &mut self.status_message,
+        );
+    }
+
+    fn draw_duplicate_preview_tab(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.label("最小候选大小:");
+            let mut min_size_text = self.duplicate_min_size_bytes.to_string();
+            let response = ui.add(
+                egui::TextEdit::singleline(&mut min_size_text)
+                    .hint_text("字节")
+                    .desired_width(80.0),
+            );
+            if response.changed() {
+                if let Ok(value) = min_size_text.parse::<u64>() {
+                    self.duplicate_min_size_bytes = value.max(1);
+                    self.invalidate_duplicate_preview_after_config_change();
+                }
+            }
+            ui.label(format!(
+                "(当前: {})",
+                format::bytes(self.duplicate_min_size_bytes)
+            ));
+        });
+        ui.label(
+            RichText::new("仅对大小 >= 最小候选的文件进行哈希比对。配置变更会清空已有预览。")
+                .small()
+                .weak(),
+        );
+        ui.separator();
+        duplicate_preview_table(
+            ui,
+            self.current_duplicate_preview().as_deref(),
+            &self.search_query,
+            &mut self.duplicate_sort,
             &mut self.status_message,
         );
     }
@@ -891,7 +1317,7 @@ impl CDriveManagerApp {
             }
         });
         ui.label(
-            RichText::new("规则变更会清空已有预览；请重新点击“生成清理预览”。")
+            RichText::new("规则变更会清空已有预览；请重新点击\"生成清理预览\"。")
                 .small()
                 .weak(),
         );
@@ -960,6 +1386,17 @@ impl CDriveManagerApp {
         ui.horizontal_wrapped(|ui| {
             ui.heading("空间占用图");
             ui.separator();
+            ui.selectable_value(
+                &mut self.visualization_mode,
+                VisualizationMode::Treemap,
+                "Treemap",
+            );
+            ui.selectable_value(
+                &mut self.visualization_mode,
+                VisualizationMode::Sunburst,
+                "旭日图",
+            );
+            ui.separator();
             if ui
                 .add_enabled(current_dir != stats.root, egui::Button::new("返回上级"))
                 .clicked()
@@ -981,7 +1418,7 @@ impl CDriveManagerApp {
         );
         ui.label(
             RichText::new(format!(
-                "完整目录树：{} 个直接子目录，直属文件 {} 个 / {}，Treemap 显示 {} / {} 个块。",
+                "完整目录树：{} 个直接子目录，直属文件 {} 个 / {}，当前图表显示 {} / {} 个块。",
                 format::count(child_count as u64),
                 format::count(current_node.record.direct_file_count),
                 format::bytes(current_node.record.direct_file_size),
@@ -991,11 +1428,15 @@ impl CDriveManagerApp {
             .small()
             .weak(),
         );
-        ui.label(
-            RichText::new("提示：Treemap 基于完整目录树；为保持可读性，矩形图最多显示当前目录下最大的 36 个块。")
-                .small()
-                .weak(),
-        );
+        let mode_hint = match self.visualization_mode {
+            VisualizationMode::Treemap => {
+                "提示：Treemap 基于完整目录树；为保持可读性，矩形图最多显示当前目录下最大的 36 个块。"
+            }
+            VisualizationMode::Sunburst => {
+                "提示：旭日图基于完整目录树；圆环从内到外展示最多 3 层目录，并聚合较小项目。"
+            }
+        };
+        ui.label(RichText::new(mode_hint).small().weak());
 
         let empty_message = if stats.total_size == 0 {
             "扫描后显示目录空间占用图"
@@ -1003,7 +1444,16 @@ impl CDriveManagerApp {
             "当前目录没有可显示的子目录或直属文件"
         };
 
-        if let Some(action) = draw_treemap(ui, &treemap_items, current_size, empty_message) {
+        let action = match self.visualization_mode {
+            VisualizationMode::Treemap => {
+                draw_treemap(ui, &treemap_items, current_size, empty_message)
+            }
+            VisualizationMode::Sunburst => {
+                draw_sunburst(ui, tree, current_index, current_size, empty_message)
+            }
+        };
+
+        if let Some(action) = action {
             self.handle_treemap_action(action, ui.ctx());
         }
     }
@@ -1054,19 +1504,25 @@ impl eframe::App for CDriveManagerApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_scan_events(ctx);
         self.poll_cleanup_preview_events(ctx);
+        self.poll_duplicate_preview_events(ctx);
         self.draw_top_bar(ctx);
 
         egui::SidePanel::left("summary_panel")
             .resizable(true)
             .default_width(300.0)
             .show(ctx, |ui| {
+                self.draw_scan_filter_config(ui);
+
+                ui.add_space(12.0);
+                ui.separator();
+
                 if let Some(stats) = self.current_stats() {
                     self.draw_summary(ui, stats.as_ref());
                 } else {
                     ui.heading("概览");
-                    ui.label("点击“开始扫描”后，这里会显示统计信息。");
+                    ui.label("点击\"开始扫描\"后，这里会显示统计信息。");
                     ui.add_space(8.0);
-                    ui.label("建议首次扫描小目录测试，再扫描整个 C 盘。  ");
+                    ui.label("建议首次扫描小目录测试，再扫描整个 C 盘。");
                 }
             });
 
@@ -1322,20 +1778,46 @@ fn file_table(
     status_message: &mut String,
 ) {
     let query = normalized_query(search_query);
-    let mut files: Vec<_> = stats
-        .largest_files
-        .iter()
-        .filter(|file| file_matches(file, &query))
-        .collect();
+    let use_full_file_search = !query.is_empty() && !stats.all_files.is_empty();
+    let mut files: Vec<_> = if use_full_file_search {
+        stats.all_files.iter().collect()
+    } else {
+        stats.largest_files.iter().collect()
+    };
+    files.retain(|file| file_matches(file, &query));
     files.sort_by(|left, right| compare_files(left, right, *sort));
 
     result_count_label(
         ui,
         files.len().min(120),
         files.len(),
-        stats.largest_files.len(),
-        "文件",
+        if use_full_file_search {
+            stats.all_files.len()
+        } else {
+            stats.largest_files.len()
+        },
+        if use_full_file_search {
+            "完整文件"
+        } else {
+            "文件"
+        },
     );
+    if use_full_file_search {
+        ui.label(
+            RichText::new("当前文件搜索基于完整文件索引；清空搜索后回到最大文件列表。")
+                .small()
+                .weak(),
+        );
+    } else if !query.is_empty()
+        && stats.all_files.is_empty()
+        && stats.file_count > stats.largest_files.len() as u64
+    {
+        ui.label(
+            RichText::new("当前结果没有完整文件索引（可能来自旧缓存或扫描中快照），只能搜索已保留的最大文件。")
+                .small()
+                .weak(),
+        );
+    }
 
     if files.is_empty() {
         ui.label("没有匹配的文件。");
@@ -1538,7 +2020,12 @@ fn export_csv_report_to_path(path: &Path, stats: &ScanStats) -> anyhow::Result<S
         stats.largest_dirs.len()
     };
 
-    for file in &stats.largest_files {
+    let exported_files = if stats.all_files.is_empty() {
+        &stats.largest_files
+    } else {
+        &stats.all_files
+    };
+    for file in exported_files {
         write_file_csv_row(&mut writer, file)?;
     }
 
@@ -1557,11 +2044,17 @@ fn export_csv_report_to_path(path: &Path, stats: &ScanStats) -> anyhow::Result<S
     } else {
         "Top 目录"
     };
+    let file_scope = if stats.all_files.is_empty() {
+        "最大文件"
+    } else {
+        "完整文件"
+    };
     Ok(format!(
-        "{} {}，{} 个最大文件，{} 个类型，{} 条错误",
+        "{} {}，{} 个{}，{} 个类型，{} 条错误",
         format::count(directory_count as u64),
         directory_scope,
-        format::count(stats.largest_files.len() as u64),
+        format::count(exported_files.len() as u64),
+        file_scope,
         format::count(stats.extensions.len() as u64),
         format::count(stats.errors.len() as u64)
     ))
@@ -1829,6 +2322,73 @@ fn write_cleanup_candidate_csv_row(
     )
 }
 
+fn export_duplicate_preview_to_path(
+    path: &Path,
+    preview: &DuplicatePreview,
+) -> anyhow::Result<String> {
+    let file = File::create(path)?;
+    let mut writer = BufWriter::new(file);
+
+    write_csv_row(
+        &mut writer,
+        [
+            "mode",
+            "action_taken",
+            "group_hash",
+            "group_size_bytes",
+            "group_size_display",
+            "duplicate_count",
+            "reclaimable_bytes",
+            "protected_bytes",
+            "file_role",
+            "protected",
+            "path",
+            "modified_unix_secs",
+        ],
+    )?;
+
+    for group in &preview.groups {
+        for file in &group.files {
+            write_duplicate_file_csv_row(&mut writer, group, file)?;
+        }
+    }
+
+    writer.flush()?;
+
+    Ok(format!(
+        "dry-run，保留 {} / 总计 {} 个重复组，重复副本 {} 个，预计可回收 {}，受保护 {}",
+        format::count(preview.groups.len() as u64),
+        format::count(preview.duplicate_group_count),
+        format::count(preview.duplicate_file_count),
+        format::bytes(preview.reclaimable_size),
+        format::bytes(preview.protected_size)
+    ))
+}
+
+fn write_duplicate_file_csv_row(
+    writer: &mut impl Write,
+    group: &DuplicateGroup,
+    file: &DuplicateFile,
+) -> anyhow::Result<()> {
+    write_csv_row(
+        writer,
+        [
+            "dry-run".to_owned(),
+            "none".to_owned(),
+            group.hash.clone(),
+            group.size.to_string(),
+            format::bytes(group.size),
+            group.duplicate_count.to_string(),
+            group.reclaimable_size.to_string(),
+            group.protected_size.to_string(),
+            if file.keep { "keep" } else { "duplicate" }.to_owned(),
+            file.protected.to_string(),
+            path_text(&file.path),
+            system_time_unix_secs(file.modified),
+        ],
+    )
+}
+
 fn cleanup_preview_table(
     ui: &mut egui::Ui,
     preview: Option<&CleanupPreview>,
@@ -1837,7 +2397,7 @@ fn cleanup_preview_table(
     status_message: &mut String,
 ) {
     let Some(preview) = preview else {
-        ui.label("点击“生成清理预览”后，这里会显示 dry-run 候选。当前版本不会删除任何文件。");
+        ui.label("点击\"生成清理预览\"后，这里会显示 dry-run 候选。当前版本不会删除任何文件。");
         return;
     };
 
@@ -1965,6 +2525,198 @@ fn cleanup_candidate_row(
         .on_hover_text(candidate.reason.clone());
     path_actions(ui, &candidate.path, open_target, status_message);
     ui.end_row();
+}
+
+fn duplicate_preview_table(
+    ui: &mut egui::Ui,
+    preview: Option<&DuplicatePreview>,
+    search_query: &str,
+    sort: &mut SortState<DuplicateSortKey>,
+    status_message: &mut String,
+) {
+    let Some(preview) = preview else {
+        ui.label(
+            "点击\"查找重复文件\"后，这里会显示 dry-run 重复文件组。当前版本不会删除任何文件。",
+        );
+        return;
+    };
+
+    ui.label(
+        RichText::new(format!(
+            "Dry-run 重复文件预览：根目录 {}，最小候选 {}，已扫描 {} 个文件，已哈希 {} 个候选。发现 {} 个重复组、{} 个重复副本，重复副本总大小 {}；预计可回收 {}，受保护 {}，错误 {} 条。",
+            preview.root.display(),
+            format::bytes(preview.min_size),
+            format::count(preview.scanned_file_count),
+            format::count(preview.hashed_file_count),
+            format::count(preview.duplicate_group_count),
+            format::count(preview.duplicate_file_count),
+            format::bytes(preview.duplicate_size),
+            format::bytes(preview.reclaimable_size),
+            format::bytes(preview.protected_size),
+            format::count(preview.error_count)
+        ))
+        .small()
+        .strong(),
+    );
+    ui.label(
+        RichText::new("每组默认保留修改时间最早、路径排序最靠前的一个文件；其它文件仅作为 dry-run 重复副本显示。受保护重复副本不计入预计可回收空间。")
+            .small()
+            .weak(),
+    );
+    if !preview.errors.is_empty() {
+        ui.label(
+            RichText::new(format!(
+                "重复检测过程中记录了 {} 条访问错误，当前保留 {} 条。",
+                format::count(preview.error_count),
+                format::count(preview.errors.len() as u64)
+            ))
+            .small()
+            .weak(),
+        );
+    }
+
+    let query = normalized_query(search_query);
+    let mut groups: Vec<_> = preview
+        .groups
+        .iter()
+        .filter(|group| duplicate_group_matches(group, &query))
+        .collect();
+    groups.sort_by(|left, right| compare_duplicate_groups(left, right, *sort));
+
+    result_count_label(
+        ui,
+        groups.len().min(120),
+        groups.len(),
+        preview.groups.len(),
+        "重复组",
+    );
+
+    if groups.is_empty() {
+        ui.label("没有匹配的重复文件组。 ");
+        return;
+    }
+
+    egui::ScrollArea::vertical()
+        .max_height(360.0)
+        .show(ui, |ui| {
+            egui::Grid::new("duplicate_preview_table")
+                .striped(true)
+                .num_columns(8)
+                .spacing([12.0, 4.0])
+                .show(ui, |ui| {
+                    sortable_header(
+                        ui,
+                        "大小",
+                        DuplicateSortKey::Size,
+                        SortDirection::Desc,
+                        sort,
+                    );
+                    sortable_header(
+                        ui,
+                        "副本",
+                        DuplicateSortKey::Count,
+                        SortDirection::Desc,
+                        sort,
+                    );
+                    sortable_header(
+                        ui,
+                        "可回收",
+                        DuplicateSortKey::Reclaimable,
+                        SortDirection::Desc,
+                        sort,
+                    );
+                    sortable_header(
+                        ui,
+                        "保护",
+                        DuplicateSortKey::Protected,
+                        SortDirection::Desc,
+                        sort,
+                    );
+                    sortable_header(
+                        ui,
+                        "保留路径",
+                        DuplicateSortKey::KeepPath,
+                        SortDirection::Asc,
+                        sort,
+                    );
+                    plain_header(ui, "哈希");
+                    plain_header(ui, "组内文件");
+                    plain_header(ui, "操作");
+                    ui.end_row();
+
+                    for group in groups.into_iter().take(120) {
+                        duplicate_group_row(ui, group, status_message);
+                    }
+                });
+        });
+}
+
+fn duplicate_group_matches(group: &DuplicateGroup, query: &str) -> bool {
+    query.is_empty()
+        || text_matches(&group.hash, query)
+        || text_matches(&group.keep_path.display().to_string(), query)
+        || group
+            .files
+            .iter()
+            .any(|file| text_matches(&file.path.display().to_string(), query))
+}
+
+fn duplicate_group_row(ui: &mut egui::Ui, group: &DuplicateGroup, status_message: &mut String) {
+    ui.label(format::bytes(group.size));
+    ui.label(format::count(group.duplicate_count));
+    ui.label(format::bytes(group.reclaimable_size));
+    ui.label(if group.protected_size > 0 {
+        RichText::new(format::bytes(group.protected_size)).strong()
+    } else {
+        RichText::new("-")
+    });
+
+    let keep_path_text = group.keep_path.display().to_string();
+    let keep_open_target = group
+        .keep_path
+        .parent()
+        .unwrap_or(group.keep_path.as_path());
+    let keep_response = ui
+        .label(compact_text(&keep_path_text, 58))
+        .on_hover_text(keep_path_text.clone());
+    path_context_menu(
+        keep_response,
+        &group.keep_path,
+        keep_open_target,
+        &file_name(&group.keep_path),
+        status_message,
+    );
+
+    ui.label(compact_text(&group.hash, 12))
+        .on_hover_text(group.hash.clone());
+
+    ui.vertical(|ui| {
+        for file in &group.files {
+            duplicate_file_line(ui, file, status_message);
+        }
+    });
+
+    path_actions(ui, &group.keep_path, keep_open_target, status_message);
+    ui.end_row();
+}
+
+fn duplicate_file_line(ui: &mut egui::Ui, file: &DuplicateFile, status_message: &mut String) {
+    let role = if file.keep { "保留" } else { "重复" };
+    let protection = if file.protected { " / 受保护" } else { "" };
+    let text = format!("{}{} · {}", role, protection, file.path.display());
+    let open_target = file.path.parent().unwrap_or(file.path.as_path());
+    let response = ui.label(compact_text(&text, 84)).on_hover_text(format!(
+        "{}\n{}",
+        text,
+        format::bytes(file.size)
+    ));
+    path_context_menu(
+        response,
+        &file.path,
+        open_target,
+        &file_name(&file.path),
+        status_message,
+    );
 }
 
 fn extension_table(
@@ -2187,6 +2939,22 @@ fn compare_cleanup_candidates(
     };
 
     apply_direction(primary, sort.direction).then_with(|| left.path.cmp(&right.path))
+}
+
+fn compare_duplicate_groups(
+    left: &DuplicateGroup,
+    right: &DuplicateGroup,
+    sort: SortState<DuplicateSortKey>,
+) -> Ordering {
+    let primary = match sort.key {
+        DuplicateSortKey::Size => left.size.cmp(&right.size),
+        DuplicateSortKey::Count => left.duplicate_count.cmp(&right.duplicate_count),
+        DuplicateSortKey::Reclaimable => left.reclaimable_size.cmp(&right.reclaimable_size),
+        DuplicateSortKey::Protected => left.protected_size.cmp(&right.protected_size),
+        DuplicateSortKey::KeepPath => left.keep_path.cmp(&right.keep_path),
+    };
+
+    apply_direction(primary, sort.direction).then_with(|| left.keep_path.cmp(&right.keep_path))
 }
 
 fn apply_direction(ordering: Ordering, direction: SortDirection) -> Ordering {

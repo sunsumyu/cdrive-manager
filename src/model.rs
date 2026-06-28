@@ -7,7 +7,53 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 
-pub const SCAN_STATS_SCHEMA_VERSION: u32 = 2;
+pub const SCAN_STATS_SCHEMA_VERSION: u32 = 4;
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ScanFilterConfig {
+    #[serde(default)]
+    pub excluded_directories: Vec<String>,
+    #[serde(default)]
+    pub excluded_extensions: Vec<String>,
+    #[serde(default)]
+    pub same_file_system: bool,
+}
+
+impl Default for ScanFilterConfig {
+    fn default() -> Self {
+        Self {
+            excluded_directories: Vec::new(),
+            excluded_extensions: Vec::new(),
+            same_file_system: false,
+        }
+    }
+}
+
+impl ScanFilterConfig {
+    pub fn is_active(&self) -> bool {
+        !self.excluded_directories.is_empty()
+            || !self.excluded_extensions.is_empty()
+            || self.same_file_system
+    }
+}
+
+pub fn normalize_extension_filter(extension: &str) -> Option<String> {
+    let extension = extension.trim();
+    if extension.is_empty() {
+        return None;
+    }
+
+    if extension == "无扩展名" || extension == "[无扩展名]" {
+        return Some("[无扩展名]".to_owned());
+    }
+
+    let extension = extension.trim_start_matches('.').to_ascii_lowercase();
+    if extension.is_empty() {
+        None
+    } else {
+        Some(format!(".{extension}"))
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileRecord {
@@ -100,11 +146,15 @@ pub struct ScanStats {
     #[serde(default)]
     pub app_version: Option<String>,
     pub root: PathBuf,
+    #[serde(default)]
+    pub filter_config: ScanFilterConfig,
     pub total_size: u64,
     pub file_count: u64,
     pub dir_count: u64,
     pub error_count: u64,
     pub largest_files: Vec<FileRecord>,
+    #[serde(default)]
+    pub all_files: Vec<FileRecord>,
     pub largest_dirs: Vec<DirectoryRecord>,
     pub extensions: Vec<ExtensionRecord>,
     pub errors: Vec<String>,
@@ -119,11 +169,13 @@ impl Default for ScanStats {
             saved_at_unix_secs: None,
             app_version: Some(env!("CARGO_PKG_VERSION").to_owned()),
             root: PathBuf::new(),
+            filter_config: ScanFilterConfig::default(),
             total_size: 0,
             file_count: 0,
             dir_count: 0,
             error_count: 0,
             largest_files: Vec::new(),
+            all_files: Vec::new(),
             largest_dirs: Vec::new(),
             extensions: Vec::new(),
             errors: Vec::new(),
@@ -139,20 +191,27 @@ fn default_schema_version() -> u32 {
 #[derive(Debug, Clone, Default)]
 pub struct ScanAccumulator {
     root: PathBuf,
+    filter_config: ScanFilterConfig,
     total_size: u64,
     file_count: u64,
     dir_count: u64,
     error_count: u64,
     dir_sizes: HashMap<PathBuf, DirectoryRecord>,
     extension_sizes: HashMap<String, ExtensionRecord>,
+    all_files: Vec<FileRecord>,
     largest_files: Vec<FileRecord>,
     errors: Vec<String>,
 }
 
 impl ScanAccumulator {
     pub fn new(root: PathBuf) -> Self {
+        Self::new_with_filter_config(root, ScanFilterConfig::default())
+    }
+
+    pub fn new_with_filter_config(root: PathBuf, filter_config: ScanFilterConfig) -> Self {
         let mut this = Self {
             root: root.clone(),
+            filter_config,
             ..Self::default()
         };
         this.record_directory(root);
@@ -215,6 +274,7 @@ impl ScanAccumulator {
             }
         }
 
+        self.all_files.push(file.clone());
         push_largest(&mut self.largest_files, file, 250, |item| item.size);
     }
 
@@ -226,14 +286,14 @@ impl ScanAccumulator {
     }
 
     pub fn progress_snapshot(&self) -> ScanStats {
-        self.snapshot(false)
+        self.snapshot(false, false)
     }
 
     pub fn final_snapshot(&self) -> ScanStats {
-        self.snapshot(true)
+        self.snapshot(true, true)
     }
 
-    fn snapshot(&self, include_tree: bool) -> ScanStats {
+    fn snapshot(&self, include_tree: bool, include_all_files: bool) -> ScanStats {
         let mut largest_dirs: Vec<_> = self.dir_sizes.values().cloned().collect();
         largest_dirs.sort_by(compare_size_then_path_dir);
         largest_dirs.truncate(250);
@@ -245,16 +305,26 @@ impl ScanAccumulator {
         let mut largest_files = self.largest_files.clone();
         largest_files.sort_by(compare_size_then_path_file);
 
+        let all_files = if include_all_files {
+            let mut all_files = self.all_files.clone();
+            all_files.sort_by(compare_path_then_size_file);
+            all_files
+        } else {
+            Vec::new()
+        };
+
         ScanStats {
             schema_version: SCAN_STATS_SCHEMA_VERSION,
             saved_at_unix_secs: None,
             app_version: Some(env!("CARGO_PKG_VERSION").to_owned()),
             root: self.root.clone(),
+            filter_config: self.filter_config.clone(),
             total_size: self.total_size,
             file_count: self.file_count,
             dir_count: self.dir_count,
             error_count: self.error_count,
             largest_files,
+            all_files,
             largest_dirs,
             extensions,
             errors: self.errors.clone(),
@@ -353,6 +423,12 @@ fn compare_size_then_path_file(left: &FileRecord, right: &FileRecord) -> Orderin
         .then_with(|| left.path.cmp(&right.path))
 }
 
+fn compare_path_then_size_file(left: &FileRecord, right: &FileRecord) -> Ordering {
+    left.path
+        .cmp(&right.path)
+        .then_with(|| right.size.cmp(&left.size))
+}
+
 fn compare_size_then_path_dir(left: &DirectoryRecord, right: &DirectoryRecord) -> Ordering {
     right
         .total_size
@@ -429,6 +505,98 @@ mod tests {
             stats.app_version.as_deref(),
             Some(env!("CARGO_PKG_VERSION"))
         );
+    }
+
+    #[test]
+    fn final_snapshot_retains_all_files_but_progress_snapshot_does_not() {
+        let root = PathBuf::from("C:\\many-files");
+        let mut accumulator = ScanAccumulator::new(root.clone());
+        for index in 0..300 {
+            accumulator.record_file(FileRecord {
+                path: root.join(format!("file-{index:03}.bin")),
+                size: index,
+                modified: None,
+                extension: ".bin".to_owned(),
+            });
+        }
+
+        let progress = accumulator.progress_snapshot();
+        assert!(progress.all_files.is_empty());
+        assert_eq!(progress.largest_files.len(), 250);
+
+        let final_stats = accumulator.final_snapshot();
+        assert_eq!(final_stats.all_files.len(), 300);
+        assert_eq!(final_stats.largest_files.len(), 250);
+        assert!(
+            final_stats
+                .all_files
+                .iter()
+                .any(|file| file.path.ends_with("file-000.bin"))
+        );
+    }
+
+    #[test]
+    fn old_json_without_all_files_loads_with_empty_index() {
+        let json = r#"{
+            "schema_version": 2,
+            "root": "C:\\\\old-cache",
+            "total_size": 0,
+            "file_count": 0,
+            "dir_count": 0,
+            "error_count": 0,
+            "largest_files": [],
+            "largest_dirs": [],
+            "extensions": [],
+            "errors": []
+        }"#;
+
+        let stats: ScanStats = serde_json::from_str(json).unwrap();
+        assert!(stats.all_files.is_empty());
+    }
+
+    #[test]
+    fn filter_config_round_trips_in_snapshots() {
+        let root = PathBuf::from("C:\\filtered-root");
+        let filter_config = ScanFilterConfig {
+            excluded_directories: vec!["target".to_owned()],
+            excluded_extensions: vec![".tmp".to_owned()],
+            same_file_system: true,
+        };
+        let accumulator = ScanAccumulator::new_with_filter_config(root, filter_config.clone());
+
+        let stats = accumulator.final_snapshot();
+
+        assert_eq!(stats.filter_config, filter_config);
+    }
+
+    #[test]
+    fn old_json_without_filter_config_loads_with_default_filter() {
+        let json = r#"{
+            "schema_version": 3,
+            "root": "C:\\\\old-cache",
+            "total_size": 0,
+            "file_count": 0,
+            "dir_count": 0,
+            "error_count": 0,
+            "largest_files": [],
+            "largest_dirs": [],
+            "extensions": [],
+            "errors": []
+        }"#;
+
+        let stats: ScanStats = serde_json::from_str(json).unwrap();
+        assert_eq!(stats.filter_config, ScanFilterConfig::default());
+    }
+
+    #[test]
+    fn extension_filter_normalization_matches_file_labels() {
+        assert_eq!(normalize_extension_filter("tmp").as_deref(), Some(".tmp"));
+        assert_eq!(normalize_extension_filter(".LOG").as_deref(), Some(".log"));
+        assert_eq!(
+            normalize_extension_filter("[无扩展名]").as_deref(),
+            Some("[无扩展名]")
+        );
+        assert_eq!(normalize_extension_filter("  "), None);
     }
 
     fn assert_directory_size_invariant(tree: &DirectoryTree, index: usize) -> u64 {

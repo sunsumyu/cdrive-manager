@@ -1,8 +1,11 @@
 mod app;
 mod cleanup;
+mod duplicates;
 mod format;
 mod model;
+mod scan_cache;
 mod scanner;
+mod sunburst;
 mod treemap;
 
 use app::CDriveManagerApp;
