@@ -11,6 +11,31 @@ mod treemap;
 use app::CDriveManagerApp;
 
 fn main() -> eframe::Result<()> {
+    // Setup Chinese font support
+    let mut fonts = egui::FontDefinitions::default();
+    
+    // Add Chinese font family
+    fonts.font_data.insert(
+        "chinese".to_owned(),
+        egui::FontData::from_static(include_bytes!(
+            "C:\\Windows\\Fonts\\msyh.ttc"
+        ))
+        .into(),
+    );
+    
+    // Set Chinese font as primary for prose text
+    fonts
+        .families
+        .entry(egui::FontFamily::Proportional)
+        .or_default()
+        .insert(0, "chinese".to_owned());
+    
+    fonts
+        .families
+        .entry(egui::FontFamily::Monospace)
+        .or_default()
+        .insert(0, "chinese".to_owned());
+
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("C 盘空间管理器")
@@ -22,6 +47,9 @@ fn main() -> eframe::Result<()> {
     eframe::run_native(
         "C 盘空间管理器",
         options,
-        Box::new(|cc| Ok(Box::new(CDriveManagerApp::new(cc)))),
+        Box::new(|cc| {
+            cc.egui_ctx.set_fonts(fonts);
+            Ok(Box::new(CDriveManagerApp::new(cc)))
+        }),
     )
 }
