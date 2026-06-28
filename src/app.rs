@@ -26,7 +26,11 @@ use crate::{
         DirectoryRecord, DirectoryTree, ExtensionRecord, FileRecord, ScanFilterConfig, ScanStats,
         normalize_extension_filter,
     },
-    scan_cache::{load_latest_scan, save_latest_scan},
+    scan_cache::{
+        ScanCacheEntry, default_cache_db_path, delete_scan_cache_by_root_key, format_saved_at_time,
+        get_cache_db_size, list_scan_cache_entries, load_latest_scan, load_scan_cache_by_root_key,
+        save_latest_scan,
+    },
     scanner::{ScanEvent, ScanFinished, ScanHandle, ScanOptions, ScanProgress, spawn_scan},
     sunburst::draw_sunburst,
     treemap::{TreemapAction, TreemapItem, draw_treemap},
@@ -64,6 +68,11 @@ pub struct CDriveManagerApp {
     scan_filter_excluded_extensions: String,
     scan_filter_same_file_system: bool,
     duplicate_min_size_bytes: u64,
+    cache_manager_open: bool,
+    cache_entries: Vec<ScanCacheEntry>,
+    cache_db_path: Option<PathBuf>,
+    cache_db_size: Option<u64>,
+    cache_delete_confirmation: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -225,6 +234,11 @@ impl CDriveManagerApp {
             scan_filter_excluded_extensions: String::new(),
             scan_filter_same_file_system: false,
             duplicate_min_size_bytes: DEFAULT_DUPLICATE_MIN_SIZE_BYTES,
+            cache_manager_open: false,
+            cache_entries: Vec::new(),
+            cache_db_path: None,
+            cache_db_size: None,
+            cache_delete_confirmation: None,
         }
     }
 
@@ -999,10 +1013,19 @@ impl CDriveManagerApp {
                 }
 
                 if ui
-                    .add_enabled(!busy && has_final_stats, egui::Button::new("查找重复文件"))
+                    .add_enabled(!busy, egui::Button::new("导出重复 CSV"))
                     .clicked()
                 {
-                    self.start_duplicate_preview();
+                    self.export_duplicate_preview_csv();
+                }
+
+                ui.separator();
+
+                if ui
+                    .add_enabled(!busy, egui::Button::new("缓存管理"))
+                    .clicked()
+                {
+                    self.open_cache_manager();
                 }
 
                 if ui
@@ -1156,6 +1179,199 @@ impl CDriveManagerApp {
         if self.duplicate_in_progress {
             ui.label(RichText::new("重复检测提示：仅对同大小候选读取文件内容并计算 BLAKE3 哈希；当前版本只提供 dry-run 预览。")
                 .small());
+        }
+    }
+
+    fn open_cache_manager(&mut self) {
+        self.cache_manager_open = true;
+        self.refresh_cache_entries();
+    }
+
+    fn refresh_cache_entries(&mut self) {
+        match default_cache_db_path() {
+            Ok(db_path) => {
+                self.cache_db_path = Some(db_path.clone());
+                self.cache_entries = list_scan_cache_entries(&db_path).unwrap_or_default();
+                self.cache_db_size = get_cache_db_size(&db_path).ok().flatten();
+            }
+            Err(e) => {
+                self.status_message = format!("无法获取缓存数据库路径: {}", e);
+                self.cache_db_path = None;
+                self.cache_entries = Vec::new();
+                self.cache_db_size = None;
+            }
+        }
+    }
+
+    fn draw_cache_manager_window(&mut self, ctx: &egui::Context) {
+        if !self.cache_manager_open {
+            return;
+        }
+
+        // Collect data needed for the UI
+        let db_path = self.cache_db_path.clone();
+        let db_size = self.cache_db_size;
+        let entries = self.cache_entries.clone();
+        let delete_confirmation = self.cache_delete_confirmation.clone();
+
+        // Actions to perform after the UI pass
+        let mut load_entry_key: Option<String> = None;
+        let mut delete_entry_key: Option<String> = None;
+        let mut confirm_delete: bool = false;
+        let mut cancel_delete: bool = false;
+        let mut refresh_requested = false;
+
+        egui::Window::new("缓存管理")
+            .open(&mut self.cache_manager_open)
+            .default_size([500.0, 400.0])
+            .show(ctx, |ui| {
+                // Database info
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("缓存数据库:").strong());
+                    if let Some(ref path) = db_path {
+                        ui.label(path.display().to_string());
+                    }
+                });
+
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("数据库大小:").strong());
+                    if let Some(size) = db_size {
+                        ui.label(format::bytes(size));
+                    } else {
+                        ui.label("未知");
+                    }
+                });
+
+                ui.add_space(8.0);
+                ui.separator();
+                ui.add_space(4.0);
+
+                // Cache entries list
+                ui.heading("已保存的扫描结果");
+                ui.add_space(4.0);
+
+                if entries.is_empty() {
+                    ui.label("暂无已保存的扫描结果。");
+                } else {
+                    egui::ScrollArea::vertical()
+                        .max_height(250.0)
+                        .show(ui, |ui| {
+                            for entry in &entries {
+                                ui.group(|ui| {
+                                    ui.horizontal(|ui| {
+                                        ui.label(RichText::new(&entry.root_display).strong());
+                                    });
+                                    ui.horizontal_wrapped(|ui| {
+                                        ui.label(format!(
+                                            "保存时间: {}",
+                                            format_saved_at_time(entry.saved_at_unix_secs)
+                                        ));
+                                        ui.label(format!(
+                                            "大小: {}",
+                                            format::bytes(entry.total_size)
+                                        ));
+                                        ui.label(format!(
+                                            "文件: {}",
+                                            format::count(entry.file_count)
+                                        ));
+                                    });
+                                    ui.horizontal(|ui| {
+                                        if ui.small_button("加载").clicked() {
+                                            load_entry_key = Some(entry.root_key.clone());
+                                        }
+                                        if ui.small_button("删除").clicked() {
+                                            delete_entry_key = Some(entry.root_key.clone());
+                                        }
+                                    });
+                                });
+                                ui.add_space(4.0);
+                            }
+                        });
+                }
+
+                // Delete confirmation dialog
+                if let Some(ref root_key) = delete_confirmation {
+                    ui.add_space(8.0);
+                    ui.separator();
+                    ui.add_space(4.0);
+                    egui::Frame::NONE
+                        .fill(egui::Color32::from_rgba_unmultiplied(255, 200, 200, 50))
+                        .inner_margin(8.0)
+                        .show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                ui.label(format!("确定要删除此缓存记录吗？路径: {}", root_key));
+                            });
+                            ui.horizontal(|ui| {
+                                if ui.small_button("确认删除").clicked() {
+                                    confirm_delete = true;
+                                }
+                                if ui.small_button("取消").clicked() {
+                                    cancel_delete = true;
+                                }
+                            });
+                        });
+                }
+
+                ui.add_space(8.0);
+                ui.separator();
+                ui.add_space(4.0);
+
+                // Refresh button
+                if ui.button("刷新列表").clicked() {
+                    refresh_requested = true;
+                }
+            });
+
+        // Handle actions after the UI pass
+        if let Some(key) = load_entry_key {
+            if let Some(ref db_path) = self.cache_db_path {
+                match load_scan_cache_by_root_key(db_path, &key) {
+                    Ok(Some(stats)) => {
+                        self.stats = Some(Arc::new(stats));
+                        self.treemap_current_dir = None;
+                        self.status_message = format!("已从缓存加载：{}", key);
+                        self.cache_manager_open = false;
+                    }
+                    Ok(None) => {
+                        self.status_message = "缓存记录不存在".to_owned();
+                    }
+                    Err(e) => {
+                        self.status_message = format!("加载缓存失败: {}", e);
+                    }
+                }
+            }
+        }
+
+        if let Some(key) = delete_entry_key {
+            self.cache_delete_confirmation = Some(key);
+        }
+
+        if confirm_delete {
+            if let Some(ref root_key) = self.cache_delete_confirmation {
+                if let Some(ref db_path) = self.cache_db_path {
+                    match delete_scan_cache_by_root_key(db_path, root_key) {
+                        Ok(true) => {
+                            self.status_message = format!("已删除缓存: {}", root_key);
+                            self.refresh_cache_entries();
+                        }
+                        Ok(false) => {
+                            self.status_message = "缓存记录不存在".to_owned();
+                        }
+                        Err(e) => {
+                            self.status_message = format!("删除缓存失败: {}", e);
+                        }
+                    }
+                }
+            }
+            self.cache_delete_confirmation = None;
+        }
+
+        if cancel_delete {
+            self.cache_delete_confirmation = None;
+        }
+
+        if refresh_requested {
+            self.refresh_cache_entries();
         }
     }
 
@@ -1506,6 +1722,7 @@ impl eframe::App for CDriveManagerApp {
         self.poll_cleanup_preview_events(ctx);
         self.poll_duplicate_preview_events(ctx);
         self.draw_top_bar(ctx);
+        self.draw_cache_manager_window(ctx);
 
         egui::SidePanel::left("summary_panel")
             .resizable(true)

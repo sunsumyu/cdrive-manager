@@ -8,6 +8,19 @@ use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::model::ScanStats;
 
+#[derive(Debug, Clone)]
+pub struct ScanCacheEntry {
+    pub root_key: String,
+    pub root_display: String,
+    pub schema_version: u32,
+    pub app_version: Option<String>,
+    pub saved_at_unix_secs: u64,
+    pub total_size: u64,
+    pub file_count: u64,
+    pub dir_count: u64,
+    pub error_count: u64,
+}
+
 pub fn default_cache_db_path() -> anyhow::Result<PathBuf> {
     if let Some(local_app_data) = env::var_os("LOCALAPPDATA") {
         return Ok(PathBuf::from(local_app_data)
@@ -137,6 +150,121 @@ fn root_key(path: &Path) -> String {
         .replace('/', "\\")
         .trim_end_matches('\\')
         .to_ascii_lowercase()
+}
+
+pub fn list_scan_cache_entries(db_path: &Path) -> anyhow::Result<Vec<ScanCacheEntry>> {
+    if !db_path.exists() {
+        return Ok(Vec::new());
+    }
+    let connection = Connection::open(db_path)?;
+    initialize_schema(&connection)?;
+
+    let mut stmt = connection.prepare(
+        "SELECT root_key, root_display, schema_version, app_version, saved_at_unix_secs, total_size, file_count, dir_count, error_count
+         FROM scan_cache ORDER BY saved_at_unix_secs DESC",
+    )?;
+
+    let entries = stmt
+        .query_map([], |row| {
+            Ok(ScanCacheEntry {
+                root_key: row.get(0)?,
+                root_display: row.get(1)?,
+                schema_version: row.get::<_, i64>(2)? as u32,
+                app_version: row.get(3)?,
+                saved_at_unix_secs: row.get::<_, i64>(4)? as u64,
+                total_size: row.get::<_, i64>(5)? as u64,
+                file_count: row.get::<_, i64>(6)? as u64,
+                dir_count: row.get::<_, i64>(7)? as u64,
+                error_count: row.get::<_, i64>(8)? as u64,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+
+    Ok(entries)
+}
+
+pub fn load_scan_cache_by_root_key(
+    db_path: &Path,
+    root_key: &str,
+) -> anyhow::Result<Option<ScanStats>> {
+    if !db_path.exists() {
+        return Ok(None);
+    }
+    let connection = Connection::open(db_path)?;
+    initialize_schema(&connection)?;
+
+    let stats_json: Option<Vec<u8>> = connection
+        .query_row(
+            "SELECT stats_json FROM scan_cache WHERE root_key = ?1",
+            params![root_key],
+            |row| row.get(0),
+        )
+        .optional()?;
+
+    stats_json
+        .map(|stats_json| {
+            let mut stats: ScanStats = serde_json::from_slice(&stats_json)
+                .context("SQLite 缓存中的扫描结果 JSON 无法解析")?;
+            stats.normalize_cache_metadata_after_load();
+            stats.rebuild_indexes();
+            Ok(stats)
+        })
+        .transpose()
+}
+
+pub fn delete_scan_cache_by_root_key(db_path: &Path, root_key: &str) -> anyhow::Result<bool> {
+    if !db_path.exists() {
+        return Ok(false);
+    }
+    let connection = Connection::open(db_path)?;
+    initialize_schema(&connection)?;
+
+    let rows_deleted = connection.execute(
+        "DELETE FROM scan_cache WHERE root_key = ?1",
+        params![root_key],
+    )?;
+
+    Ok(rows_deleted > 0)
+}
+
+pub fn get_cache_db_size(db_path: &Path) -> anyhow::Result<Option<u64>> {
+    if !db_path.exists() {
+        return Ok(None);
+    }
+    let metadata = fs::metadata(db_path)?;
+    Ok(Some(metadata.len()))
+}
+
+pub fn format_saved_at_time(saved_at_unix_secs: u64) -> String {
+    if saved_at_unix_secs == 0 {
+        return "未知时间".to_owned();
+    }
+    let datetime = chrono_timestamp(saved_at_unix_secs);
+    datetime
+}
+
+fn chrono_timestamp(unix_secs: u64) -> String {
+    // Simple formatting without chrono dependency
+    let days = unix_secs / 86400;
+    let hours = (unix_secs % 86400) / 3600;
+    let minutes = (unix_secs % 3600) / 60;
+    let secs = unix_secs % 60;
+
+    // Approximate date calculation (not precise but sufficient for display)
+    let years_since_1970 = days / 365;
+    let remaining_days = days % 365;
+    let months_approx = remaining_days / 30;
+    let day_approx = remaining_days % 30;
+
+    format!(
+        "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
+        1970 + years_since_1970,
+        months_approx + 1,
+        day_approx + 1,
+        hours,
+        minutes,
+        secs
+    )
 }
 
 #[cfg(test)]
