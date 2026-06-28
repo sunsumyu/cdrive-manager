@@ -1612,26 +1612,11 @@ impl CDriveManagerApp {
                 VisualizationMode::Sunburst,
                 "旭日图",
             );
-            ui.separator();
-            if ui
-                .add_enabled(current_dir != stats.root, egui::Button::new("返回上级"))
-                .clicked()
-            {
-                self.treemap_current_dir = Some(treemap_parent_dir(stats, &current_dir));
-            }
-            if ui
-                .add_enabled(current_dir != stats.root, egui::Button::new("返回根目录"))
-                .clicked()
-            {
-                self.treemap_current_dir = None;
-            }
         });
 
-        ui.label(
-            RichText::new(format!("当前目录：{}", current_dir.display()))
-                .small()
-                .strong(),
-        );
+        // Breadcrumb navigation
+        self.draw_breadcrumb_navigation(ui, stats, &current_dir);
+
         ui.label(
             RichText::new(format!(
                 "完整目录树：{} 个直接子目录，直属文件 {} 个 / {}，当前图表显示 {} / {} 个块。",
@@ -1696,6 +1681,46 @@ impl CDriveManagerApp {
             self.treemap_current_dir = None;
             stats.root.clone()
         }
+    }
+
+    fn draw_breadcrumb_navigation(
+        &mut self,
+        ui: &mut egui::Ui,
+        stats: &ScanStats,
+        current_dir: &Path,
+    ) {
+        let root_display = stats.root.display().to_string();
+        let path_parts: Vec<&str> = if current_dir == &stats.root {
+            vec![]
+        } else {
+            current_dir
+                .iter()
+                .map(|p| p.to_str().unwrap_or(""))
+                .collect()
+        };
+
+        ui.horizontal_wrapped(|ui| {
+            // Show parent directory button if not at root
+            if current_dir != &stats.root {
+                if ui.small_button("返回上级").clicked() {
+                    self.treemap_current_dir = Some(treemap_parent_dir(stats, current_dir));
+                }
+                if ui.small_button("返回根目录").clicked() {
+                    self.treemap_current_dir = None;
+                }
+                ui.separator();
+            }
+
+            ui.label(RichText::new(&root_display).strong());
+
+            // Show breadcrumb path segments
+            for part in &path_parts {
+                if !part.is_empty() {
+                    ui.label(" > ");
+                    ui.label(format!("{}", part));
+                }
+            }
+        });
     }
 
     fn handle_treemap_action(&mut self, action: TreemapAction, ctx: &egui::Context) {
