@@ -15,6 +15,7 @@ use walkdir::WalkDir;
 #[derive(Debug, Clone)]
 pub struct CleanupPreviewOptions {
     pub root: PathBuf,
+    pub rules: Vec<CleanupRule>,
 }
 
 #[derive(Debug)]
@@ -152,7 +153,7 @@ pub fn spawn_cleanup_preview(options: CleanupPreviewOptions) -> CleanupPreviewHa
     let worker_cancel_flag = Arc::clone(&cancel_flag);
 
     thread::spawn(move || {
-        let rules = default_cleanup_rules();
+        let rules = options.rules;
         let mut accumulator = CleanupPreviewAccumulator::new(options.root.clone());
         let mut entries_since_update = 0_u64;
         let mut last_progress_at = Instant::now();
@@ -460,7 +461,10 @@ mod tests {
 
     #[test]
     fn temp_cache_directory_rule_matches_files_inside_cache_dir() {
-        let rules = default_cleanup_rules();
+        let rules: Vec<_> = default_cleanup_rules()
+            .into_iter()
+            .filter(|rule| rule.id == "temp_cache_directory")
+            .collect();
         let root = PathBuf::from("C:\\work");
         let candidate = cleanup_candidate_for_file(
             &root,
@@ -472,6 +476,26 @@ mod tests {
         .unwrap();
 
         assert_eq!(candidate.rule_id, "temp_cache_directory");
+    }
+
+    #[test]
+    fn empty_rule_set_matches_no_candidates() {
+        let root = PathBuf::from("C:\\work");
+        let candidate =
+            cleanup_candidate_for_file(&root, &root.join("build").join("x.tmp"), 42, None, &[]);
+
+        assert!(candidate.is_none());
+    }
+
+    #[test]
+    fn cleanup_rules_use_first_match() {
+        let rules = default_cleanup_rules();
+        let root = PathBuf::from("C:\\work");
+        let candidate =
+            cleanup_candidate_for_file(&root, &root.join("Cache").join("x.tmp"), 10, None, &rules)
+                .unwrap();
+
+        assert_eq!(candidate.rule_id, "temp_extension");
     }
 
     #[test]

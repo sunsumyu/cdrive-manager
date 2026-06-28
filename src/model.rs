@@ -1,6 +1,13 @@
-use std::{cmp::Ordering, collections::HashMap, path::PathBuf, time::SystemTime};
+use std::{
+    cmp::Ordering,
+    collections::HashMap,
+    path::PathBuf,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use serde::{Deserialize, Serialize};
+
+pub const SCAN_STATS_SCHEMA_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileRecord {
@@ -60,6 +67,21 @@ impl ScanStats {
             tree.rebuild_path_index();
         }
     }
+
+    pub fn prepare_for_save(&mut self) {
+        self.schema_version = SCAN_STATS_SCHEMA_VERSION;
+        self.saved_at_unix_secs = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .ok()
+            .map(|duration| duration.as_secs());
+        self.app_version = Some(env!("CARGO_PKG_VERSION").to_owned());
+    }
+
+    pub fn normalize_cache_metadata_after_load(&mut self) {
+        if self.schema_version == 0 {
+            self.schema_version = 1;
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -69,8 +91,14 @@ pub struct ExtensionRecord {
     pub file_count: u64,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ScanStats {
+    #[serde(default = "default_schema_version")]
+    pub schema_version: u32,
+    #[serde(default)]
+    pub saved_at_unix_secs: Option<u64>,
+    #[serde(default)]
+    pub app_version: Option<String>,
     pub root: PathBuf,
     pub total_size: u64,
     pub file_count: u64,
@@ -82,6 +110,30 @@ pub struct ScanStats {
     pub errors: Vec<String>,
     #[serde(default)]
     pub directory_tree: Option<DirectoryTree>,
+}
+
+impl Default for ScanStats {
+    fn default() -> Self {
+        Self {
+            schema_version: SCAN_STATS_SCHEMA_VERSION,
+            saved_at_unix_secs: None,
+            app_version: Some(env!("CARGO_PKG_VERSION").to_owned()),
+            root: PathBuf::new(),
+            total_size: 0,
+            file_count: 0,
+            dir_count: 0,
+            error_count: 0,
+            largest_files: Vec::new(),
+            largest_dirs: Vec::new(),
+            extensions: Vec::new(),
+            errors: Vec::new(),
+            directory_tree: None,
+        }
+    }
+}
+
+fn default_schema_version() -> u32 {
+    SCAN_STATS_SCHEMA_VERSION
 }
 
 #[derive(Debug, Clone, Default)]
@@ -194,6 +246,9 @@ impl ScanAccumulator {
         largest_files.sort_by(compare_size_then_path_file);
 
         ScanStats {
+            schema_version: SCAN_STATS_SCHEMA_VERSION,
+            saved_at_unix_secs: None,
+            app_version: Some(env!("CARGO_PKG_VERSION").to_owned()),
             root: self.root.clone(),
             total_size: self.total_size,
             file_count: self.file_count,
@@ -358,6 +413,22 @@ mod tests {
         let grandchild_node = &tree.nodes[tree.node_index_for_path(&grandchild).unwrap()];
         assert_eq!(grandchild_node.record.direct_file_size, 30);
         assert_eq!(grandchild_node.record.total_size, 30);
+    }
+
+    #[test]
+    fn scan_stats_prepare_for_save_sets_cache_metadata() {
+        let mut stats = ScanStats::default();
+        stats.schema_version = 0;
+        stats.app_version = None;
+
+        stats.prepare_for_save();
+
+        assert_eq!(stats.schema_version, SCAN_STATS_SCHEMA_VERSION);
+        assert!(stats.saved_at_unix_secs.is_some());
+        assert_eq!(
+            stats.app_version.as_deref(),
+            Some(env!("CARGO_PKG_VERSION"))
+        );
     }
 
     fn assert_directory_size_invariant(tree: &DirectoryTree, index: usize) -> u64 {

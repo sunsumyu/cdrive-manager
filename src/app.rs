@@ -13,7 +13,8 @@ use rfd::FileDialog;
 use crate::{
     cleanup::{
         CleanupCandidate, CleanupPreview, CleanupPreviewEvent, CleanupPreviewFinished,
-        CleanupPreviewHandle, CleanupPreviewOptions, CleanupPreviewProgress, spawn_cleanup_preview,
+        CleanupPreviewHandle, CleanupPreviewOptions, CleanupPreviewProgress, CleanupRule,
+        default_cleanup_rules, spawn_cleanup_preview,
     },
     format,
     model::{DirectoryRecord, DirectoryTree, ExtensionRecord, FileRecord, ScanStats},
@@ -33,6 +34,7 @@ pub struct CDriveManagerApp {
     cleanup_cancel_requested: bool,
     cleanup_progress: Option<CleanupPreviewProgress>,
     cleanup_preview: Option<Arc<CleanupPreview>>,
+    cleanup_rules: Vec<CleanupRuleUiState>,
     status_message: String,
     selected_tab: ResultTab,
     search_query: String,
@@ -132,6 +134,21 @@ enum CleanupSortKey {
     Path,
 }
 
+#[derive(Debug, Clone)]
+struct CleanupRuleUiState {
+    rule: CleanupRule,
+    enabled: bool,
+}
+
+impl CleanupRuleUiState {
+    fn new(rule: CleanupRule) -> Self {
+        Self {
+            rule,
+            enabled: true,
+        }
+    }
+}
+
 impl CDriveManagerApp {
     pub fn new(_cc: &eframe::CreationContext<'_>) -> Self {
         Self {
@@ -146,6 +163,10 @@ impl CDriveManagerApp {
             cleanup_cancel_requested: false,
             cleanup_progress: None,
             cleanup_preview: None,
+            cleanup_rules: default_cleanup_rules()
+                .into_iter()
+                .map(CleanupRuleUiState::new)
+                .collect(),
             status_message: "准备扫描。第一版只分析空间占用，不删除任何文件。".to_owned(),
             selected_tab: ResultTab::Directories,
             search_query: String::new(),
@@ -187,9 +208,17 @@ impl CDriveManagerApp {
             return;
         };
 
+        let rules = self.enabled_cleanup_rules();
+        if rules.is_empty() {
+            self.status_message = "请至少启用一条清理预览规则。".to_owned();
+            return;
+        }
+
         let root = stats.root.clone();
+        let rule_count = rules.len();
         self.cleanup_handle = Some(spawn_cleanup_preview(CleanupPreviewOptions {
             root: root.clone(),
+            rules,
         }));
         self.cleanup_in_progress = true;
         self.cleanup_cancel_requested = false;
@@ -197,8 +226,9 @@ impl CDriveManagerApp {
         self.cleanup_preview = None;
         self.selected_tab = ResultTab::CleanupPreview;
         self.status_message = format!(
-            "正在生成 dry-run 清理预览：{}。不会删除、移动或修改任何文件。",
-            root.display()
+            "正在生成 dry-run 清理预览：{}，启用 {} 条规则。不会删除、移动或修改任何文件。",
+            root.display(),
+            format::count(rule_count as u64)
         );
     }
 
@@ -280,6 +310,7 @@ impl CDriveManagerApp {
 
         match load_scan_result_from_path(&path) {
             Ok(stats) => {
+                let metadata = scan_cache_metadata_summary(&stats);
                 self.root_input = stats.root.display().to_string();
                 self.stats = Some(Arc::new(stats));
                 self.progress = None;
@@ -292,7 +323,7 @@ impl CDriveManagerApp {
                 self.cleanup_cancel_requested = false;
                 self.cleanup_handle = None;
                 self.treemap_current_dir = None;
-                self.status_message = format!("已打开扫描结果：{}", path.display());
+                self.status_message = format!("已打开扫描结果：{} ({})", path.display(), metadata);
             }
             Err(error) => {
                 self.status_message = format!("打开扫描结果失败：{} ({:#})", path.display(), error);
@@ -505,6 +536,46 @@ impl CDriveManagerApp {
         })
     }
 
+    fn enabled_cleanup_rules(&self) -> Vec<CleanupRule> {
+        self.cleanup_rules
+            .iter()
+            .filter(|state| state.enabled)
+            .map(|state| state.rule.clone())
+            .collect()
+    }
+
+    fn enabled_cleanup_rule_count(&self) -> usize {
+        self.cleanup_rules
+            .iter()
+            .filter(|state| state.enabled)
+            .count()
+    }
+
+    fn set_all_cleanup_rules_enabled(&mut self, enabled: bool) {
+        for state in &mut self.cleanup_rules {
+            state.enabled = enabled;
+        }
+        self.invalidate_cleanup_preview_after_rule_change();
+    }
+
+    fn reset_cleanup_rules(&mut self) {
+        self.cleanup_rules = default_cleanup_rules()
+            .into_iter()
+            .map(CleanupRuleUiState::new)
+            .collect();
+        self.invalidate_cleanup_preview_after_rule_change();
+    }
+
+    fn invalidate_cleanup_preview_after_rule_change(&mut self) {
+        if !self.cleanup_in_progress
+            && (self.cleanup_preview.is_some() || self.cleanup_progress.is_some())
+        {
+            self.cleanup_preview = None;
+            self.cleanup_progress = None;
+            self.status_message = "清理规则已变化，请重新生成 dry-run 预览。".to_owned();
+        }
+    }
+
     fn draw_top_bar(&mut self, ctx: &egui::Context) {
         egui::TopBottomPanel::top("top_bar").show(ctx, |ui| {
             ui.horizontal_wrapped(|ui| {
@@ -587,7 +658,10 @@ impl CDriveManagerApp {
 
                 if ui
                     .add_enabled(
-                        !self.scan_in_progress && !self.cleanup_in_progress && has_final_stats,
+                        !self.scan_in_progress
+                            && !self.cleanup_in_progress
+                            && has_final_stats
+                            && self.enabled_cleanup_rule_count() > 0,
                         egui::Button::new("生成清理预览"),
                     )
                     .clicked()
@@ -724,13 +798,22 @@ impl CDriveManagerApp {
         ui.add_space(4.0);
 
         match self.selected_tab {
-            ResultTab::Directories => directory_table(
-                ui,
-                stats,
-                &self.search_query,
-                &mut self.directory_sort,
-                &mut self.status_message,
-            ),
+            ResultTab::Directories => {
+                if let Some(path) = directory_table(
+                    ui,
+                    stats,
+                    &self.search_query,
+                    &mut self.directory_sort,
+                    &mut self.status_message,
+                ) {
+                    self.treemap_current_dir = if path == stats.root {
+                        None
+                    } else {
+                        Some(path.clone())
+                    };
+                    self.status_message = format!("Treemap 已定位目录：{}", path.display());
+                }
+            }
             ResultTab::Files => file_table(
                 ui,
                 stats,
@@ -741,13 +824,7 @@ impl CDriveManagerApp {
             ResultTab::Types => {
                 extension_table(ui, stats, &self.search_query, &mut self.extension_sort)
             }
-            ResultTab::CleanupPreview => cleanup_preview_table(
-                ui,
-                self.current_cleanup_preview().as_deref(),
-                &self.search_query,
-                &mut self.cleanup_sort,
-                &mut self.status_message,
-            ),
+            ResultTab::CleanupPreview => self.draw_cleanup_preview_tab(ui),
             ResultTab::Errors => error_list(ui, stats, &self.search_query),
         }
     }
@@ -768,10 +845,85 @@ impl CDriveManagerApp {
             }
         });
         ui.label(
-            RichText::new("搜索和排序只作用于当前保留的 Top 结果，不是全盘全文搜索。")
+            RichText::new("目录标签输入关键词后会搜索完整目录树；文件、类型、错误和清理预览搜索当前保留结果。")
                 .small()
                 .weak(),
         );
+    }
+
+    fn draw_cleanup_preview_tab(&mut self, ui: &mut egui::Ui) {
+        self.draw_cleanup_rules_panel(ui);
+        ui.separator();
+        cleanup_preview_table(
+            ui,
+            self.current_cleanup_preview().as_deref(),
+            &self.search_query,
+            &mut self.cleanup_sort,
+            &mut self.status_message,
+        );
+    }
+
+    fn draw_cleanup_rules_panel(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal_wrapped(|ui| {
+            ui.label(RichText::new("清理规则").strong());
+            ui.label(format!(
+                "已启用 {} / {} 条",
+                format::count(self.enabled_cleanup_rule_count() as u64),
+                format::count(self.cleanup_rules.len() as u64)
+            ));
+            if ui
+                .add_enabled(!self.cleanup_in_progress, egui::Button::new("全选"))
+                .clicked()
+            {
+                self.set_all_cleanup_rules_enabled(true);
+            }
+            if ui
+                .add_enabled(!self.cleanup_in_progress, egui::Button::new("全不选"))
+                .clicked()
+            {
+                self.set_all_cleanup_rules_enabled(false);
+            }
+            if ui
+                .add_enabled(!self.cleanup_in_progress, egui::Button::new("恢复默认"))
+                .clicked()
+            {
+                self.reset_cleanup_rules();
+            }
+        });
+        ui.label(
+            RichText::new("规则变更会清空已有预览；请重新点击“生成清理预览”。")
+                .small()
+                .weak(),
+        );
+
+        let mut changed = false;
+        egui::Grid::new("cleanup_rules_grid")
+            .striped(true)
+            .num_columns(4)
+            .spacing([12.0, 4.0])
+            .show(ui, |ui| {
+                plain_header(ui, "启用");
+                plain_header(ui, "规则");
+                plain_header(ui, "风险");
+                plain_header(ui, "说明");
+                ui.end_row();
+
+                for state in &mut self.cleanup_rules {
+                    let response = ui.add_enabled(
+                        !self.cleanup_in_progress,
+                        egui::Checkbox::new(&mut state.enabled, ""),
+                    );
+                    changed |= response.changed();
+                    ui.label(state.rule.label);
+                    ui.label(state.rule.risk.label());
+                    ui.label(state.rule.description);
+                    ui.end_row();
+                }
+            });
+
+        if changed {
+            self.invalidate_cleanup_preview_after_rule_change();
+        }
     }
 
     fn draw_treemap_panel(&mut self, ui: &mut egui::Ui, stats: &ScanStats) {
@@ -802,7 +954,8 @@ impl CDriveManagerApp {
         let child_count = current_node.children.len();
         let mut treemap_items = treemap_items_for_node(tree, current_index);
         let item_count = treemap_items.len();
-        treemap_items.truncate(36);
+        let display_limit = 36;
+        treemap_items = treemap_items_with_other(treemap_items, current_dir.clone(), display_limit);
 
         ui.horizontal_wrapped(|ui| {
             ui.heading("空间占用图");
@@ -828,7 +981,7 @@ impl CDriveManagerApp {
         );
         ui.label(
             RichText::new(format!(
-                "完整目录树：{} 个直接子目录，直属文件 {} 个 / {}，Treemap 显示前 {} / {} 个块。",
+                "完整目录树：{} 个直接子目录，直属文件 {} 个 / {}，Treemap 显示 {} / {} 个块。",
                 format::count(child_count as u64),
                 format::count(current_node.record.direct_file_count),
                 format::bytes(current_node.record.direct_file_size),
@@ -988,6 +1141,28 @@ fn treemap_items_for_node(tree: &DirectoryTree, node_index: usize) -> Vec<Treema
     items
 }
 
+fn treemap_items_with_other(
+    mut items: Vec<TreemapItem>,
+    dir: PathBuf,
+    limit: usize,
+) -> Vec<TreemapItem> {
+    if items.len() <= limit || limit < 2 {
+        return items;
+    }
+
+    let hidden_items = items.split_off(limit - 1);
+    let hidden_count = hidden_items.len();
+    let hidden_size = hidden_items
+        .iter()
+        .fold(0_u64, |total, item| total.saturating_add(item.size));
+
+    if hidden_size > 0 {
+        items.push(TreemapItem::other(dir, hidden_count, hidden_size));
+    }
+
+    items
+}
+
 fn treemap_parent_dir(stats: &ScanStats, current_dir: &Path) -> PathBuf {
     if current_dir == stats.root {
         return stats.root.clone();
@@ -1006,28 +1181,54 @@ fn directory_table(
     search_query: &str,
     sort: &mut SortState<DirectorySortKey>,
     status_message: &mut String,
-) {
+) -> Option<PathBuf> {
     let query = normalized_query(search_query);
-    let mut directories: Vec<_> = stats
-        .largest_dirs
-        .iter()
-        .filter(|dir| directory_matches(dir, &query))
-        .collect();
+    let use_full_tree_search = !query.is_empty() && stats.directory_tree.is_some();
+    let mut directories: Vec<_> = if use_full_tree_search {
+        stats
+            .directory_tree
+            .as_ref()
+            .map(|tree| tree.nodes.iter().map(|node| &node.record).collect())
+            .unwrap_or_default()
+    } else {
+        stats.largest_dirs.iter().collect()
+    };
+    directories.retain(|dir| directory_matches(dir, &query));
     directories.sort_by(|left, right| compare_directories(left, right, *sort));
 
     result_count_label(
         ui,
         directories.len().min(120),
         directories.len(),
-        stats.largest_dirs.len(),
-        "目录",
+        if use_full_tree_search {
+            stats
+                .directory_tree
+                .as_ref()
+                .map(|tree| tree.nodes.len())
+                .unwrap_or(stats.largest_dirs.len())
+        } else {
+            stats.largest_dirs.len()
+        },
+        if use_full_tree_search {
+            "完整目录"
+        } else {
+            "目录"
+        },
     );
+    if use_full_tree_search {
+        ui.label(
+            RichText::new("当前目录搜索基于完整目录树；清空搜索后回到最大目录列表。")
+                .small()
+                .weak(),
+        );
+    }
 
     if directories.is_empty() {
         ui.label("没有匹配的目录。");
-        return;
+        return None;
     }
 
+    let mut jump_to = None;
     egui::ScrollArea::vertical()
         .max_height(320.0)
         .show(ui, |ui| {
@@ -1062,10 +1263,16 @@ fn directory_table(
                     plain_header(ui, "操作");
                     ui.end_row();
                     for dir in directories.into_iter().take(120) {
-                        directory_row(ui, dir, stats.total_size, status_message);
+                        if jump_to.is_none() {
+                            jump_to = directory_row(ui, dir, stats.total_size, status_message);
+                        } else {
+                            let _ = directory_row(ui, dir, stats.total_size, status_message);
+                        }
                     }
                 });
         });
+
+    jump_to
 }
 
 fn directory_matches(dir: &DirectoryRecord, query: &str) -> bool {
@@ -1079,7 +1286,7 @@ fn directory_row(
     dir: &DirectoryRecord,
     total_size: u64,
     status_message: &mut String,
-) {
+) -> Option<PathBuf> {
     let name = dir.name();
     let name_response = ui
         .label(compact_text(&name, 32))
@@ -1096,8 +1303,15 @@ fn directory_row(
         .on_hover_text(path_text.clone());
     path_context_menu(path_response, &dir.path, &dir.path, &name, status_message);
 
-    path_actions(ui, &dir.path, &dir.path, status_message);
+    let mut jump_to = None;
+    ui.horizontal(|ui| {
+        if ui.small_button("定位图中").clicked() {
+            jump_to = Some(dir.path.clone());
+        }
+        path_actions(ui, &dir.path, &dir.path, status_message);
+    });
     ui.end_row();
+    jump_to
 }
 
 fn file_table(
@@ -1263,15 +1477,30 @@ fn open_path(open_target: &Path, status_message: &mut String) {
 fn save_scan_result_to_path(path: &Path, stats: &ScanStats) -> anyhow::Result<()> {
     let file = File::create(path)?;
     let writer = BufWriter::new(file);
-    serde_json::to_writer_pretty(writer, stats)?;
+    let mut stats = stats.clone();
+    stats.prepare_for_save();
+    serde_json::to_writer_pretty(writer, &stats)?;
     Ok(())
 }
 
 fn load_scan_result_from_path(path: &Path) -> anyhow::Result<ScanStats> {
     let file = File::open(path)?;
     let mut stats: ScanStats = serde_json::from_reader(file)?;
+    stats.normalize_cache_metadata_after_load();
     stats.rebuild_indexes();
     Ok(stats)
+}
+
+fn scan_cache_metadata_summary(stats: &ScanStats) -> String {
+    let saved_at = stats
+        .saved_at_unix_secs
+        .map(|saved_at| format!("saved_at={}", saved_at))
+        .unwrap_or_else(|| "旧缓存，无保存时间".to_owned());
+    let app_version = stats.app_version.as_deref().unwrap_or("未知版本");
+    format!(
+        "schema v{}，{}，app {}",
+        stats.schema_version, saved_at, app_version
+    )
 }
 
 fn export_csv_report_to_path(path: &Path, stats: &ScanStats) -> anyhow::Result<String> {
@@ -2006,4 +2235,32 @@ fn compact_text(text: &str, max_chars: usize) -> String {
         .skip(chars.len().saturating_sub(keep_end))
         .collect();
     format!("{}…{}", start, end)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn treemap_items_with_other_aggregates_hidden_items() {
+        let dir = PathBuf::from("C:\\root");
+        let mut items = Vec::new();
+        for index in 0..5 {
+            items.push(TreemapItem::directory(
+                format!("dir{}", index),
+                dir.join(format!("dir{}", index)),
+                10 - index as u64,
+            ));
+        }
+
+        let aggregated = treemap_items_with_other(items, dir, 3);
+        assert_eq!(aggregated.len(), 3);
+        assert_eq!(aggregated[0].label, "dir0");
+        assert_eq!(aggregated[1].label, "dir1");
+        assert_eq!(aggregated[2].size, 8 + 7 + 6);
+        assert!(matches!(
+            aggregated[2].kind,
+            crate::treemap::TreemapItemKind::Other { item_count: 3, .. }
+        ));
+    }
 }

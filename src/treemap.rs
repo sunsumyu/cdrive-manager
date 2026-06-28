@@ -1,4 +1,8 @@
-use std::path::PathBuf;
+use std::{
+    collections::hash_map::DefaultHasher,
+    hash::{Hash, Hasher},
+    path::{Path, PathBuf},
+};
 
 use egui::{Align2, Color32, FontId, Pos2, Rect, Sense, Stroke, Ui, Vec2};
 
@@ -15,6 +19,7 @@ pub struct TreemapItem {
 pub enum TreemapItemKind {
     Directory { path: PathBuf },
     DirectFiles { dir: PathBuf, file_count: u64 },
+    Other { dir: PathBuf, item_count: usize },
 }
 
 impl TreemapItem {
@@ -34,10 +39,18 @@ impl TreemapItem {
         }
     }
 
+    pub fn other(dir: PathBuf, item_count: usize, size: u64) -> Self {
+        Self {
+            label: format!("其它 {} 项", format::count(item_count as u64)),
+            size,
+            kind: TreemapItemKind::Other { dir, item_count },
+        }
+    }
+
     fn path(&self) -> &PathBuf {
         match &self.kind {
             TreemapItemKind::Directory { path } => path,
-            TreemapItemKind::DirectFiles { dir, .. } => dir,
+            TreemapItemKind::DirectFiles { dir, .. } | TreemapItemKind::Other { dir, .. } => dir,
         }
     }
 
@@ -49,6 +62,7 @@ impl TreemapItem {
         match self.kind {
             TreemapItemKind::Directory { .. } => "目录",
             TreemapItemKind::DirectFiles { .. } => "直属文件合计",
+            TreemapItemKind::Other { .. } => "其它项目合计",
         }
     }
 
@@ -70,6 +84,13 @@ impl TreemapItem {
             }
             TreemapItemKind::DirectFiles { file_count, .. } => {
                 lines.push(format!("直属文件数：{}", format::count(*file_count)));
+                lines.push("右键可复制或打开当前目录".to_owned());
+            }
+            TreemapItemKind::Other { item_count, .. } => {
+                lines.push(format!(
+                    "聚合隐藏项目：{}",
+                    format::count(*item_count as u64)
+                ));
                 lines.push("右键可复制或打开当前目录".to_owned());
             }
         }
@@ -109,12 +130,7 @@ pub fn draw_treemap(
         return None;
     }
 
-    let display_items: Vec<_> = items
-        .iter()
-        .filter(|item| item.size > 0)
-        .take(36)
-        .cloned()
-        .collect();
+    let display_items: Vec<_> = items.iter().filter(|item| item.size > 0).cloned().collect();
 
     if display_items.is_empty() {
         painter.text(
@@ -134,9 +150,10 @@ pub fn draw_treemap(
             continue;
         }
 
-        let color = match item.kind {
-            TreemapItemKind::Directory { .. } => palette(index),
+        let color = match &item.kind {
+            TreemapItemKind::Directory { path } => palette(path_palette_index(path)),
             TreemapItemKind::DirectFiles { .. } => Color32::from_rgb(96, 125, 139),
+            TreemapItemKind::Other { .. } => Color32::from_rgb(88, 88, 96),
         };
         painter.rect_filled(item_rect, 4.0, color);
         painter.rect_stroke(
@@ -261,6 +278,12 @@ fn compact_label(label: &str, width: f32) -> String {
     let mut output: String = label.chars().take(max_chars.saturating_sub(1)).collect();
     output.push('…');
     output
+}
+
+fn path_palette_index(path: &Path) -> usize {
+    let mut hasher = DefaultHasher::new();
+    path.hash(&mut hasher);
+    hasher.finish() as usize
 }
 
 fn palette(index: usize) -> Color32 {
