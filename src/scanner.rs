@@ -10,7 +10,6 @@ use std::{
 };
 
 use crossbeam_channel::{Receiver, Sender, unbounded};
-use rayon::prelude::*;
 use walkdir::WalkDir;
 
 use crate::model::{
@@ -235,159 +234,145 @@ fn spawn_single_thread_scan(options: ScanOptions) -> ScanHandle {
     }
 }
 
-/// Multi-threaded parallel scan using rayon with adaptive batch sizing
+/// Multi-threaded parallel scan using a streaming producer/worker pipeline.
 fn spawn_parallel_scan(options: ScanOptions) -> ScanHandle {
     let (sender, receiver) = unbounded();
     let cancel_flag = Arc::new(AtomicBool::new(false));
     let worker_cancel_flag = Arc::clone(&cancel_flag);
     let scan_mode = options.mode.clone();
-    
-    // Dynamic thread count: use 75% of CPU cores by default
+
     let cpu_count = num_cpus::get();
     let num_threads = options.num_threads.unwrap_or_else(|| {
-        // Reserve 1-2 cores for UI responsiveness
         let reserved = if cpu_count <= 4 { 1 } else { 2 };
         cpu_count.saturating_sub(reserved).max(1)
     });
 
     thread::spawn(move || {
         let scan_start = Instant::now();
-        
-        // Build custom thread pool for better control
+        let matcher = Arc::new(ScanFilterMatcher::new(
+            options.root.clone(),
+            options.filter_config.clone(),
+        ));
+        let accumulator = Arc::new(std::sync::Mutex::new(
+            ScanAccumulator::new_with_filter_config(options.root.clone(), options.filter_config.clone()),
+        ));
+        let discovered_dirs = Arc::new(AtomicU64::new(0));
+        let processed_files = Arc::new(AtomicU64::new(0));
+        let last_progress_time = Arc::new(std::sync::Mutex::new(Instant::now()));
+        let (work_sender, work_receiver) = unbounded::<PathBuf>();
+
         let pool_result = rayon::ThreadPoolBuilder::new()
             .num_threads(num_threads)
             .thread_name(|i| format!("cdrive-scan-{}", i))
             .build();
-        
-        // Phase 1: Collect all directory paths (single thread, fast)
-        let matcher = ScanFilterMatcher::new(options.root.clone(), options.filter_config.clone());
-        let accumulator = Arc::new(std::sync::Mutex::new(
-            ScanAccumulator::new_with_filter_config(
-                options.root.clone(),
-                options.filter_config.clone(),
-            )
-        ));
-        let mut all_dirs: Vec<PathBuf> = Vec::new();
-        let mut entries_since_update = 0_u64;
-        let mut last_progress_at = Instant::now();
 
-        let walker = WalkDir::new(&options.root)
-            .follow_links(false)
-            .same_file_system(options.filter_config.same_file_system)
-            .into_iter();
+        let walker_cancel_flag = Arc::clone(&worker_cancel_flag);
+        let walker_sender = sender.clone();
+        let walker_matcher = Arc::clone(&matcher);
+        let walker_accumulator = Arc::clone(&accumulator);
+        let walker_discovered_dirs = Arc::clone(&discovered_dirs);
+        let walker_last_progress_time = Arc::clone(&last_progress_time);
+        let walker_scan_mode = scan_mode.clone();
+        let root = options.root.clone();
+        let same_file_system = options.filter_config.same_file_system;
 
-        for entry in walker.filter_entry(|entry| matcher.should_descend(entry)) {
-            if worker_cancel_flag.load(Ordering::Relaxed) {
-                break;
-            }
+        let walker_thread = thread::spawn(move || {
+            let walker = WalkDir::new(&root)
+                .follow_links(false)
+                .same_file_system(same_file_system)
+                .into_iter();
 
-            if let Ok(entry) = entry {
-                let path = entry.path().to_path_buf();
-                if entry.file_type().is_dir() {
-                    all_dirs.push(path.clone());
-                    let mut acc = accumulator.lock().unwrap();
-                    acc.record_directory(path.clone());
+            for entry in walker.filter_entry(|entry| walker_matcher.should_descend(entry)) {
+                if walker_cancel_flag.load(Ordering::Relaxed) {
+                    break;
                 }
 
-                entries_since_update += 1;
-                if entries_since_update >= PROGRESS_ENTRY_INTERVAL
-                    && last_progress_at.elapsed() >= PROGRESS_TIME_INTERVAL
-                {
-                    entries_since_update = 0;
-                    last_progress_at = Instant::now();
-                    let mut acc = accumulator.lock().unwrap();
-                    let _ = sender.send(ScanEvent::Progress(ScanProgress {
-                        stats: Arc::new(acc.progress_snapshot()),
-                        current_path: Some(entry.path().to_path_buf()),
-                        finished: false,
-                        cancelled: false,
-                        estimated_total_dirs: Some(all_dirs.len() as u64),
-                        estimated_total_files: None,
-                        scan_mode: scan_mode.clone(),
-                        active_threads: Some(1),
-                    }));
+                match entry {
+                    Ok(entry) => {
+                        let path = entry.path().to_path_buf();
+                        if entry.file_type().is_dir() {
+                            walker_discovered_dirs.fetch_add(1, Ordering::Relaxed);
+                            {
+                                let mut acc = walker_accumulator.lock().unwrap();
+                                acc.record_directory(path.clone());
+                            }
+
+                            if work_sender.send(path.clone()).is_err() {
+                                break;
+                            }
+
+                            maybe_send_parallel_progress(
+                                &walker_sender,
+                                &walker_accumulator,
+                                &walker_last_progress_time,
+                                &walker_scan_mode,
+                                Some(path),
+                                Some(num_threads),
+                                Some(walker_discovered_dirs.load(Ordering::Relaxed)),
+                                None,
+                                false,
+                                false,
+                            );
+                        }
+                    }
+                    Err(error) => {
+                        let mut acc = walker_accumulator.lock().unwrap();
+                        acc.record_error(error.to_string());
+                    }
                 }
             }
-        }
+        });
 
-        if worker_cancel_flag.load(Ordering::Relaxed) {
-            let _ = sender.send(ScanEvent::Finished(ScanFinished {
-                stats: Arc::new(ScanStats::default()),
-                cancelled: true,
-                scan_mode: scan_mode.clone(),
-                total_dirs: 0,
-                total_files: 0,
-                elapsed_time: scan_start.elapsed(),
-            }));
-            return;
-        }
+        let worker = || {
+            process_dirs_streaming(
+                work_receiver,
+                &accumulator,
+                &matcher,
+                &worker_cancel_flag,
+                &processed_files,
+                &last_progress_time,
+                &sender,
+                &scan_mode,
+                num_threads,
+                &discovered_dirs,
+            );
+        };
 
-        let total_dir_count = all_dirs.len() as u64;
-        
-        // Phase 2: Adaptive parallel processing
-        // Calculate optimal batch size based on workload
-        let batch_size = calculate_adaptive_batch_size(total_dir_count, num_threads);
-        
-        let processed_dirs = Arc::new(AtomicU64::new(0));
-        let total_files = Arc::new(AtomicU64::new(0));
-        let last_progress_time = Arc::new(std::sync::Mutex::new(Instant::now()));
-
-        // Process directories in adaptive batches
         match &pool_result {
-            Ok(pool) => {
-                pool.install(|| {
-                    process_dirs_parallel(
-                        &all_dirs, batch_size, &accumulator, &matcher,
-                        &worker_cancel_flag, &processed_dirs, &total_files,
-                        &last_progress_time, &sender, total_dir_count,
-                        &scan_mode, num_threads
-                    );
-                });
-            }
-            Err(_) => {
-                // Use global pool
-                process_dirs_parallel(
-                    &all_dirs, batch_size, &accumulator, &matcher,
-                    &worker_cancel_flag, &processed_dirs, &total_files,
-                    &last_progress_time, &sender, total_dir_count,
-                    &scan_mode, num_threads
-                );
-            }
+            Ok(pool) => pool.install(worker),
+            Err(_) => worker(),
         }
 
-        if worker_cancel_flag.load(Ordering::Relaxed) {
-            let _ = sender.send(ScanEvent::Finished(ScanFinished {
-                stats: Arc::new(accumulator.lock().unwrap().progress_snapshot()),
-                cancelled: true,
-                scan_mode: scan_mode.clone(),
-                total_dirs: processed_dirs.load(Ordering::Relaxed),
-                total_files: total_files.load(Ordering::Relaxed),
-                elapsed_time: scan_start.elapsed(),
-            }));
-            return;
-        }
+        let _ = walker_thread.join();
 
-        let final_stats = Arc::new(accumulator.lock().unwrap().final_snapshot());
-        let final_dirs = processed_dirs.load(Ordering::Relaxed);
-        let final_files = total_files.load(Ordering::Relaxed);
+        let cancelled = worker_cancel_flag.load(Ordering::Relaxed);
+        let mut acc = accumulator.lock().unwrap();
+        let final_stats = if cancelled {
+            Arc::new(acc.progress_snapshot())
+        } else {
+            Arc::new(acc.final_snapshot())
+        };
+        let total_dirs = acc.get_dir_count();
+        let total_files = acc.get_file_count();
         let elapsed = scan_start.elapsed();
+        drop(acc);
 
         let _ = sender.send(ScanEvent::Progress(ScanProgress {
-            stats: Arc::new(accumulator.lock().unwrap().progress_snapshot()),
+            stats: Arc::clone(&final_stats),
             current_path: None,
             finished: true,
-            cancelled: false,
-            estimated_total_dirs: Some(final_dirs),
-            estimated_total_files: Some(final_files),
+            cancelled,
+            estimated_total_dirs: Some(total_dirs),
+            estimated_total_files: Some(total_files),
             scan_mode: scan_mode.clone(),
             active_threads: Some(num_threads),
         }));
         let _ = sender.send(ScanEvent::Finished(ScanFinished {
             stats: final_stats,
-            cancelled: false,
+            cancelled,
             scan_mode,
-            total_dirs: final_dirs,
-            total_files: final_files,
+            total_dirs,
+            total_files,
             elapsed_time: elapsed,
         }));
     });
@@ -398,96 +383,120 @@ fn spawn_parallel_scan(options: ScanOptions) -> ScanHandle {
     }
 }
 
-/// Calculate adaptive batch size based on workload and thread count
-fn calculate_adaptive_batch_size(total_dirs: u64, num_threads: usize) -> usize {
-    // Adaptive strategy:
-    // - Small workloads (< 100 dirs): batch size 1, immediate processing
-    // - Medium workloads (100-1000 dirs): batch size 5-10
-    // - Large workloads (1000-10000 dirs): batch size 10-50
-    // - Huge workloads (> 10000 dirs): batch size 50-100
-    //
-    // Smaller batches = better load balancing but more overhead
-    // Larger batches = less overhead but potential load imbalance
-    
-    if total_dirs < 100 {
-        1
-    } else if total_dirs < 1000 {
-        5
-    } else if total_dirs < 10000 {
-        // Scale with thread count for better parallelism
-        (num_threads * 2).max(10).min(50)
-    } else {
-        // For very large directories, use larger batches to reduce overhead
-        (total_dirs as usize / num_threads / 4).max(50).min(200)
+fn maybe_send_parallel_progress(
+    sender: &Sender<ScanEvent>,
+    accumulator: &Arc<std::sync::Mutex<ScanAccumulator>>,
+    last_progress_time: &Arc<std::sync::Mutex<Instant>>,
+    scan_mode: &ScanMode,
+    current_path: Option<PathBuf>,
+    active_threads: Option<usize>,
+    estimated_total_dirs: Option<u64>,
+    estimated_total_files: Option<u64>,
+    finished: bool,
+    cancelled: bool,
+) {
+    let mut last = last_progress_time.lock().unwrap();
+    if !finished && last.elapsed() < PROGRESS_TIME_INTERVAL {
+        return;
     }
+
+    *last = Instant::now();
+    drop(last);
+
+    let mut acc = accumulator.lock().unwrap();
+    let _ = sender.send(ScanEvent::Progress(ScanProgress {
+        stats: Arc::new(acc.progress_snapshot()),
+        current_path,
+        finished,
+        cancelled,
+        estimated_total_dirs,
+        estimated_total_files,
+        scan_mode: scan_mode.clone(),
+        active_threads,
+    }));
 }
 
-/// Process directories in parallel with adaptive batching
-#[inline]
-fn process_dirs_parallel(
-    all_dirs: &[PathBuf],
-    batch_size: usize,
+fn process_dirs_streaming(
+    work_receiver: Receiver<PathBuf>,
     accumulator: &Arc<std::sync::Mutex<ScanAccumulator>>,
-    matcher: &ScanFilterMatcher,
+    matcher: &Arc<ScanFilterMatcher>,
     cancel_flag: &Arc<AtomicBool>,
-    processed_dirs: &Arc<AtomicU64>,
-    total_files: &Arc<AtomicU64>,
+    processed_files: &Arc<AtomicU64>,
     last_progress_time: &Arc<std::sync::Mutex<Instant>>,
     sender: &Sender<ScanEvent>,
-    total_dir_count: u64,
     scan_mode: &ScanMode,
     num_threads: usize,
+    discovered_dirs: &Arc<AtomicU64>,
 ) {
     use rayon::prelude::*;
-    
-    all_dirs.par_chunks(batch_size).for_each(|batch| {
+
+    work_receiver.into_iter().par_bridge().for_each(|dir_path| {
         if cancel_flag.load(Ordering::Relaxed) {
             return;
         }
 
-        for dir_path in batch {
-            // Process files in this directory
-            if let Ok(read_dir) = std::fs::read_dir(dir_path) {
-                for entry in read_dir.flatten() {
-                    let path = entry.path();
-                    if path.is_file() && !matcher.excludes_file(&path) {
-                        if let Ok(metadata) = entry.metadata() {
-                            let file_record = FileRecord {
-                                extension: file_extension_label(&path),
-                                modified: metadata.modified().ok(),
-                                path,
-                                size: metadata.len(),
-                            };
+        if let Ok(read_dir) = std::fs::read_dir(&dir_path) {
+            for entry in read_dir.flatten() {
+                if cancel_flag.load(Ordering::Relaxed) {
+                    return;
+                }
+
+                let path = entry.path();
+                let Ok(file_type) = entry.file_type() else {
+                    continue;
+                };
+                if !file_type.is_file() || matcher.excludes_file(&path) {
+                    continue;
+                }
+
+                match entry.metadata() {
+                    Ok(metadata) => {
+                        let file_record = FileRecord {
+                            extension: file_extension_label(&path),
+                            modified: metadata.modified().ok(),
+                            path: path.clone(),
+                            size: metadata.len(),
+                        };
+                        {
                             let mut acc = accumulator.lock().unwrap();
                             acc.record_file(file_record);
-                            total_files.fetch_add(1, Ordering::Relaxed);
                         }
+                        let files = processed_files.fetch_add(1, Ordering::Relaxed) + 1;
+                        if files % PROGRESS_ENTRY_INTERVAL == 0 {
+                            maybe_send_parallel_progress(
+                                sender,
+                                accumulator,
+                                last_progress_time,
+                                scan_mode,
+                                Some(path),
+                                Some(num_threads),
+                                Some(discovered_dirs.load(Ordering::Relaxed)),
+                                Some(files),
+                                false,
+                                false,
+                            );
+                        }
+                    }
+                    Err(error) => {
+                        let mut acc = accumulator.lock().unwrap();
+                        acc.record_error(format!("读取元数据失败：{} ({})", path.display(), error));
                     }
                 }
             }
-
-            // Update counter
-            let _processed = processed_dirs.fetch_add(1, Ordering::Relaxed) + 1;
-            
-            // Send progress updates (throttled)
-            {
-                let mut last = last_progress_time.lock().unwrap();
-                if last.elapsed() >= PROGRESS_TIME_INTERVAL {
-                    *last = Instant::now();
-                    let mut acc = accumulator.lock().unwrap();
-                    let _ = sender.send(ScanEvent::Progress(ScanProgress {
-                        stats: Arc::new(acc.progress_snapshot()),
-                        current_path: Some(dir_path.clone()),
-                        finished: false,
-                        cancelled: false,
-                        estimated_total_dirs: Some(total_dir_count),
-                        estimated_total_files: None,
-                        scan_mode: scan_mode.clone(),
-                        active_threads: Some(num_threads),
-                    }));
-                }
-            }
         }
+
+        maybe_send_parallel_progress(
+            sender,
+            accumulator,
+            last_progress_time,
+            scan_mode,
+            Some(dir_path),
+            Some(num_threads),
+            Some(discovered_dirs.load(Ordering::Relaxed)),
+            Some(processed_files.load(Ordering::Relaxed)),
+            false,
+            false,
+        );
     });
 }
 
@@ -558,12 +567,13 @@ fn spawn_mft_scan(options: ScanOptions) -> ScanHandle {
         let scan_start = Instant::now();
         
         // Extract drive letter from root path
-        let drive_letter = options.root
-            .to_str()
-            .and_then(|s| s.chars().next())
+        let drive_letter = options
+            .drive_letter
+            .or_else(|| options.root.to_str().and_then(|s| s.chars().next()))
             .unwrap_or('C');
         
         let config = MftScanConfig {
+            root: options.root.clone(),
             drive_letter,
             cancel_flag: Arc::clone(&worker_cancel_flag),
         };
@@ -576,13 +586,17 @@ fn spawn_mft_scan(options: ScanOptions) -> ScanHandle {
                     options.filter_config.clone(),
                 );
                 
+                for directory in result.directories {
+                    accumulator.record_directory(directory);
+                }
                 for file in result.files {
                     accumulator.record_file(file);
                 }
                 
+                let elapsed = result.elapsed;
                 let final_stats = Arc::new(accumulator.final_snapshot());
-                let total_dirs = accumulator.get_dir_count() + result.dir_count;
-                let total_files = accumulator.get_file_count() + result.file_count;
+                let total_dirs = accumulator.get_dir_count();
+                let total_files = accumulator.get_file_count();
                 
                 let _ = sender.send(ScanEvent::Progress(ScanProgress {
                     stats: Arc::new(accumulator.progress_snapshot()),
@@ -601,7 +615,7 @@ fn spawn_mft_scan(options: ScanOptions) -> ScanHandle {
                     scan_mode: ScanMode::MftScan,
                     total_dirs,
                     total_files,
-                    elapsed_time: scan_start.elapsed(),
+                    elapsed_time: elapsed,
                 }));
             }
             Err(e) => {
@@ -644,7 +658,7 @@ fn run_parallel_scan_fallback(
 ) {
     use rayon::prelude::*;
     
-    let num_threads = rayon::current_num_threads();
+    let _num_threads = rayon::current_num_threads();
     let matcher = ScanFilterMatcher::new(options.root.clone(), options.filter_config.clone());
     
     // Phase 1: Collect directories

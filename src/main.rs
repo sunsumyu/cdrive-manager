@@ -1,3 +1,4 @@
+mod ai_analysis;
 mod app;
 mod cleanup;
 mod duplicates;

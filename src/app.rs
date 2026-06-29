@@ -11,6 +11,10 @@ use eframe::egui::{self, RichText};
 use rfd::FileDialog;
 
 use crate::{
+    ai_analysis::{
+        AiAnalysisEvent, AiAnalysisFinished, AiAnalysisHandle, AiAnalysisProgress,
+        AiAnalysisReport, AiCleanupRisk, AiProviderConfig, AiReviewFinding, spawn_ai_analysis,
+    },
     cleanup::{
         CleanupCandidate, CleanupPreview, CleanupPreviewEvent, CleanupPreviewFinished,
         CleanupPreviewHandle, CleanupPreviewOptions, CleanupPreviewProgress, CleanupRule,
@@ -53,6 +57,12 @@ pub struct CDriveManagerApp {
     duplicate_cancel_requested: bool,
     duplicate_progress: Option<DuplicatePreviewProgress>,
     duplicate_preview: Option<Arc<DuplicatePreview>>,
+    ai_analysis_handle: Option<AiAnalysisHandle>,
+    ai_analysis_in_progress: bool,
+    ai_analysis_cancel_requested: bool,
+    ai_analysis_progress: Option<AiAnalysisProgress>,
+    ai_analysis_report: Option<Arc<AiAnalysisReport>>,
+    ai_provider_config: AiProviderConfig,
     cleanup_rules: Vec<CleanupRuleUiState>,
     status_message: String,
     selected_tab: ResultTab,
@@ -62,6 +72,7 @@ pub struct CDriveManagerApp {
     extension_sort: SortState<ExtensionSortKey>,
     cleanup_sort: SortState<CleanupSortKey>,
     duplicate_sort: SortState<DuplicateSortKey>,
+    ai_sort: SortState<AiSortKey>,
     treemap_current_dir: Option<PathBuf>,
     visualization_mode: VisualizationMode,
     scan_filter_excluded_dirs: String,
@@ -87,6 +98,7 @@ enum ResultTab {
     Types,
     CleanupPreview,
     DuplicatePreview,
+    AiReview,
     Errors,
 }
 
@@ -185,6 +197,19 @@ enum DuplicateSortKey {
     KeepPath,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AiSortKey {
+    FinalRecommendation,
+    AuditStatus,
+    Risk,
+    Confidence,
+    Category,
+    Source,
+    Size,
+    Protected,
+    Path,
+}
+
 #[derive(Debug, Clone)]
 struct CleanupRuleUiState {
     rule: CleanupRule,
@@ -221,6 +246,12 @@ impl CDriveManagerApp {
             duplicate_cancel_requested: false,
             duplicate_progress: None,
             duplicate_preview: None,
+            ai_analysis_handle: None,
+            ai_analysis_in_progress: false,
+            ai_analysis_cancel_requested: false,
+            ai_analysis_progress: None,
+            ai_analysis_report: None,
+            ai_provider_config: AiProviderConfig::default(),
             cleanup_rules: default_cleanup_rules()
                 .into_iter()
                 .map(CleanupRuleUiState::new)
@@ -233,6 +264,7 @@ impl CDriveManagerApp {
             extension_sort: SortState::new(ExtensionSortKey::Size, SortDirection::Desc),
             cleanup_sort: SortState::new(CleanupSortKey::Size, SortDirection::Desc),
             duplicate_sort: SortState::new(DuplicateSortKey::Reclaimable, SortDirection::Desc),
+            ai_sort: SortState::new(AiSortKey::Size, SortDirection::Desc),
             treemap_current_dir: None,
             visualization_mode: VisualizationMode::Treemap,
             scan_filter_excluded_dirs: String::new(),
@@ -270,6 +302,10 @@ impl CDriveManagerApp {
         self.stats = None;
         self.cleanup_preview = None;
         self.cleanup_progress = None;
+        self.duplicate_preview = None;
+        self.duplicate_progress = None;
+        self.ai_analysis_report = None;
+        self.ai_analysis_progress = None;
         self.treemap_current_dir = None;
         self.quick_scan_complete = true;
         self.estimated_total_dirs = None;
@@ -300,6 +336,10 @@ impl CDriveManagerApp {
         self.stats = None;
         self.cleanup_preview = None;
         self.cleanup_progress = None;
+        self.duplicate_preview = None;
+        self.duplicate_progress = None;
+        self.ai_analysis_report = None;
+        self.ai_analysis_progress = None;
         self.treemap_current_dir = None;
         self.quick_scan_complete = false;
         self.estimated_total_dirs = None;
@@ -402,6 +442,48 @@ impl CDriveManagerApp {
             handle.cancel();
             self.duplicate_cancel_requested = true;
             self.status_message = "正在取消重复文件检测，已发现的重复组会保留……".to_owned();
+        }
+    }
+
+    fn start_ai_analysis(&mut self) {
+        let cleanup_preview = self.current_cleanup_preview();
+        let duplicate_preview = self.current_duplicate_preview();
+        if cleanup_preview.is_none() && duplicate_preview.is_none() {
+            self.status_message = "请先生成清理预览或重复文件预览，再启动 AI 分析审核。".to_owned();
+            return;
+        }
+
+        let root = cleanup_preview
+            .as_ref()
+            .map(|preview| preview.root.clone())
+            .or_else(|| duplicate_preview.as_ref().map(|preview| preview.root.clone()))
+            .or_else(|| self.stats.as_ref().map(|stats| stats.root.clone()))
+            .unwrap_or_else(|| PathBuf::from(self.root_input.trim()));
+
+        let config = self.ai_provider_config.clone();
+        self.ai_analysis_handle = Some(spawn_ai_analysis(crate::ai_analysis::AiAnalysisOptions {
+            root: root.clone(),
+            cleanup_preview,
+            duplicate_preview,
+            provider_config: config.clone(),
+        }));
+        self.ai_analysis_in_progress = true;
+        self.ai_analysis_cancel_requested = false;
+        self.ai_analysis_progress = None;
+        self.ai_analysis_report = None;
+        self.selected_tab = ResultTab::AiReview;
+        self.status_message = format!(
+            "正在进行 AI 分析审核：{}，模型 {}。dry-run/report-only，不会删除、移动或修改任何文件。",
+            root.display(),
+            config.model
+        );
+    }
+
+    fn cancel_ai_analysis(&mut self) {
+        if let Some(handle) = &self.ai_analysis_handle {
+            handle.cancel();
+            self.ai_analysis_cancel_requested = true;
+            self.status_message = "正在取消 AI 分析审核，已生成的报告会保留……".to_owned();
         }
     }
 
@@ -528,6 +610,11 @@ impl CDriveManagerApp {
         self.duplicate_in_progress = false;
         self.duplicate_cancel_requested = false;
         self.duplicate_handle = None;
+        self.ai_analysis_report = None;
+        self.ai_analysis_progress = None;
+        self.ai_analysis_in_progress = false;
+        self.ai_analysis_cancel_requested = false;
+        self.ai_analysis_handle = None;
         self.treemap_current_dir = None;
     }
 
@@ -605,6 +692,56 @@ impl CDriveManagerApp {
             Err(error) => {
                 self.status_message =
                     format!("导出重复文件预览失败：{} ({:#})", path.display(), error);
+            }
+        }
+    }
+
+    fn export_ai_analysis_report_csv(&mut self) {
+        let Some(report) = self.current_ai_analysis_report() else {
+            self.status_message = "没有可导出的 AI 审核报告。".to_owned();
+            return;
+        };
+
+        let Some(path) = FileDialog::new()
+            .set_title("导出 AI 审核报告 CSV")
+            .add_filter("CSV 报告", &["csv"])
+            .set_file_name("cdrive-ai-review-report.csv")
+            .save_file()
+        else {
+            return;
+        };
+
+        match export_ai_analysis_report_to_path(&path, report.as_ref()) {
+            Ok(summary) => {
+                self.status_message = format!("已导出 AI 审核报告：{} ({})", path.display(), summary);
+            }
+            Err(error) => {
+                self.status_message = format!("导出 AI 审核报告失败：{} ({:#})", path.display(), error);
+            }
+        }
+    }
+
+    fn export_ai_delete_list_csv(&mut self) {
+        let Some(report) = self.current_ai_analysis_report() else {
+            self.status_message = "没有可导出的 AI 待删清单。".to_owned();
+            return;
+        };
+
+        let Some(path) = FileDialog::new()
+            .set_title("导出 AI 待删清单 CSV")
+            .add_filter("CSV 报告", &["csv"])
+            .set_file_name("cdrive-ai-delete-candidates.csv")
+            .save_file()
+        else {
+            return;
+        };
+
+        match export_ai_delete_list_to_path(&path, report.as_ref()) {
+            Ok(summary) => {
+                self.status_message = format!("已导出 AI 待删清单：{} ({})", path.display(), summary);
+            }
+            Err(error) => {
+                self.status_message = format!("导出 AI 待删清单失败：{} ({:#})", path.display(), error);
             }
         }
     }
@@ -701,6 +838,38 @@ impl CDriveManagerApp {
         }
 
         if self.duplicate_in_progress {
+            ctx.request_repaint_after(Duration::from_millis(120));
+        }
+    }
+
+    fn poll_ai_analysis_events(&mut self, ctx: &egui::Context) {
+        let Some(receiver) = self
+            .ai_analysis_handle
+            .as_ref()
+            .map(|handle| handle.receiver.clone())
+        else {
+            return;
+        };
+
+        let mut latest_progress = None;
+        let mut finished = None;
+
+        while let Ok(event) = receiver.try_recv() {
+            match event {
+                AiAnalysisEvent::Progress(progress) => latest_progress = Some(progress),
+                AiAnalysisEvent::Finished(result) => finished = Some(result),
+            }
+        }
+
+        if let Some(progress) = latest_progress {
+            self.apply_ai_analysis_progress(progress);
+        }
+
+        if let Some(result) = finished {
+            self.apply_ai_analysis_finished(result);
+        }
+
+        if self.ai_analysis_in_progress {
             ctx.request_repaint_after(Duration::from_millis(120));
         }
     }
@@ -950,6 +1119,43 @@ impl CDriveManagerApp {
         self.duplicate_handle = None;
     }
 
+    fn apply_ai_analysis_progress(&mut self, progress: AiAnalysisProgress) {
+        self.status_message = if progress.cancelled {
+            "AI 分析审核已取消，当前显示的是部分报告。".to_owned()
+        } else if progress.finished {
+            "AI 分析审核完成。".to_owned()
+        } else if let Some(item) = &progress.current_item {
+            format!("正在{}：{}", progress.phase.label(), item)
+        } else {
+            format!("正在{}……", progress.phase.label())
+        };
+        self.ai_analysis_progress = Some(progress);
+    }
+
+    fn apply_ai_analysis_finished(&mut self, result: AiAnalysisFinished) {
+        self.status_message = if result.cancelled {
+            format!(
+                "AI 分析审核已取消：已分析 {} 个候选，可导出待删候选 {} 个，需人工复核 {} 个。不会删除任何文件。",
+                format::count(result.report.candidate_count),
+                format::count(result.report.delete_candidate_count),
+                format::count(result.report.needs_review_count)
+            )
+        } else {
+            format!(
+                "AI 分析审核完成：{} 个候选，可导出待删候选 {} 个，需人工复核 {} 个，拒绝/保留 {} 个，错误 {} 条。请人工确认后自行处理；本程序不会删除文件。",
+                format::count(result.report.candidate_count),
+                format::count(result.report.delete_candidate_count),
+                format::count(result.report.needs_review_count),
+                format::count(result.report.rejected_count),
+                format::count(result.report.error_count)
+            )
+        };
+        self.ai_analysis_report = Some(result.report);
+        self.ai_analysis_in_progress = false;
+        self.ai_analysis_cancel_requested = false;
+        self.ai_analysis_handle = None;
+    }
+
     fn current_stats(&self) -> Option<Arc<ScanStats>> {
         self.stats.as_ref().map(Arc::clone).or_else(|| {
             self.progress
@@ -971,6 +1177,14 @@ impl CDriveManagerApp {
             self.duplicate_progress
                 .as_ref()
                 .map(|progress| Arc::clone(&progress.preview))
+        })
+    }
+
+    fn current_ai_analysis_report(&self) -> Option<Arc<AiAnalysisReport>> {
+        self.ai_analysis_report.as_ref().map(Arc::clone).or_else(|| {
+            self.ai_analysis_progress
+                .as_ref()
+                .map(|progress| Arc::clone(&progress.report))
         })
     }
 
@@ -1032,8 +1246,10 @@ impl CDriveManagerApp {
                     .weak(),
             );
 
-            let busy =
-                self.scan_in_progress || self.cleanup_in_progress || self.duplicate_in_progress;
+            let busy = self.scan_in_progress
+                || self.cleanup_in_progress
+                || self.duplicate_in_progress
+                || self.ai_analysis_in_progress;
 
             ui.label(RichText::new("排除目录名称").strong());
             ui.add_enabled(
@@ -1219,6 +1435,48 @@ impl CDriveManagerApp {
 
                 ui.separator();
 
+                let has_ai_source =
+                    self.current_cleanup_preview().is_some() || self.current_duplicate_preview().is_some();
+                if ui
+                    .add_enabled(!busy && has_ai_source, egui::Button::new("AI 分析审核"))
+                    .on_hover_text("基于清理预览和/或重复文件预览调用 OpenAI 兼容 API。只生成报告，不删除文件。")
+                    .clicked()
+                {
+                    self.start_ai_analysis();
+                }
+
+                if ui
+                    .add_enabled(
+                        self.ai_analysis_in_progress && !self.ai_analysis_cancel_requested,
+                        egui::Button::new("取消 AI 分析"),
+                    )
+                    .clicked()
+                {
+                    self.cancel_ai_analysis();
+                }
+
+                if ui
+                    .add_enabled(
+                        !busy && self.current_ai_analysis_report().is_some(),
+                        egui::Button::new("导出 AI 报告 CSV"),
+                    )
+                    .clicked()
+                {
+                    self.export_ai_analysis_report_csv();
+                }
+
+                if ui
+                    .add_enabled(
+                        !busy && self.current_ai_analysis_report().is_some(),
+                        egui::Button::new("导出待删清单 CSV"),
+                    )
+                    .clicked()
+                {
+                    self.export_ai_delete_list_csv();
+                }
+
+                ui.separator();
+
                 if ui
                     .add_enabled(!busy, egui::Button::new("缓存管理"))
                     .clicked()
@@ -1240,10 +1498,16 @@ impl CDriveManagerApp {
                         } else {
                             "预览中"
                         }
-                    } else if self.duplicate_cancel_requested {
-                        "取消重复检测中"
+                    } else if self.duplicate_in_progress {
+                        if self.duplicate_cancel_requested {
+                            "取消重复检测中"
+                        } else {
+                            "重复检测中"
+                        }
+                    } else if self.ai_analysis_cancel_requested {
+                        "取消 AI 分析中"
                     } else {
-                        "重复检测中"
+                        "AI 分析中"
                     };
                     ui.label(RichText::new(text).strong());
                     
@@ -1474,7 +1738,7 @@ impl CDriveManagerApp {
 
             ui.horizontal(|ui| {
                 // Color bar
-                let color = match ext.extension.as_str() {
+                let color = match ext.extension.trim_start_matches('.') {
                     "dll" | "exe" => egui::Color32::RED,
                     "msi" | "cab" => egui::Color32::GREEN,
                     "sys" | "cat" => egui::Color32::BLUE,
@@ -1482,13 +1746,14 @@ impl CDriveManagerApp {
                     _ => egui::Color32::GRAY,
                 };
                 
+                ui.colored_label(color, "■");
                 ui.add(
                     egui::ProgressBar::new((percentage / 100.0) as f32)
                         .desired_width(80.0)
                         .desired_height(8.0),
                 );
                 
-                ui.label(format!(".{}", ext.extension));
+                ui.label(ext.extension.as_str());
                 ui.label(format::bytes(ext.total_size));
             });
         }
@@ -1820,6 +2085,7 @@ impl CDriveManagerApp {
                 ResultTab::DuplicatePreview,
                 "重复文件",
             );
+            tab_button(ui, &mut self.selected_tab, ResultTab::AiReview, "AI 审核报告");
             tab_button(ui, &mut self.selected_tab, ResultTab::Errors, "错误");
         });
         ui.separator();
@@ -1855,6 +2121,7 @@ impl CDriveManagerApp {
             }
             ResultTab::CleanupPreview => self.draw_cleanup_preview_tab(ui),
             ResultTab::DuplicatePreview => self.draw_duplicate_preview_tab(ui),
+            ResultTab::AiReview => self.draw_ai_review_tab(ui),
             ResultTab::Errors => error_list(ui, stats, &self.search_query),
         }
     }
@@ -1926,6 +2193,101 @@ impl CDriveManagerApp {
             &mut self.duplicate_sort,
             &mut self.status_message,
         );
+    }
+
+    fn draw_ai_review_tab(&mut self, ui: &mut egui::Ui) {
+        self.draw_ai_config_panel(ui);
+        ui.separator();
+        ai_review_table(
+            ui,
+            self.current_ai_analysis_report().as_deref(),
+            &self.search_query,
+            &mut self.ai_sort,
+            &mut self.status_message,
+        );
+    }
+
+    fn draw_ai_config_panel(&mut self, ui: &mut egui::Ui) {
+        ui.collapsing("AI 分析配置（OpenAI 兼容 API）", |ui| {
+            ui.label(
+                RichText::new("API Key 只从环境变量读取，不会保存、显示、日志记录或导出。默认不会向云 API 发送完整路径/文件名。")
+                    .small()
+                    .weak(),
+            );
+            let busy = self.ai_analysis_in_progress;
+            egui::Grid::new("ai_config_grid")
+                .num_columns(2)
+                .spacing([12.0, 4.0])
+                .show(ui, |ui| {
+                    ui.label("Base URL");
+                    ui.add_enabled(
+                        !busy,
+                        egui::TextEdit::singleline(&mut self.ai_provider_config.base_url)
+                            .desired_width(280.0),
+                    );
+                    ui.end_row();
+
+                    ui.label("模型");
+                    ui.add_enabled(
+                        !busy,
+                        egui::TextEdit::singleline(&mut self.ai_provider_config.model)
+                            .desired_width(180.0),
+                    );
+                    ui.end_row();
+
+                    ui.label("API Key 环境变量");
+                    ui.add_enabled(
+                        !busy,
+                        egui::TextEdit::singleline(&mut self.ai_provider_config.api_key_env)
+                            .desired_width(180.0),
+                    );
+                    ui.end_row();
+
+                    ui.label("最多候选数");
+                    let mut max_candidates_text = self.ai_provider_config.max_candidates.to_string();
+                    if ui
+                        .add_enabled(
+                            !busy,
+                            egui::TextEdit::singleline(&mut max_candidates_text)
+                                .desired_width(80.0),
+                        )
+                        .changed()
+                    {
+                        if let Ok(value) = max_candidates_text.parse::<usize>() {
+                            self.ai_provider_config.max_candidates = value.clamp(1, 1000);
+                        }
+                    }
+                    ui.end_row();
+
+                    ui.label("超时秒数");
+                    let mut timeout_text = self.ai_provider_config.timeout_secs.to_string();
+                    if ui
+                        .add_enabled(
+                            !busy,
+                            egui::TextEdit::singleline(&mut timeout_text).desired_width(80.0),
+                        )
+                        .changed()
+                    {
+                        if let Ok(value) = timeout_text.parse::<u64>() {
+                            self.ai_provider_config.timeout_secs = value.clamp(5, 600);
+                        }
+                    }
+                    ui.end_row();
+                });
+
+            ui.add_enabled(
+                !busy,
+                egui::Checkbox::new(
+                    &mut self.ai_provider_config.send_full_paths,
+                    "允许向云 API 发送完整路径/文件名",
+                ),
+            );
+            ui.label(
+                RichText::new("关闭时云端只接收脱敏路径、大小、扩展名、来源、风险提示和规则原因；本地导出的报告仍包含真实路径，方便用户人工确认。")
+                    .small()
+                    .weak(),
+            );
+        });
     }
 
     fn draw_cleanup_rules_panel(&mut self, ui: &mut egui::Ui) {
@@ -2009,19 +2371,37 @@ impl CDriveManagerApp {
         } else {
             // Scanning in progress - use top_level_dirs for hierarchical incremental display
             // This shows direct children of root, which is more meaningful than global largest_dirs
-            let items: Vec<TreemapItem> = stats
-                .top_level_dirs
-                .iter()
-                .map(|dir| TreemapItem::directory(
-                    dir.path
-                        .file_name()
-                        .and_then(|name| name.to_str())
-                        .map(|s| s.to_string())
-                        .unwrap_or_else(|| dir.path.display().to_string()),
-                    dir.path.clone(),
-                    dir.total_size,
-                ))
-                .collect();
+            let items: Vec<TreemapItem> = if stats.top_level_dirs.iter().any(|dir| dir.total_size > 0) {
+                stats
+                    .top_level_dirs
+                    .iter()
+                    .map(|dir| TreemapItem::directory(
+                        dir.path
+                            .file_name()
+                            .and_then(|name| name.to_str())
+                            .map(|s| s.to_string())
+                            .unwrap_or_else(|| dir.path.display().to_string()),
+                        dir.path.clone(),
+                        dir.total_size,
+                    ))
+                    .collect()
+            } else {
+                stats
+                    .largest_dirs
+                    .iter()
+                    .take(36)
+                    .filter(|dir| dir.total_size > 0)
+                    .map(|dir| TreemapItem::directory(
+                        dir.path
+                            .file_name()
+                            .and_then(|name| name.to_str())
+                            .map(|s| s.to_string())
+                            .unwrap_or_else(|| dir.path.display().to_string()),
+                        dir.path.clone(),
+                        dir.total_size,
+                    ))
+                    .collect()
+            };
             let display_limit = 36;
             let items = treemap_items_with_other(items, stats.root.clone(), display_limit);
             (items, stats.total_size, true)
@@ -2073,7 +2453,9 @@ impl CDriveManagerApp {
             );
         }
 
-        let empty_message = if is_scanning {
+        let empty_message = if is_scanning && stats.file_count == 0 {
+            "正在读取文件大小，稍候显示空间占用图..."
+        } else if is_scanning {
             "正在扫描中..."
         } else if stats.total_size == 0 {
             "扫描后显示目录空间占用图"
@@ -2192,6 +2574,7 @@ impl eframe::App for CDriveManagerApp {
         self.poll_scan_events(ctx);
         self.poll_cleanup_preview_events(ctx);
         self.poll_duplicate_preview_events(ctx);
+        self.poll_ai_analysis_events(ctx);
         self.draw_top_bar(ctx);
         self.draw_cache_manager_window(ctx);
 
@@ -3056,6 +3439,152 @@ fn write_duplicate_file_csv_row(
     )
 }
 
+fn export_ai_analysis_report_to_path(
+    path: &Path,
+    report: &AiAnalysisReport,
+) -> anyhow::Result<String> {
+    let file = File::create(path)?;
+    let mut writer = BufWriter::new(file);
+
+    write_csv_row(
+        &mut writer,
+        [
+            "mode",
+            "action_taken",
+            "source",
+            "category",
+            "risk",
+            "confidence",
+            "protected",
+            "analysis_recommendation",
+            "analysis_reason",
+            "audit_status",
+            "audit_reason",
+            "final_recommendation",
+            "delete_list_candidate",
+            "path",
+            "size_bytes",
+            "size_display",
+            "provider",
+            "model",
+        ],
+    )?;
+
+    for finding in &report.findings {
+        write_ai_finding_csv_row(&mut writer, report, finding)?;
+    }
+
+    if !report.errors.is_empty() {
+        write_csv_row(&mut writer, ["errors"])?;
+        for error in &report.errors {
+            write_csv_row(&mut writer, [error.as_str()])?;
+        }
+    }
+
+    writer.flush()?;
+
+    Ok(format!(
+        "ai-review/report-only，候选 {} 个，待删清单 {} 个，需人工复核 {} 个，受保护 {} 个，错误 {} 条",
+        format::count(report.candidate_count),
+        format::count(report.delete_candidate_count),
+        format::count(report.needs_review_count),
+        format::count(report.protected_count),
+        format::count(report.error_count)
+    ))
+}
+
+fn export_ai_delete_list_to_path(
+    path: &Path,
+    report: &AiAnalysisReport,
+) -> anyhow::Result<String> {
+    let file = File::create(path)?;
+    let mut writer = BufWriter::new(file);
+
+    write_csv_row(
+        &mut writer,
+        [
+            "mode",
+            "action_taken",
+            "source",
+            "category",
+            "risk",
+            "confidence",
+            "audit_status",
+            "final_recommendation",
+            "path",
+            "size_bytes",
+            "size_display",
+            "audit_reason",
+        ],
+    )?;
+
+    let mut exported = 0_u64;
+    let mut exported_size = 0_u64;
+    for finding in report
+        .findings
+        .iter()
+        .filter(|finding| finding.is_delete_list_candidate())
+    {
+        write_csv_row(
+            &mut writer,
+            [
+                "ai-review".to_owned(),
+                "none".to_owned(),
+                finding.source.as_str().to_owned(),
+                finding.category.as_str().to_owned(),
+                finding.risk.as_str().to_owned(),
+                format!("{:.2}", finding.confidence),
+                finding.audit_status.as_str().to_owned(),
+                finding.final_recommendation.as_str().to_owned(),
+                path_text(&finding.path),
+                finding.size.to_string(),
+                format::bytes(finding.size),
+                finding.audit_reason.clone(),
+            ],
+        )?;
+        exported += 1;
+        exported_size = exported_size.saturating_add(finding.size);
+    }
+
+    writer.flush()?;
+
+    Ok(format!(
+        "ai-review/report-only，导出待删候选 {} 个，合计 {}；action_taken=none，请人工确认后自行处理",
+        format::count(exported),
+        format::bytes(exported_size)
+    ))
+}
+
+fn write_ai_finding_csv_row(
+    writer: &mut impl Write,
+    report: &AiAnalysisReport,
+    finding: &AiReviewFinding,
+) -> anyhow::Result<()> {
+    write_csv_row(
+        writer,
+        [
+            "ai-review".to_owned(),
+            "none".to_owned(),
+            finding.source.as_str().to_owned(),
+            finding.category.as_str().to_owned(),
+            finding.risk.as_str().to_owned(),
+            format!("{:.2}", finding.confidence),
+            finding.protected.to_string(),
+            finding.analysis_recommendation.as_str().to_owned(),
+            finding.analysis_reason.clone(),
+            finding.audit_status.as_str().to_owned(),
+            finding.audit_reason.clone(),
+            finding.final_recommendation.as_str().to_owned(),
+            finding.is_delete_list_candidate().to_string(),
+            path_text(&finding.path),
+            finding.size.to_string(),
+            format::bytes(finding.size),
+            report.provider_label.clone(),
+            report.model.clone(),
+        ],
+    )
+}
+
 fn cleanup_preview_table(
     ui: &mut egui::Ui,
     preview: Option<&CleanupPreview>,
@@ -3386,6 +3915,183 @@ fn duplicate_file_line(ui: &mut egui::Ui, file: &DuplicateFile, status_message: 
     );
 }
 
+fn ai_review_table(
+    ui: &mut egui::Ui,
+    report: Option<&AiAnalysisReport>,
+    search_query: &str,
+    sort: &mut SortState<AiSortKey>,
+    status_message: &mut String,
+) {
+    let Some(report) = report else {
+        ui.label("生成清理预览或重复文件预览后，点击\"AI 分析审核\"。当前版本只生成报告和待删清单，不执行删除。 ");
+        return;
+    };
+
+    ui.label(
+        RichText::new(format!(
+            "AI 审核报告：根目录 {}，Provider {}，模型 {}。候选 {} 个，待删清单候选 {} 个，需人工复核 {} 个，拒绝/保留 {} 个，受保护 {} 个，错误 {} 条。",
+            report.root.display(),
+            report.provider_label,
+            report.model,
+            format::count(report.candidate_count),
+            format::count(report.delete_candidate_count),
+            format::count(report.needs_review_count),
+            format::count(report.rejected_count),
+            format::count(report.protected_count),
+            format::count(report.error_count)
+        ))
+        .small()
+        .strong(),
+    );
+    ui.label(
+        RichText::new("待删清单只包含：审核通过/纠正为可删、非受保护、风险不是高/未知、且不需要人工复核的项目；导出仍为 action_taken=none。")
+            .small()
+            .weak(),
+    );
+
+    if !report.errors.is_empty() {
+        ui.label(
+            RichText::new(format!(
+                "AI 流程记录了 {} 条错误；失败或缺失结果会保守标记为需人工复核。",
+                format::count(report.error_count)
+            ))
+            .small()
+            .weak(),
+        );
+    }
+
+    let query = normalized_query(search_query);
+    let mut findings: Vec<_> = report
+        .findings
+        .iter()
+        .filter(|finding| ai_finding_matches(finding, &query))
+        .collect();
+    findings.sort_by(|left, right| compare_ai_findings(left, right, *sort));
+
+    result_count_label(
+        ui,
+        findings.len().min(120),
+        findings.len(),
+        report.findings.len(),
+        "AI 条目",
+    );
+
+    if findings.is_empty() {
+        ui.label("没有匹配的 AI 审核条目。 ");
+        return;
+    }
+
+    egui::ScrollArea::vertical()
+        .max_height(360.0)
+        .show(ui, |ui| {
+            egui::Grid::new("ai_review_table")
+                .striped(true)
+                .num_columns(10)
+                .spacing([12.0, 4.0])
+                .show(ui, |ui| {
+                    sortable_header(
+                        ui,
+                        "最终建议",
+                        AiSortKey::FinalRecommendation,
+                        SortDirection::Asc,
+                        sort,
+                    );
+                    sortable_header(
+                        ui,
+                        "审核",
+                        AiSortKey::AuditStatus,
+                        SortDirection::Asc,
+                        sort,
+                    );
+                    sortable_header(ui, "风险", AiSortKey::Risk, SortDirection::Desc, sort);
+                    sortable_header(
+                        ui,
+                        "置信度",
+                        AiSortKey::Confidence,
+                        SortDirection::Desc,
+                        sort,
+                    );
+                    sortable_header(ui, "分类", AiSortKey::Category, SortDirection::Asc, sort);
+                    sortable_header(ui, "来源", AiSortKey::Source, SortDirection::Asc, sort);
+                    sortable_header(ui, "大小", AiSortKey::Size, SortDirection::Desc, sort);
+                    sortable_header(
+                        ui,
+                        "保护",
+                        AiSortKey::Protected,
+                        SortDirection::Desc,
+                        sort,
+                    );
+                    sortable_header(ui, "路径", AiSortKey::Path, SortDirection::Asc, sort);
+                    plain_header(ui, "理由/操作");
+                    ui.end_row();
+
+                    for finding in findings.into_iter().take(120) {
+                        ai_finding_row(ui, finding, status_message);
+                    }
+                });
+        });
+}
+
+fn ai_finding_matches(finding: &AiReviewFinding, query: &str) -> bool {
+    query.is_empty()
+        || text_matches(finding.final_recommendation.label(), query)
+        || text_matches(finding.audit_status.label(), query)
+        || text_matches(finding.risk.label(), query)
+        || text_matches(finding.category.label(), query)
+        || text_matches(finding.source.label(), query)
+        || text_matches(&finding.display_path, query)
+        || text_matches(&finding.analysis_reason, query)
+        || text_matches(&finding.audit_reason, query)
+}
+
+fn ai_finding_row(ui: &mut egui::Ui, finding: &AiReviewFinding, status_message: &mut String) {
+    let recommendation = if finding.is_delete_list_candidate() {
+        RichText::new(finding.final_recommendation.label()).strong()
+    } else {
+        RichText::new(finding.final_recommendation.label())
+    };
+    ui.label(recommendation);
+    ui.label(finding.audit_status.label());
+    ui.label(match finding.risk {
+        AiCleanupRisk::High | AiCleanupRisk::Unknown => RichText::new(finding.risk.label()).strong(),
+        _ => RichText::new(finding.risk.label()),
+    });
+    ui.label(format!("{:.0}%", finding.confidence * 100.0));
+    ui.label(finding.category.label());
+    ui.label(finding.source.label());
+    ui.label(format::bytes(finding.size));
+    ui.label(if finding.protected {
+        RichText::new("受保护").strong()
+    } else {
+        RichText::new("-")
+    });
+
+    let path_text = finding.path.display().to_string();
+    let open_target = finding.path.parent().unwrap_or(finding.path.as_path());
+    let path_response = ui
+        .label(compact_text(&path_text, 64))
+        .on_hover_text(path_text.clone());
+    path_context_menu(
+        path_response,
+        &finding.path,
+        open_target,
+        &file_name(&finding.path),
+        status_message,
+    );
+
+    ui.vertical(|ui| {
+        ui.label(compact_text(&finding.audit_reason, 48))
+            .on_hover_text(format!(
+                "审核理由：{}\n分析建议：{}\n分析理由：{}",
+                finding.audit_reason,
+                finding.analysis_recommendation.label(),
+                finding.analysis_reason
+            ));
+        path_actions(ui, &finding.path, open_target, status_message);
+    });
+    ui.end_row();
+}
+
 fn extension_table(
     ui: &mut egui::Ui,
     stats: &ScanStats,
@@ -3622,6 +4328,32 @@ fn compare_duplicate_groups(
     };
 
     apply_direction(primary, sort.direction).then_with(|| left.keep_path.cmp(&right.keep_path))
+}
+
+fn compare_ai_findings(
+    left: &AiReviewFinding,
+    right: &AiReviewFinding,
+    sort: SortState<AiSortKey>,
+) -> Ordering {
+    let primary = match sort.key {
+        AiSortKey::FinalRecommendation => left
+            .final_recommendation
+            .rank()
+            .cmp(&right.final_recommendation.rank()),
+        AiSortKey::AuditStatus => left.audit_status.rank().cmp(&right.audit_status.rank()),
+        AiSortKey::Risk => left.risk.rank().cmp(&right.risk.rank()),
+        AiSortKey::Confidence => left
+            .confidence
+            .partial_cmp(&right.confidence)
+            .unwrap_or(Ordering::Equal),
+        AiSortKey::Category => left.category.rank().cmp(&right.category.rank()),
+        AiSortKey::Source => compare_text(left.source.label(), right.source.label()),
+        AiSortKey::Size => left.size.cmp(&right.size),
+        AiSortKey::Protected => left.protected.cmp(&right.protected),
+        AiSortKey::Path => left.path.cmp(&right.path),
+    };
+
+    apply_direction(primary, sort.direction).then_with(|| left.path.cmp(&right.path))
 }
 
 fn apply_direction(ordering: Ordering, direction: SortDirection) -> Ordering {

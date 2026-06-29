@@ -414,12 +414,15 @@ impl ScanAccumulator {
         // Use incremental top-level dirs (cached, O(d) where d = direct children)
         let top_level_dirs = self.get_top_level_dirs();
 
-        // Skip sorting all dirs during scanning - only keep recent updates
-        // This is O(1) instead of O(n log n)
-        let largest_dirs = Vec::new();
+        // Keep useful live data while scanning. These collections are capped so
+        // progress updates can drive the UI without waiting for the final snapshot.
+        let mut largest_dirs: Vec<_> = self.dir_sizes.values().cloned().collect();
+        largest_dirs.sort_by(compare_size_then_path_dir);
+        largest_dirs.truncate(250);
 
-        // Skip sorting extensions during scanning
-        let extensions = Vec::new();
+        let mut extensions: Vec<_> = self.extension_sizes.values().cloned().collect();
+        extensions.sort_by(compare_size_then_extension);
+        extensions.truncate(250);
 
         let mut largest_files = self.largest_files.clone();
         largest_files.sort_by(compare_size_then_path_file);
@@ -725,7 +728,7 @@ mod tests {
             excluded_extensions: vec![".tmp".to_owned()],
             same_file_system: true,
         };
-        let accumulator = ScanAccumulator::new_with_filter_config(root, filter_config.clone());
+        let mut accumulator = ScanAccumulator::new_with_filter_config(root, filter_config.clone());
 
         let stats = accumulator.final_snapshot();
 
