@@ -1606,96 +1606,113 @@ impl CDriveManagerApp {
         let right_width = (available_width * self.right_panel_ratio).clamp(150.0, 280.0);
         let center_width = (available_width - left_width - right_width - splitter_width * 2.0).max(260.0);
 
-        // Row layout for visualization panels
-        ui.horizontal(|ui| {
-            // Left panel: Directory tree
-            let left_response = ui.allocate_ui_with_layout(
-                egui::vec2(left_width, viz_height),
-                egui::Layout::top_down(egui::Align::Min),
-                |ui| {
-                    egui::Frame::group(ui.style()).show(ui, |ui| {
-                        ui.set_min_height(viz_height - 8.0);
-                        self.draw_directory_tree_panel(ui, stats);
-                    });
-                },
-            );
-            let left_rect = left_response.response.rect;
-
-            // Left splitter (horizontal resize)
-            let left_splitter_rect = egui::Rect::from_min_size(
-                egui::pos2(left_rect.max.x, left_rect.min.y),
-                egui::vec2(splitter_width, viz_height),
-            );
-            let left_splitter_id = ui.make_persistent_id("viz_left_splitter");
-            let left_splitter_response = ui.interact(left_splitter_rect, left_splitter_id, egui::Sense::drag());
-            
-            if left_splitter_response.dragged() {
-                if let Some(pos) = ui.ctx().pointer_interact_pos() {
-                    let new_ratio = (pos.x / available_width).clamp(0.15, 0.40);
-                    self.left_panel_ratio = new_ratio;
+        // Use a single horizontal layout with proper cursor advancement
+        ui.allocate_ui_with_layout(
+            egui::vec2(available_width, viz_height),
+            egui::Layout::left_to_right(egui::Align::Min),
+            |ui| {
+                // === Left panel: Directory tree ===
+                let left_rect_start = ui.cursor().min;
+                
+                ui.allocate_ui_with_layout(
+                    egui::vec2(left_width, viz_height),
+                    egui::Layout::top_down(egui::Align::Min),
+                    |ui| {
+                        egui::Frame::group(ui.style()).show(ui, |ui| {
+                            ui.set_min_height(viz_height - 8.0);
+                            self.draw_directory_tree_panel(ui, stats);
+                        });
+                    },
+                );
+                
+                // Get the actual allocated rect for left panel
+                let left_allocated_rect = ui.min_rect();
+                
+                // === Left splitter ===
+                let left_splitter_rect = egui::Rect::from_min_size(
+                    egui::pos2(left_allocated_rect.max.x, left_rect_start.y),
+                    egui::vec2(splitter_width, viz_height),
+                );
+                
+                // Allocate splitter space
+                ui.allocate_space(egui::vec2(splitter_width, viz_height));
+                
+                let left_splitter_id = ui.make_persistent_id("viz_left_splitter");
+                let left_splitter_response = ui.interact(left_splitter_rect, left_splitter_id, egui::Sense::drag());
+                
+                if left_splitter_response.dragged() {
+                    if let Some(pos) = ui.ctx().pointer_interact_pos() {
+                        let new_ratio = (pos.x / available_width).clamp(0.15, 0.40);
+                        self.left_panel_ratio = new_ratio;
+                    }
                 }
-            }
-            
-            // Draw left splitter with hover/drag highlight
-            let left_splitter_color = if left_splitter_response.dragged() {
-                egui::Color32::from_rgb(100, 150, 200)
-            } else if left_splitter_response.hovered() {
-                egui::Color32::from_rgb(80, 120, 180)
-            } else {
-                egui::Color32::from_rgb(50, 55, 65)
-            };
-            ui.painter_at(left_splitter_rect).rect_filled(left_splitter_rect, 0.0, left_splitter_color);
+                
+                // Draw left splitter
+                let left_splitter_color = if left_splitter_response.dragged() {
+                    egui::Color32::from_rgb(100, 150, 200)
+                } else if left_splitter_response.hovered() {
+                    egui::Color32::from_rgb(80, 120, 180)
+                } else {
+                    egui::Color32::from_rgb(50, 55, 65)
+                };
+                ui.painter().rect_filled(left_splitter_rect, 0.0, left_splitter_color);
 
-            // Center panel: Treemap/Sunburst
-            ui.allocate_ui_with_layout(
-                egui::vec2(center_width, viz_height),
-                egui::Layout::top_down(egui::Align::Min),
-                |ui| {
-                    egui::Frame::group(ui.style()).show(ui, |ui| {
-                        ui.set_min_height(viz_height - 8.0);
-                        self.draw_treemap_panel(ui, stats);
-                    });
-                },
-            );
-
-            // Right splitter (horizontal resize)
-            let right_splitter_start_x = left_rect.max.x + splitter_width + center_width;
-            let right_splitter_rect = egui::Rect::from_min_size(
-                egui::pos2(right_splitter_start_x, left_rect.min.y),
-                egui::vec2(splitter_width, viz_height),
-            );
-            let right_splitter_id = ui.make_persistent_id("viz_right_splitter");
-            let right_splitter_response = ui.interact(right_splitter_rect, right_splitter_id, egui::Sense::drag());
-
-            if right_splitter_response.dragged() {
-                if let Some(pos) = ui.ctx().pointer_interact_pos() {
-                    // Right panel starts from this splitter, so ratio = (width - pos.x) / width
-                    let new_ratio = ((available_width - pos.x) / available_width).clamp(0.10, 0.30);
-                    self.right_panel_ratio = new_ratio;
+                // === Center panel: Treemap/Sunburst ===
+                ui.allocate_ui_with_layout(
+                    egui::vec2(center_width, viz_height),
+                    egui::Layout::top_down(egui::Align::Min),
+                    |ui| {
+                        egui::Frame::group(ui.style()).show(ui, |ui| {
+                            ui.set_min_height(viz_height - 8.0);
+                            self.draw_treemap_panel(ui, stats);
+                        });
+                    },
+                );
+                
+                let center_allocated_rect = ui.min_rect();
+                
+                // === Right splitter ===
+                let right_splitter_rect = egui::Rect::from_min_size(
+                    egui::pos2(center_allocated_rect.max.x, left_rect_start.y),
+                    egui::vec2(splitter_width, viz_height),
+                );
+                
+                // Allocate splitter space
+                ui.allocate_space(egui::vec2(splitter_width, viz_height));
+                
+                let right_splitter_id = ui.make_persistent_id("viz_right_splitter");
+                let right_splitter_response = ui.interact(right_splitter_rect, right_splitter_id, egui::Sense::drag());
+                
+                if right_splitter_response.dragged() {
+                    if let Some(pos) = ui.ctx().pointer_interact_pos() {
+                        let new_ratio = ((available_width - pos.x) / available_width).clamp(0.10, 0.30);
+                        self.right_panel_ratio = new_ratio;
+                    }
                 }
-            }
+                
+                // Draw right splitter
+                let right_splitter_color = if right_splitter_response.dragged() {
+                    egui::Color32::from_rgb(100, 150, 200)
+                } else if right_splitter_response.hovered() {
+                    egui::Color32::from_rgb(80, 120, 180)
+                } else {
+                    egui::Color32::from_rgb(50, 55, 65)
+                };
+                ui.painter().rect_filled(right_splitter_rect, 0.0, right_splitter_color);
 
-            let right_splitter_color = if right_splitter_response.dragged() {
-                egui::Color32::from_rgb(100, 150, 200)
-            } else if right_splitter_response.hovered() {
-                egui::Color32::from_rgb(80, 120, 180)
-            } else {
-                egui::Color32::from_rgb(50, 55, 65)
-            };
-            ui.painter_at(right_splitter_rect).rect_filled(right_splitter_rect, 0.0, right_splitter_color);
-
-            // Right panel: Extension/File type distribution
-            ui.allocate_ui_with_layout(
-                egui::vec2(right_width, viz_height),
-                egui::Layout::top_down(egui::Align::Min),
-                |ui| {
-                    egui::Frame::group(ui.style()).show(ui, |ui| {
-                        ui.set_min_height(viz_height - 8.0);
-                        self.draw_extension_panel(ui, stats);
-                    });
-                },
-            );
-        });
+                // === Right panel: Extension/File type distribution ===
+                ui.allocate_ui_with_layout(
+                    egui::vec2(right_width, viz_height),
+                    egui::Layout::top_down(egui::Align::Min),
+                    |ui| {
+                        egui::Frame::group(ui.style()).show(ui, |ui| {
+                            ui.set_min_height(viz_height - 8.0);
+                            self.draw_extension_panel(ui, stats);
+                        });
+                    },
+                );
+            },
+        );
 
         // Bottom: Tab bar with detailed data tables
         ui.add_space(6.0);
@@ -1746,21 +1763,39 @@ impl CDriveManagerApp {
         }
     }
 
-    /// Recursive tree drawing with percentage bars and icons
+    /// Recursive tree drawing with percentage bars, icons, and collapsible nodes
     fn draw_tree_recursive(&mut self, ui: &mut egui::Ui, tree: &DirectoryTree, node_index: usize, depth: usize, stats: &ScanStats) {
         if depth > 5 {
             return; // Limit depth for performance
         }
 
         let node = &tree.nodes[node_index];
-        let indent = depth * 12;
-        ui.add_space(2.0);
+        let has_children = !node.children.is_empty();
+        let is_expanded = self.expanded_dirs.contains(&node.record.path);
+        let indent = depth * 16;
         
         ui.horizontal(|ui| {
             ui.add_space(indent as f32);
             
-            // Add icon based on file category (for directories, use folder icon)
-            let icon = "📁";  // Folder icon for directories
+            // Expand/collapse button for directories with children
+            if has_children {
+                let expand_icon = if is_expanded { "▼" } else { "▶" };
+                let expand_button = egui::Button::new(egui::RichText::new(expand_icon).size(10.0))
+                    .fill(egui::Color32::TRANSPARENT)
+                    .small();
+                if ui.add(expand_button).clicked() {
+                    if is_expanded {
+                        self.expanded_dirs.remove(&node.record.path);
+                    } else {
+                        self.expanded_dirs.insert(node.record.path.clone());
+                    }
+                }
+            } else {
+                ui.add_space(12.0); // Align with expand button width
+            }
+            
+            // Add folder icon
+            let icon = if has_children && is_expanded { "📂" } else { "📁" };
             ui.label(egui::RichText::new(icon).size(14.0));
             
             // Directory name
@@ -1782,12 +1817,12 @@ impl CDriveManagerApp {
             // Draw percentage progress bar
             ui.add(
                 egui::ProgressBar::new((percentage / 100.0) as f32)
-                    .desired_width(60.0)
+                    .desired_width(50.0)
                     .desired_height(8.0)
                     .fill(color),
             );
             
-            // Show name and size
+            // Show name and size - click to navigate to directory in treemap
             let text = format!("{} ({})", name, size_text);
             if ui.small_button(text).clicked() {
                 self.treemap_current_dir = Some(node.record.path.clone());
@@ -1797,8 +1832,11 @@ impl CDriveManagerApp {
             ui.label(egui::RichText::new(format!("{:.1}%", percentage)).small().weak());
         });
 
-        for &child_index in &node.children {
-            self.draw_tree_recursive(ui, tree, child_index, depth + 1, stats);
+        // Only draw children if expanded (or at root level, always show first level)
+        if has_children && (is_expanded || depth == 0) {
+            for &child_index in &node.children {
+                self.draw_tree_recursive(ui, tree, child_index, depth + 1, stats);
+            }
         }
     }
 
