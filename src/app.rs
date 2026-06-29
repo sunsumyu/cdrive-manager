@@ -75,6 +75,15 @@ pub struct CDriveManagerApp {
     ai_sort: SortState<AiSortKey>,
     treemap_current_dir: Option<PathBuf>,
     visualization_mode: VisualizationMode,
+    // Resizable panel state
+    left_panel_ratio: f32,
+    right_panel_ratio: f32,
+    // Directory tree expansion state
+    expanded_dirs: std::collections::HashSet<PathBuf>,
+    // Color palette for unified visualization
+    color_palette: crate::color_palette::ColorPalette,
+    // Extension selection for Treemap highlighting
+    selected_extensions: std::collections::HashSet<String>,
     scan_filter_excluded_dirs: String,
     scan_filter_excluded_extensions: String,
     scan_filter_same_file_system: bool,
@@ -267,6 +276,11 @@ impl CDriveManagerApp {
             ai_sort: SortState::new(AiSortKey::Size, SortDirection::Desc),
             treemap_current_dir: None,
             visualization_mode: VisualizationMode::Treemap,
+            left_panel_ratio: 0.25,
+            right_panel_ratio: 0.15,
+            expanded_dirs: std::collections::HashSet::new(),
+            color_palette: crate::color_palette::ColorPalette::new(),
+            selected_extensions: std::collections::HashSet::new(),
             scan_filter_excluded_dirs: String::new(),
             scan_filter_excluded_extensions: String::new(),
             scan_filter_same_file_system: false,
@@ -1575,64 +1589,115 @@ impl CDriveManagerApp {
         }
     }
 
-    /// WizTree-style three-column layout:
-    /// - Left: Directory tree
+    /// WizTree-style three-column layout with resizable panels:
+    /// - Left: Directory tree (resizable)
     /// - Center: Treemap/Sunburst visualization
-    /// - Right: File type distribution
+    /// - Right: File type distribution (resizable)
     fn draw_wiztree_layout(&mut self, ui: &mut egui::Ui, stats: &ScanStats) {
         let available_height = ui.available_height();
-        let top_height = (available_height * 0.55).max(280.0).min(520.0);
+        let available_width = ui.available_width();
+        
+        // Use 55% height for visualization area, rest for tabs
+        let viz_height = (available_height * 0.55).max(280.0).min(520.0);
+        let splitter_width = 4.0;
 
-        // Top: WizTree-style three columns. Do not use SidePanel/CentralPanel here;
-        // nested panels inside horizontal layouts collapse height in egui.
-        ui.allocate_ui_with_layout(
-            egui::vec2(ui.available_width(), top_height),
-            egui::Layout::left_to_right(egui::Align::Min),
-            |ui| {
-                let total_width = ui.available_width();
-                let gap = 8.0;
-                let left_width = 240.0;
-                let right_width = 230.0;
-                let center_width = (total_width - left_width - right_width - gap * 2.0).max(260.0);
+        // Calculate panel widths from ratios with constraints
+        let left_width = (available_width * self.left_panel_ratio).clamp(180.0, 320.0);
+        let right_width = (available_width * self.right_panel_ratio).clamp(150.0, 280.0);
+        let center_width = (available_width - left_width - right_width - splitter_width * 2.0).max(260.0);
 
-                ui.allocate_ui_with_layout(
-                    egui::vec2(left_width, top_height),
-                    egui::Layout::top_down(egui::Align::Min),
-                    |ui| {
-                        egui::Frame::group(ui.style()).show(ui, |ui| {
-                            ui.set_min_height(top_height - 8.0);
-                            self.draw_directory_tree_panel(ui, stats);
-                        });
-                    },
-                );
-                ui.add_space(gap);
+        // Row layout for visualization panels
+        ui.horizontal(|ui| {
+            // Left panel: Directory tree
+            let left_response = ui.allocate_ui_with_layout(
+                egui::vec2(left_width, viz_height),
+                egui::Layout::top_down(egui::Align::Min),
+                |ui| {
+                    egui::Frame::group(ui.style()).show(ui, |ui| {
+                        ui.set_min_height(viz_height - 8.0);
+                        self.draw_directory_tree_panel(ui, stats);
+                    });
+                },
+            );
+            let left_rect = left_response.response.rect;
 
-                ui.allocate_ui_with_layout(
-                    egui::vec2(center_width, top_height),
-                    egui::Layout::top_down(egui::Align::Min),
-                    |ui| {
-                        egui::Frame::group(ui.style()).show(ui, |ui| {
-                            ui.set_min_height(top_height - 8.0);
-                            self.draw_treemap_panel(ui, stats);
-                        });
-                    },
-                );
-                ui.add_space(gap);
+            // Left splitter (horizontal resize)
+            let left_splitter_rect = egui::Rect::from_min_size(
+                egui::pos2(left_rect.max.x, left_rect.min.y),
+                egui::vec2(splitter_width, viz_height),
+            );
+            let left_splitter_id = ui.make_persistent_id("viz_left_splitter");
+            let left_splitter_response = ui.interact(left_splitter_rect, left_splitter_id, egui::Sense::drag());
+            
+            if left_splitter_response.dragged() {
+                if let Some(pos) = ui.ctx().pointer_interact_pos() {
+                    let new_ratio = (pos.x / available_width).clamp(0.15, 0.40);
+                    self.left_panel_ratio = new_ratio;
+                }
+            }
+            
+            // Draw left splitter with hover/drag highlight
+            let left_splitter_color = if left_splitter_response.dragged() {
+                egui::Color32::from_rgb(100, 150, 200)
+            } else if left_splitter_response.hovered() {
+                egui::Color32::from_rgb(80, 120, 180)
+            } else {
+                egui::Color32::from_rgb(50, 55, 65)
+            };
+            ui.painter_at(left_splitter_rect).rect_filled(left_splitter_rect, 0.0, left_splitter_color);
 
-                ui.allocate_ui_with_layout(
-                    egui::vec2(right_width, top_height),
-                    egui::Layout::top_down(egui::Align::Min),
-                    |ui| {
-                        egui::Frame::group(ui.style()).show(ui, |ui| {
-                            ui.set_min_height(top_height - 8.0);
-                            self.draw_extension_panel(ui, stats);
-                        });
-                    },
-                );
-            },
-        );
+            // Center panel: Treemap/Sunburst
+            ui.allocate_ui_with_layout(
+                egui::vec2(center_width, viz_height),
+                egui::Layout::top_down(egui::Align::Min),
+                |ui| {
+                    egui::Frame::group(ui.style()).show(ui, |ui| {
+                        ui.set_min_height(viz_height - 8.0);
+                        self.draw_treemap_panel(ui, stats);
+                    });
+                },
+            );
 
-        // Bottom: Tab bar with detailed data tables.
+            // Right splitter (horizontal resize)
+            let right_splitter_start_x = left_rect.max.x + splitter_width + center_width;
+            let right_splitter_rect = egui::Rect::from_min_size(
+                egui::pos2(right_splitter_start_x, left_rect.min.y),
+                egui::vec2(splitter_width, viz_height),
+            );
+            let right_splitter_id = ui.make_persistent_id("viz_right_splitter");
+            let right_splitter_response = ui.interact(right_splitter_rect, right_splitter_id, egui::Sense::drag());
+
+            if right_splitter_response.dragged() {
+                if let Some(pos) = ui.ctx().pointer_interact_pos() {
+                    // Right panel starts from this splitter, so ratio = (width - pos.x) / width
+                    let new_ratio = ((available_width - pos.x) / available_width).clamp(0.10, 0.30);
+                    self.right_panel_ratio = new_ratio;
+                }
+            }
+
+            let right_splitter_color = if right_splitter_response.dragged() {
+                egui::Color32::from_rgb(100, 150, 200)
+            } else if right_splitter_response.hovered() {
+                egui::Color32::from_rgb(80, 120, 180)
+            } else {
+                egui::Color32::from_rgb(50, 55, 65)
+            };
+            ui.painter_at(right_splitter_rect).rect_filled(right_splitter_rect, 0.0, right_splitter_color);
+
+            // Right panel: Extension/File type distribution
+            ui.allocate_ui_with_layout(
+                egui::vec2(right_width, viz_height),
+                egui::Layout::top_down(egui::Align::Min),
+                |ui| {
+                    egui::Frame::group(ui.style()).show(ui, |ui| {
+                        ui.set_min_height(viz_height - 8.0);
+                        self.draw_extension_panel(ui, stats);
+                    });
+                },
+            );
+        });
+
+        // Bottom: Tab bar with detailed data tables
         ui.add_space(6.0);
         ui.separator();
         self.draw_tabs(ui, stats);
@@ -1681,7 +1746,7 @@ impl CDriveManagerApp {
         }
     }
 
-    /// Recursive tree drawing
+    /// Recursive tree drawing with percentage bars and icons
     fn draw_tree_recursive(&mut self, ui: &mut egui::Ui, tree: &DirectoryTree, node_index: usize, depth: usize, stats: &ScanStats) {
         if depth > 5 {
             return; // Limit depth for performance
@@ -1694,18 +1759,42 @@ impl CDriveManagerApp {
         ui.horizontal(|ui| {
             ui.add_space(indent as f32);
             
-            let size_text = format::bytes(node.record.total_size);
-            let name = &node.record.name();
+            // Add icon based on file category (for directories, use folder icon)
+            let icon = "📁";  // Folder icon for directories
+            ui.label(egui::RichText::new(icon).size(14.0));
             
-            let text = if depth == 0 {
-                format!("{} ({})", name, size_text)
+            // Directory name
+            let name = &node.record.name();
+            let size_text = format::bytes(node.record.total_size);
+            
+            // Calculate percentage relative to parent or root
+            let percentage = if stats.total_size > 0 {
+                (node.record.total_size as f64 / stats.total_size as f64) * 100.0
             } else {
-                format!("{} ({})", name, size_text)
+                0.0
             };
             
+            // Use unified color for this directory type
+            let path_str = node.record.path.to_string_lossy();
+            let ext_hint = path_str.rsplit('.').next().unwrap_or("");
+            let color = self.color_palette.color_for_extension(ext_hint);
+            
+            // Draw percentage progress bar
+            ui.add(
+                egui::ProgressBar::new((percentage / 100.0) as f32)
+                    .desired_width(60.0)
+                    .desired_height(8.0)
+                    .fill(color),
+            );
+            
+            // Show name and size
+            let text = format!("{} ({})", name, size_text);
             if ui.small_button(text).clicked() {
                 self.treemap_current_dir = Some(node.record.path.clone());
             }
+            
+            // Show percentage label
+            ui.label(egui::RichText::new(format!("{:.1}%", percentage)).small().weak());
         });
 
         for &child_index in &node.children {
@@ -1713,8 +1802,8 @@ impl CDriveManagerApp {
         }
     }
 
-    /// Right panel: File type distribution
-    fn draw_extension_panel(&self, ui: &mut egui::Ui, stats: &ScanStats) {
+    /// Right panel: File type distribution with unified color palette
+    fn draw_extension_panel(&mut self, ui: &mut egui::Ui, stats: &ScanStats) {
         ui.heading("文件类型");
         ui.add_space(4.0);
         
@@ -1727,39 +1816,104 @@ impl CDriveManagerApp {
             return;
         }
 
-        // Show top 10 extensions
+        // Show clear filter button if extensions are selected
+        if !self.selected_extensions.is_empty() {
+            ui.horizontal(|ui| {
+                if ui.small_button("✕ 清除筛选").clicked() {
+                    self.selected_extensions.clear();
+                }
+                ui.label(format!("已选 {} 种类型", self.selected_extensions.len()));
+            });
+            ui.add_space(4.0);
+        }
+
+        // Show top extensions with unified color palette
         let total = stats.total_size as f64;
-        for ext in stats.extensions.iter().take(10) {
+        for ext in stats.extensions.iter().take(15) {
             let percentage = if total > 0.0 {
                 (ext.total_size as f64 / total) * 100.0
             } else {
                 0.0
             };
 
+            // Use unified color palette
+            let ext_name = ext.extension.trim_start_matches('.').to_string();
+            let color = self.color_palette.color_for_extension(&ext_name);
+            let category = self.color_palette.category_for_extension(&ext_name);
+            let is_selected = self.selected_extensions.contains(&ext.extension);
+
             ui.horizontal(|ui| {
-                // Color bar
-                let color = match ext.extension.trim_start_matches('.') {
-                    "dll" | "exe" => egui::Color32::RED,
-                    "msi" | "cab" => egui::Color32::GREEN,
-                    "sys" | "cat" => egui::Color32::BLUE,
-                    "log" | "tmp" => egui::Color32::YELLOW,
-                    _ => egui::Color32::GRAY,
+                // Color indicator (clickable for selection)
+                let color_label = if is_selected {
+                    format!("✓ {}", category.icon())
+                } else {
+                    category.icon().to_string()
                 };
                 
-                ui.colored_label(color, "■");
-                ui.add(
-                    egui::ProgressBar::new((percentage / 100.0) as f32)
-                        .desired_width(80.0)
-                        .desired_height(8.0),
+                let color_response = ui.add(
+                    egui::Label::new(egui::RichText::new(color_label).color(color))
+                        .selectable(false)
+                        .sense(egui::Sense::click())
                 );
                 
-                ui.label(ext.extension.as_str());
-                ui.label(format::bytes(ext.total_size));
+                // Click to select/highlight this extension type
+                if color_response.clicked() {
+                    if is_selected {
+                        self.selected_extensions.remove(&ext.extension);
+                    } else {
+                        self.selected_extensions.insert(ext.extension.clone());
+                    }
+                }
+
+                // Progress bar
+                ui.add(
+                    egui::ProgressBar::new((percentage / 100.0) as f32)
+                        .desired_width(60.0)
+                        .desired_height(8.0)
+                        .fill(color),
+                );
+                
+                // Extension name (highlighted if selected)
+                let ext_text = if is_selected {
+                    egui::RichText::new(&ext.extension).strong().color(color)
+                } else {
+                    egui::RichText::new(&ext.extension)
+                };
+                ui.label(ext_text);
+                
+                // Size and percentage
+                ui.label(format!("{} ({:.1}%)", format::bytes(ext.total_size), percentage));
             });
+
+            // Show category label on hover
+            ui.add_space(1.0);
         }
 
         ui.add_space(8.0);
         ui.label(format!("共 {} 种类型", format::count(stats.extensions.len() as u64)));
+        
+        // Show legend for categories
+        ui.add_space(4.0);
+        ui.label(egui::RichText::new("颜色图例").small().weak());
+        egui::Grid::new("category_legend")
+            .num_columns(4)
+            .spacing([8.0, 4.0])
+            .show(ui, |ui| {
+                for category in [
+                    crate::color_palette::FileCategory::Executable,
+                    crate::color_palette::FileCategory::Document,
+                    crate::color_palette::FileCategory::Media,
+                    crate::color_palette::FileCategory::Code,
+                    crate::color_palette::FileCategory::System,
+                    crate::color_palette::FileCategory::Temporary,
+                    crate::color_palette::FileCategory::Archive,
+                    crate::color_palette::FileCategory::Data,
+                ] {
+                    let color = category.default_color();
+                    ui.colored_label(color, category.icon());
+                    ui.label(egui::RichText::new(category.label()).small());
+                }
+            });
     }
 
     fn draw_summary(&self, ui: &mut egui::Ui, stats: &ScanStats) {
@@ -2465,19 +2619,22 @@ impl CDriveManagerApp {
 
         // Draw visualization (only Treemap during scanning, full options after completion)
         if is_scanning {
-            draw_treemap(ui, &treemap_items, current_size, empty_message);
+            draw_treemap(ui, &treemap_items, current_size, empty_message, &self.color_palette, None);
         } else if let Some(tree) = stats.directory_tree.as_ref() {
             let current_dir = self.treemap_current_dir(stats);
             let current_index = tree
                 .node_index_for_path(&current_dir)
                 .unwrap_or(tree.root_index);
             
+            // Create selected extensions reference after getting current_dir to avoid borrow conflict
+            let selected_ext_ref = Some(&self.selected_extensions);
+            
             let action = match self.visualization_mode {
                 VisualizationMode::Treemap => {
-                    draw_treemap(ui, &treemap_items, current_size, empty_message)
+                    draw_treemap(ui, &treemap_items, current_size, empty_message, &self.color_palette, selected_ext_ref)
                 }
                 VisualizationMode::Sunburst => {
-                    draw_sunburst(ui, tree, current_index, current_size, empty_message)
+                    draw_sunburst(ui, tree, current_index, current_size, empty_message, &self.color_palette)
                 }
             };
 

@@ -1,13 +1,13 @@
 use std::{
-    collections::hash_map::DefaultHasher,
     f32::consts::TAU,
-    hash::{Hash, Hasher},
+    hash::{Hash, Hasher, DefaultHasher},
     path::{Path, PathBuf},
 };
 
 use egui::{Align2, Color32, FontId, Pos2, Rect, Sense, Shape, Stroke, Ui, Vec2};
 
 use crate::{
+    color_palette::ColorPalette,
     format,
     model::{DirectoryNode, DirectoryTree},
     treemap::TreemapAction,
@@ -38,6 +38,7 @@ pub fn draw_sunburst(
     root_index: usize,
     total_size: u64,
     empty_message: &str,
+    color_palette: &ColorPalette,
 ) -> Option<TreemapAction> {
     let available = ui.available_size_before_wrap();
     let desired_size = Vec2::new(available.x.max(280.0), available.y.max(260.0));
@@ -70,16 +71,19 @@ pub fn draw_sunburst(
 
     let mut action = None;
     for (index, segment) in segments.iter().enumerate() {
+        // Use unified color system
         let color = match segment.kind {
-            SunburstSegmentKind::Directory => palette(path_palette_index(&segment.path)),
+            SunburstSegmentKind::Directory => {
+                let path_str = segment.path.to_string_lossy();
+                let ext_hint = path_str.rsplit('.').next().unwrap_or("");
+                color_palette.color_for_extension(ext_hint)
+            },
             SunburstSegmentKind::DirectFiles => Color32::from_rgb(96, 125, 139),
             SunburstSegmentKind::Other => Color32::from_rgb(88, 88, 96),
         };
-        painter.add(Shape::convex_polygon(
-            annular_sector_points(rect.center(), segment),
-            color,
-            Stroke::new(1.0, Color32::from_black_alpha(80)),
-        ));
+        
+        // Draw with cushion shading effect
+        draw_cushion_shaded_segment(&painter, rect.center(), segment, color);
 
         let response = ui
             .interact(
@@ -417,6 +421,44 @@ fn palette(index: usize) -> Color32 {
     ];
 
     COLORS[index % COLORS.len()]
+}
+
+/// Draw a sunburst segment with cushion shading effect
+fn draw_cushion_shaded_segment(
+    painter: &egui::Painter,
+    center: Pos2,
+    segment: &SunburstSegment,
+    base_color: Color32,
+) {
+    // Draw multiple layers for gradient effect
+    let layer_count = 2;
+    for layer in (0..layer_count).rev() {
+        let shade_factor = (layer as f32 / layer_count as f32) * 0.3;
+        let layer_color = ColorPalette::darken(base_color, shade_factor);
+        let shrink_radius = layer as f32 * 3.0;
+        
+        let adjusted_segment = SunburstSegment {
+            inner_radius: segment.inner_radius + shrink_radius,
+            outer_radius: segment.outer_radius - shrink_radius,
+            ..segment.clone()
+        };
+        
+        let points = annular_sector_points(center, &adjusted_segment);
+        painter.add(Shape::convex_polygon(
+            points,
+            layer_color,
+            Stroke::NONE,
+        ));
+    }
+    
+    // Draw border
+    let border_color = ColorPalette::darken(base_color, 0.4);
+    let points = annular_sector_points(center, segment);
+    painter.add(Shape::convex_polygon(
+        points,
+        base_color,
+        Stroke::new(1.0, border_color),
+    ));
 }
 
 #[cfg(test)]

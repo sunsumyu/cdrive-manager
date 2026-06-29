@@ -6,7 +6,7 @@ use std::{
 
 use egui::{Align2, Color32, FontId, Pos2, Rect, Sense, Stroke, Ui, Vec2};
 
-use crate::format;
+use crate::{format};
 
 #[derive(Debug, Clone)]
 pub struct TreemapItem {
@@ -111,6 +111,8 @@ pub fn draw_treemap(
     items: &[TreemapItem],
     total_size: u64,
     empty_message: &str,
+    color_palette: &crate::color_palette::ColorPalette,
+    selected_extensions: Option<&std::collections::HashSet<String>>,
 ) -> Option<TreemapAction> {
     let available = ui.available_size_before_wrap();
     let desired_size = Vec2::new(available.x.max(280.0), available.y.max(260.0));
@@ -150,18 +152,43 @@ pub fn draw_treemap(
             continue;
         }
 
-        let color = match &item.kind {
-            TreemapItemKind::Directory { path } => palette(path_palette_index(path)),
+        // Use unified color system based on path/directory type
+        let base_color = match &item.kind {
+            TreemapItemKind::Directory { path } => {
+                // For directories, use path hash to pick a category color
+                let path_str = path.to_string_lossy();
+                let ext_hint = path_str.rsplit('.').next().unwrap_or("");
+                color_palette.color_for_extension(ext_hint)
+            },
             TreemapItemKind::DirectFiles { .. } => Color32::from_rgb(96, 125, 139),
             TreemapItemKind::Other { .. } => Color32::from_rgb(88, 88, 96),
         };
-        painter.rect_filled(item_rect, 4.0, color);
-        painter.rect_stroke(
-            item_rect,
-            4.0,
-            Stroke::new(1.0, Color32::from_black_alpha(80)),
-            egui::StrokeKind::Inside,
-        );
+
+        // Check if this item should be highlighted based on selected extensions
+        let is_highlighted = if let Some(selected_exts) = selected_extensions {
+            if selected_exts.is_empty() {
+                false
+            } else {
+                // For directories, check if any selected extension might be inside
+                // Simplified: directories are always shown, only filter specific file blocks
+                matches!(&item.kind, TreemapItemKind::Directory { .. })
+            }
+        } else {
+            false
+        };
+
+        // Draw with cushion shading effect
+        draw_cushion_shaded_rect(&painter, item_rect, base_color, 4.0, is_highlighted);
+
+        // Add highlight border for selected items
+        if is_highlighted {
+            painter.rect_stroke(
+                item_rect,
+                4.0,
+                Stroke::new(2.0, Color32::from_rgb(255, 215, 0)),  // Gold highlight
+                egui::StrokeKind::Outside,
+            );
+        }
 
         let response = ui
             .interact(
@@ -299,8 +326,40 @@ fn palette(index: usize) -> Color32 {
         Color32::from_rgb(92, 107, 192),
         Color32::from_rgb(236, 64, 122),
         Color32::from_rgb(141, 110, 99),
-        Color32::from_rgb(120, 144, 156),
+        Color32::from_rgb(103, 58, 183),
     ];
-
     COLORS[index % COLORS.len()]
+}
+
+/// Draw a rectangle with cushion shading effect (WinDirStat-style gradient)
+fn draw_cushion_shaded_rect(
+    painter: &egui::Painter,
+    rect: Rect,
+    base_color: Color32,
+    corner_radius: f32,
+    is_highlighted: bool,
+) {
+    // Draw gradient layers from center to edge
+    let layer_count = 3;
+    for layer in (0..layer_count).rev() {
+        let shade_factor = (layer as f32 / layer_count as f32) * 0.35;
+        let layer_color = if is_highlighted {
+            crate::color_palette::ColorPalette::lighten(base_color, shade_factor * 0.5)
+        } else {
+            crate::color_palette::ColorPalette::darken(base_color, shade_factor)
+        };
+        let shrink_amount = layer as f32 * 1.5;
+        let layer_rect = rect.shrink(shrink_amount);
+        
+        painter.rect_filled(layer_rect, corner_radius.max(0.0), layer_color);
+    }
+
+    // Draw border stroke
+    let border_color = crate::color_palette::ColorPalette::darken(base_color, 0.45);
+    painter.rect_stroke(
+        rect,
+        corner_radius,
+        Stroke::new(1.0, border_color),
+        egui::StrokeKind::Inside,
+    );
 }

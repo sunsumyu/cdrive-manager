@@ -1,5 +1,6 @@
 mod ai_analysis;
 mod app;
+mod color_palette;
 mod cleanup;
 mod duplicates;
 mod format;
@@ -8,6 +9,7 @@ mod mft;
 mod model;
 mod scan_cache;
 mod scanner;
+mod split_panel;
 mod sunburst;
 mod treemap;
 
