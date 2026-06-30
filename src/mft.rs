@@ -13,20 +13,26 @@
 #[cfg(windows)]
 pub mod windows_mft {
     use std::collections::HashMap;
+    use std::fmt;
     use std::path::PathBuf;
     use std::ptr;
-    use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
     use std::time::{Duration, Instant, SystemTime};
 
     use anyhow::{Context, Result};
     use crossbeam_channel::Sender;
     use winapi::ctypes::c_void;
+    use winapi::shared::minwindef::{BOOL, FALSE};
+    use winapi::shared::ntdef::{HANDLE, NULL};
     use winapi::um::errhandlingapi::GetLastError;
     use winapi::um::fileapi::*;
     use winapi::um::handleapi::*;
     use winapi::um::ioapiset::DeviceIoControl;
+    use winapi::um::securitybaseapi::{AllocateAndInitializeSid, CheckTokenMembership, FreeSid};
     use winapi::um::winnt::*;
-    use winapi::shared::ntdef::HANDLE;
 
     use crate::model::{FileRecord, ScanStats, file_extension_label};
     use crate::scanner::{ScanEvent, ScanProgress};
@@ -39,10 +45,18 @@ pub mod windows_mft {
         (device_type << 16) | (access << 14) | (function << 2) | method
     }
 
-    const FSCTL_GET_NTFS_VOLUME_DATA: u32 =
-        ctl_code(FILE_DEVICE_FILE_SYSTEM, 25, METHOD_BUFFERED, FILE_ANY_ACCESS_CTL);
-    const FSCTL_GET_NTFS_FILE_RECORD: u32 =
-        ctl_code(FILE_DEVICE_FILE_SYSTEM, 26, METHOD_BUFFERED, FILE_ANY_ACCESS_CTL);
+    const FSCTL_GET_NTFS_VOLUME_DATA: u32 = ctl_code(
+        FILE_DEVICE_FILE_SYSTEM,
+        25,
+        METHOD_BUFFERED,
+        FILE_ANY_ACCESS_CTL,
+    );
+    const FSCTL_GET_NTFS_FILE_RECORD: u32 = ctl_code(
+        FILE_DEVICE_FILE_SYSTEM,
+        26,
+        METHOD_BUFFERED,
+        FILE_ANY_ACCESS_CTL,
+    );
 
     const MFT_RECORD_SIGNATURE: u32 = 0x454C_4946; // "FILE"
     const FILETIME_UNIX_DIFFERENCE: u64 = 11_644_473_600;
@@ -65,7 +79,9 @@ pub mod windows_mft {
             return None;
         }
 
-        Some(SystemTime::UNIX_EPOCH + Duration::new(seconds - FILETIME_UNIX_DIFFERENCE, nanoseconds))
+        Some(
+            SystemTime::UNIX_EPOCH + Duration::new(seconds - FILETIME_UNIX_DIFFERENCE, nanoseconds),
+        )
     }
 
     #[repr(C)]
@@ -104,6 +120,96 @@ pub mod windows_mft {
         pub elapsed: Duration,
     }
 
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum MftPrivilegeStatus {
+        Elevated,
+        NotElevated,
+    }
+
+    impl fmt::Display for MftPrivilegeStatus {
+        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            match self {
+                Self::Elevated => formatter.write_str("管理员权限"),
+                Self::NotElevated => formatter.write_str("非管理员权限"),
+            }
+        }
+    }
+
+    pub fn current_privilege_status() -> MftPrivilegeStatus {
+        unsafe {
+            let mut admin_group: PSID = ptr::null_mut();
+            let mut nt_authority = SID_IDENTIFIER_AUTHORITY {
+                Value: SECURITY_NT_AUTHORITY,
+            };
+
+            let allocated = AllocateAndInitializeSid(
+                &mut nt_authority,
+                2,
+                SECURITY_BUILTIN_DOMAIN_RID,
+                DOMAIN_ALIAS_RID_ADMINS,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                &mut admin_group,
+            );
+
+            if allocated == FALSE {
+                return MftPrivilegeStatus::NotElevated;
+            }
+
+            let mut is_member: BOOL = FALSE;
+            let checked = CheckTokenMembership(NULL as HANDLE, admin_group, &mut is_member);
+            FreeSid(admin_group);
+
+            if checked != FALSE && is_member != FALSE {
+                MftPrivilegeStatus::Elevated
+            } else {
+                MftPrivilegeStatus::NotElevated
+            }
+        }
+    }
+
+    fn windows_error_hint(error: u32) -> &'static str {
+        match error {
+            5 => "访问被拒绝：请以管理员身份运行程序，再重试 MFT 高速扫描。",
+            2 | 3 => "找不到指定卷：请确认扫描路径是存在的驱动器根目录，例如 C:\\。",
+            21 => "设备未就绪：请确认目标驱动器已挂载且可访问。",
+            32 => "卷正被其他进程独占使用：请关闭磁盘工具或安全软件后重试。",
+            87 => "参数不正确：请确认目标是 NTFS 驱动器根目录。",
+            50 => "系统不支持该请求：目标可能不是 NTFS 卷。",
+            _ => "可先尝试以管理员身份运行；如果仍失败，请确认目标是本机 NTFS 驱动器根目录。",
+        }
+    }
+
+    fn is_drive_root_path(root: &PathBuf, drive_letter: char) -> bool {
+        let expected_drive = drive_letter.to_ascii_uppercase();
+        let Some(root_str) = root.to_str() else {
+            return false;
+        };
+        let normalized = root_str.trim().replace('/', "\\");
+        let normalized = normalized.trim_end_matches('\\');
+        let mut chars = normalized.chars();
+        matches!(
+            (chars.next(), chars.next(), chars.next()),
+            (Some(drive), Some(':'), None) if drive.to_ascii_uppercase() == expected_drive
+        )
+    }
+
+    fn validate_mft_target(root: &PathBuf, drive_letter: char) -> Result<()> {
+        if !is_drive_root_path(root, drive_letter) {
+            anyhow::bail!(
+                "MFT 扫描只支持驱动器根目录（例如 {}:\\），当前路径为 {}。请切换到驱动器根目录，或使用普通多线程扫描。",
+                drive_letter.to_ascii_uppercase(),
+                root.display()
+            );
+        }
+
+        Ok(())
+    }
+
     struct MftRecordInfo {
         record_number: u64,
         is_directory: bool,
@@ -124,7 +230,10 @@ pub mod windows_mft {
 
     fn open_ntfs_volume(drive_letter: char) -> Result<HANDLE> {
         let device_path = format!("\\\\.\\{}:", drive_letter.to_ascii_uppercase());
-        let wide_path: Vec<u16> = device_path.encode_utf16().chain(std::iter::once(0)).collect();
+        let wide_path: Vec<u16> = device_path
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
 
         unsafe {
             let handle = CreateFileW(
@@ -139,10 +248,13 @@ pub mod windows_mft {
 
             if handle == INVALID_HANDLE_VALUE {
                 let error = GetLastError();
+                let privilege = current_privilege_status();
                 anyhow::bail!(
-                    "无法打开卷 {}（错误码 {}）。MFT 扫描通常需要管理员权限。",
+                    "无法打开卷 {}（Windows 错误码 {}，{}）。{}",
                     device_path,
-                    error
+                    error,
+                    privilege,
+                    windows_error_hint(error)
                 );
             }
 
@@ -167,7 +279,10 @@ pub mod windows_mft {
 
             if success == 0 {
                 let error = GetLastError();
-                anyhow::bail!("无法读取 NTFS 卷信息（错误码 {}）。目标可能不是 NTFS 卷。", error);
+                anyhow::bail!(
+                    "无法读取 NTFS 卷信息（错误码 {}）。目标可能不是 NTFS 卷。",
+                    error
+                );
             }
 
             if data.bytes_per_file_record_segment == 0 || data.bytes_per_sector == 0 {
@@ -203,14 +318,19 @@ pub mod windows_mft {
 
             if success == 0 {
                 let error = GetLastError();
-                anyhow::bail!("无法读取文件记录 {}（错误码 {}）", file_reference_number, error);
+                anyhow::bail!(
+                    "无法读取文件记录 {}（错误码 {}）",
+                    file_reference_number,
+                    error
+                );
             }
 
             if bytes_returned as usize <= header_size || output.len() < header_size {
                 anyhow::bail!("文件记录 {} 返回数据过短", file_reference_number);
             }
 
-            let returned_reference = read_i64(&output, 0).unwrap_or(file_reference_number as i64) as u64;
+            let returned_reference =
+                read_i64(&output, 0).unwrap_or(file_reference_number as i64) as u64;
             let file_record_length = read_u32(&output, 8).unwrap_or(0) as usize;
             if file_record_length == 0 {
                 anyhow::bail!("文件记录 {} 长度为 0", file_reference_number);
@@ -222,7 +342,10 @@ pub mod windows_mft {
                 anyhow::bail!("文件记录 {} 内容过短", file_reference_number);
             }
 
-            Ok((returned_reference & FILE_REFERENCE_MASK, output[header_size..header_size + actual_len].to_vec()))
+            Ok((
+                returned_reference & FILE_REFERENCE_MASK,
+                output[header_size..header_size + actual_len].to_vec(),
+            ))
         }
     }
 
@@ -303,7 +426,8 @@ pub mod windows_mft {
         if non_resident {
             return;
         }
-        let Some((value_offset, value_length)) = resident_value_range(data, attribute_offset) else {
+        let Some((value_offset, value_length)) = resident_value_range(data, attribute_offset)
+        else {
             return;
         };
         if value_length < 36 || value_offset + 36 > data.len() {
@@ -327,14 +451,16 @@ pub mod windows_mft {
         if non_resident {
             return;
         }
-        let Some((value_offset, value_length)) = resident_value_range(data, attribute_offset) else {
+        let Some((value_offset, value_length)) = resident_value_range(data, attribute_offset)
+        else {
             return;
         };
         if value_length < 66 || value_offset + 66 > data.len() {
             return;
         }
 
-        let parent_reference = read_u64(data, value_offset).unwrap_or(ROOT_FILE_REFERENCE) & FILE_REFERENCE_MASK;
+        let parent_reference =
+            read_u64(data, value_offset).unwrap_or(ROOT_FILE_REFERENCE) & FILE_REFERENCE_MASK;
         let filename_modified = read_u64(data, value_offset + 16);
         let real_size = read_u64(data, value_offset + 48).unwrap_or(0);
         let flags = read_u32(data, value_offset + 56).unwrap_or(0);
@@ -391,7 +517,9 @@ pub mod windows_mft {
             if let Some(data_size) = read_u64(data, attribute_offset + 48) {
                 info.file_size = data_size;
             }
-        } else if let Some((_value_offset, value_length)) = resident_value_range(data, attribute_offset) {
+        } else if let Some((_value_offset, value_length)) =
+            resident_value_range(data, attribute_offset)
+        {
             info.file_size = value_length as u64;
         }
     }
@@ -467,24 +595,33 @@ pub mod windows_mft {
     }
 
     fn read_u16(data: &[u8], offset: usize) -> Option<u16> {
-        Some(u16::from_le_bytes(data.get(offset..offset + 2)?.try_into().ok()?))
+        Some(u16::from_le_bytes(
+            data.get(offset..offset + 2)?.try_into().ok()?,
+        ))
     }
 
     fn read_u32(data: &[u8], offset: usize) -> Option<u32> {
-        Some(u32::from_le_bytes(data.get(offset..offset + 4)?.try_into().ok()?))
+        Some(u32::from_le_bytes(
+            data.get(offset..offset + 4)?.try_into().ok()?,
+        ))
     }
 
     fn read_u64(data: &[u8], offset: usize) -> Option<u64> {
-        Some(u64::from_le_bytes(data.get(offset..offset + 8)?.try_into().ok()?))
+        Some(u64::from_le_bytes(
+            data.get(offset..offset + 8)?.try_into().ok()?,
+        ))
     }
 
     fn read_i64(data: &[u8], offset: usize) -> Option<i64> {
-        Some(i64::from_le_bytes(data.get(offset..offset + 8)?.try_into().ok()?))
+        Some(i64::from_le_bytes(
+            data.get(offset..offset + 8)?.try_into().ok()?,
+        ))
     }
 
     pub fn scan_mft(config: MftScanConfig, sender: Sender<ScanEvent>) -> Result<MftScanResult> {
         let scan_start = Instant::now();
-        let handle = open_ntfs_volume(config.drive_letter).context("打开 NTFS 卷失败")?;
+        validate_mft_target(&config.root, config.drive_letter)?;
+        let handle = open_ntfs_volume(config.drive_letter)?;
 
         let scan_result = (|| {
             let volume_data = get_ntfs_volume_data(handle).context("读取 NTFS 卷信息失败")?;
@@ -525,14 +662,15 @@ pub mod windows_mft {
                     last_progress_at = Instant::now();
                     let mut stats = ScanStats::default();
                     stats.root = config.root.clone();
-                    stats.file_count = nodes.values().filter(|node| !node.is_directory).count() as u64;
-                    stats.dir_count = nodes.values().filter(|node| node.is_directory).count() as u64;
+                    stats.file_count =
+                        nodes.values().filter(|node| !node.is_directory).count() as u64;
+                    stats.dir_count =
+                        nodes.values().filter(|node| node.is_directory).count() as u64;
                     let _ = sender.send(ScanEvent::Progress(ScanProgress {
                         stats: Arc::new(stats),
                         current_path: Some(PathBuf::from(format!(
                             "MFT 记录 {}/{}",
-                            record_index,
-                            estimated_records
+                            record_index, estimated_records
                         ))),
                         finished: false,
                         cancelled: false,

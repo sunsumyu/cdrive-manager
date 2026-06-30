@@ -23,4 +23,4 @@ walkdir = "2"
 
 # Windows-specific dependencies for NTFS MFT scanning
 [target.'cfg(windows)'.dependencies]
-winapi = { version = "0.3", features = ["fileapi", "handleapi", "ioapiset", "winbase", "winnt", "winioctl", "errhandlingapi", "winerror", "minwinbase"] }
+winapi = { version = "0.3", features = ["fileapi", "handleapi", "ioapiset", "winbase", "winnt", "winioctl", "errhandlingapi", "winerror", "minwinbase", "securitybaseapi"] }

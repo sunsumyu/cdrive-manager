@@ -53,17 +53,17 @@ impl ScanOptions {
             drive_letter: None,
         }
     }
-    
+
     pub fn with_mode(mut self, mode: ScanMode) -> Self {
         self.mode = mode;
         self
     }
-    
+
     pub fn with_threads(mut self, num_threads: usize) -> Self {
         self.num_threads = Some(num_threads);
         self
     }
-    
+
     pub fn with_drive_letter(mut self, drive_letter: char) -> Self {
         self.drive_letter = Some(drive_letter);
         self
@@ -254,7 +254,10 @@ fn spawn_parallel_scan(options: ScanOptions) -> ScanHandle {
             options.filter_config.clone(),
         ));
         let accumulator = Arc::new(std::sync::Mutex::new(
-            ScanAccumulator::new_with_filter_config(options.root.clone(), options.filter_config.clone()),
+            ScanAccumulator::new_with_filter_config(
+                options.root.clone(),
+                options.filter_config.clone(),
+            ),
         ));
         let discovered_dirs = Arc::new(AtomicU64::new(0));
         let processed_files = Arc::new(AtomicU64::new(0));
@@ -560,24 +563,24 @@ fn spawn_mft_scan(options: ScanOptions) -> ScanHandle {
     let (sender, receiver) = unbounded();
     let cancel_flag = Arc::new(AtomicBool::new(false));
     let worker_cancel_flag = Arc::clone(&cancel_flag);
-    
+
     thread::spawn(move || {
         use crate::mft::windows_mft::{MftScanConfig, scan_mft};
-        
+
         let scan_start = Instant::now();
-        
+
         // Extract drive letter from root path
         let drive_letter = options
             .drive_letter
             .or_else(|| options.root.to_str().and_then(|s| s.chars().next()))
             .unwrap_or('C');
-        
+
         let config = MftScanConfig {
             root: options.root.clone(),
             drive_letter,
             cancel_flag: Arc::clone(&worker_cancel_flag),
         };
-        
+
         // Try MFT scan first
         match scan_mft(config, sender.clone()) {
             Ok(result) => {
@@ -585,19 +588,19 @@ fn spawn_mft_scan(options: ScanOptions) -> ScanHandle {
                     options.root.clone(),
                     options.filter_config.clone(),
                 );
-                
+
                 for directory in result.directories {
                     accumulator.record_directory(directory);
                 }
                 for file in result.files {
                     accumulator.record_file(file);
                 }
-                
+
                 let elapsed = result.elapsed;
                 let final_stats = Arc::new(accumulator.final_snapshot());
                 let total_dirs = accumulator.get_dir_count();
                 let total_files = accumulator.get_file_count();
-                
+
                 let _ = sender.send(ScanEvent::Progress(ScanProgress {
                     stats: Arc::new(accumulator.progress_snapshot()),
                     current_path: None,
@@ -608,7 +611,7 @@ fn spawn_mft_scan(options: ScanOptions) -> ScanHandle {
                     scan_mode: ScanMode::MftScan,
                     active_threads: Some(1),
                 }));
-                
+
                 let _ = sender.send(ScanEvent::Finished(ScanFinished {
                     stats: final_stats,
                     cancelled: false,
@@ -619,14 +622,20 @@ fn spawn_mft_scan(options: ScanOptions) -> ScanHandle {
                 }));
             }
             Err(e) => {
+                let error_text = format!("{:#}", e);
+
                 // MFT scan failed, fallback to parallel scan
-                eprintln!("MFT scan failed ({}), falling back to parallel scan...", e);
-                
+                eprintln!(
+                    "MFT scan failed ({}), falling back to parallel scan...",
+                    error_text
+                );
+
                 // Notify UI about fallback
                 let _ = sender.send(ScanEvent::Progress(ScanProgress {
                     stats: Arc::new(ScanStats::default()),
                     current_path: Some(std::path::PathBuf::from(format!(
-                        "MFT 扫描失败: {}，回退到多线程扫描...", e
+                        "MFT 扫描失败: {}，已自动回退到多线程扫描...",
+                        error_text
                     ))),
                     finished: false,
                     cancelled: false,
@@ -635,13 +644,13 @@ fn spawn_mft_scan(options: ScanOptions) -> ScanHandle {
                     scan_mode: ScanMode::MftScan,
                     active_threads: Some(1),
                 }));
-                
+
                 // Run parallel scan as fallback
                 run_parallel_scan_fallback(options, sender, worker_cancel_flag, scan_start);
             }
         }
     });
-    
+
     ScanHandle {
         receiver,
         cancel_flag,
@@ -657,17 +666,17 @@ fn run_parallel_scan_fallback(
     scan_start: Instant,
 ) {
     use rayon::prelude::*;
-    
+
     let _num_threads = rayon::current_num_threads();
     let matcher = ScanFilterMatcher::new(options.root.clone(), options.filter_config.clone());
-    
+
     // Phase 1: Collect directories
     let mut all_dirs: Vec<PathBuf> = Vec::new();
     let walker = WalkDir::new(&options.root)
         .follow_links(false)
         .same_file_system(options.filter_config.same_file_system)
         .into_iter();
-    
+
     for entry in walker.filter_entry(|e| matcher.should_descend(e)) {
         if cancel_flag.load(Ordering::Relaxed) {
             break;
@@ -678,7 +687,7 @@ fn run_parallel_scan_fallback(
             }
         }
     }
-    
+
     if cancel_flag.load(Ordering::Relaxed) {
         let _ = sender.send(ScanEvent::Finished(ScanFinished {
             stats: Arc::new(ScanStats::default()),
@@ -690,22 +699,25 @@ fn run_parallel_scan_fallback(
         }));
         return;
     }
-    
+
     // Phase 2: Parallel processing
     let accumulator = Arc::new(std::sync::Mutex::new(
-        ScanAccumulator::new_with_filter_config(options.root.clone(), options.filter_config.clone())
+        ScanAccumulator::new_with_filter_config(
+            options.root.clone(),
+            options.filter_config.clone(),
+        ),
     ));
-    
+
     all_dirs.par_iter().for_each(|dir_path| {
         if cancel_flag.load(Ordering::Relaxed) {
             return;
         }
-        
+
         {
             let mut acc = accumulator.lock().unwrap();
             acc.record_directory(dir_path.clone());
         }
-        
+
         if let Ok(read_dir) = std::fs::read_dir(dir_path) {
             for entry in read_dir.flatten() {
                 let path = entry.path();
@@ -723,13 +735,13 @@ fn run_parallel_scan_fallback(
             }
         }
     });
-    
+
     // Send final result
     let mut acc = accumulator.lock().unwrap();
     let final_stats = Arc::new(acc.final_snapshot());
     let total_dirs = acc.get_dir_count();
     let total_files = acc.get_file_count();
-    
+
     let _ = sender.send(ScanEvent::Finished(ScanFinished {
         stats: final_stats,
         cancelled: false,
@@ -745,11 +757,11 @@ fn run_parallel_scan_fallback(
 fn spawn_mft_scan(options: ScanOptions) -> ScanHandle {
     let (sender, receiver) = unbounded();
     let cancel_flag = Arc::new(AtomicBool::new(false));
-    
+
     thread::spawn(move || {
         let scan_start = Instant::now();
         eprintln!("MFT scanning is only supported on Windows");
-        
+
         let _ = sender.send(ScanEvent::Finished(ScanFinished {
             stats: Arc::new(ScanStats::default()),
             cancelled: true,
@@ -759,7 +771,7 @@ fn spawn_mft_scan(options: ScanOptions) -> ScanHandle {
             elapsed_time: scan_start.elapsed(),
         }));
     });
-    
+
     ScanHandle {
         receiver,
         cancel_flag,
