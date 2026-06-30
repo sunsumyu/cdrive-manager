@@ -1700,24 +1700,47 @@ impl CDriveManagerApp {
         // Use 55% height for visualization area, rest for tabs
         let viz_height = (available_height * 0.55).max(280.0).min(520.0);
         let splitter_width = 6.0;
+        let splitter_total = splitter_width * 2.0;
 
-        // Clamp ratios to keep all three panels usable.
+        // Clamp ratios to reasonable bounds
         let left_ratio = self.left_panel_ratio.clamp(0.12, 0.35);
         let right_ratio = self.right_panel_ratio.clamp(0.10, 0.25);
         self.left_panel_ratio = left_ratio;
         self.right_panel_ratio = right_ratio;
 
-        let raw_left = available_width * left_ratio;
-        let raw_right = available_width * right_ratio;
-        // Guarantee the center stays at least 40% even if the user drags both
-        // splitters aggressively.
-        let min_center = available_width * 0.40;
-        let total_side = (raw_left + raw_right + splitter_width * 2.0).max(0.0);
-        let center_width = (available_width - total_side).max(min_center);
-        // Recompute side widths so left + center + right + splitters == available
-        let side_budget = (available_width - center_width - splitter_width * 2.0).max(0.0);
-        let left_width = raw_left.min(side_budget - raw_right.max(0.0)).max(150.0);
-        let right_width = (side_budget - left_width).max(120.0);
+        // Calculate ideal widths based on ratios
+        let ideal_left = available_width * left_ratio;
+        let ideal_right = available_width * right_ratio;
+
+        // Absolute minimum widths to prevent panels from disappearing
+        // Right panel needs more space due to extension list with progress bars
+        let min_left = 100.0;
+        let min_center = 160.0;
+        let min_right = 150.0;
+
+        // Total minimum width required
+        let total_min = min_left + min_center + min_right + splitter_total;
+
+        let (left_width, center_width, right_width) = if available_width >= total_min {
+            // Enough space: use ideal widths but ensure minimums
+            let left = ideal_left.max(min_left);
+            let right = ideal_right.max(min_right);
+            let center = (available_width - left - right - splitter_total).max(min_center);
+            // Recalculate to fit exactly
+            let remaining = available_width - center - splitter_total;
+            let left_final = left.min(remaining - min_right).max(min_left);
+            let right_final = (remaining - left_final).max(min_right);
+            (left_final, center, right_final)
+        } else {
+            // Very narrow window: shrink proportionally but ensure right panel readable
+            // Prioritize right panel being at least 130px for basic readability
+            let right = min_right.max(130.0).min(available_width * 0.25);
+            let left = (min_left * (available_width - right - splitter_total - min_center)
+                / (min_left + min_center))
+                .max(80.0);
+            let center = (available_width - left - right - splitter_total).max(min_center);
+            (left, center, right)
+        };
 
         let left_rect = egui::Rect::from_min_size(start, egui::vec2(left_width, viz_height));
         let left_splitter_rect = egui::Rect::from_min_size(
@@ -1992,13 +2015,18 @@ impl CDriveManagerApp {
         // Show clear filter button if extensions are selected
         if !self.selected_extensions.is_empty() {
             ui.horizontal(|ui| {
-                if ui.small_button("✕ 清除筛选").clicked() {
+                if ui.small_button("✕ 清除").clicked() {
                     self.selected_extensions.clear();
                 }
-                ui.label(format!("已选 {} 种类型", self.selected_extensions.len()));
+                ui.label(format!("已选 {}", self.selected_extensions.len()));
             });
             ui.add_space(4.0);
         }
+
+        // Adapt layout to available width
+        let panel_width = ui.available_width();
+        let use_compact = panel_width < 180.0;
+        let bar_width = if use_compact { 40.0 } else { 60.0 };
 
         // Show top extensions with unified color palette
         let total = stats.total_size as f64;
@@ -2018,7 +2046,7 @@ impl CDriveManagerApp {
             ui.horizontal(|ui| {
                 // Color indicator (clickable for selection)
                 let color_label = if is_selected {
-                    format!("✓ {}", category.icon())
+                    format!("✓{}", category.icon())
                 } else {
                     category.icon().to_string()
                 };
@@ -2041,7 +2069,7 @@ impl CDriveManagerApp {
                 // Progress bar
                 ui.add(
                     egui::ProgressBar::new((percentage / 100.0) as f32)
-                        .desired_width(60.0)
+                        .desired_width(bar_width)
                         .desired_height(8.0)
                         .fill(color),
                 );
@@ -2054,46 +2082,51 @@ impl CDriveManagerApp {
                 };
                 ui.label(ext_text);
 
-                // Size and percentage
-                ui.label(format!(
-                    "{} ({:.1}%)",
-                    format::bytes(ext.total_size),
-                    percentage
-                ));
+                // Size and percentage - hide percentage in compact mode
+                if use_compact {
+                    ui.label(format::bytes(ext.total_size));
+                } else {
+                    ui.label(format!(
+                        "{} ({:.1}%)",
+                        format::bytes(ext.total_size),
+                        percentage
+                    ));
+                }
             });
 
-            // Show category label on hover
             ui.add_space(1.0);
         }
 
-        ui.add_space(8.0);
+        ui.add_space(6.0);
         ui.label(format!(
-            "共 {} 种类型",
+            "共 {} 种",
             format::count(stats.extensions.len() as u64)
         ));
 
-        // Show legend for categories
-        ui.add_space(4.0);
-        ui.label(egui::RichText::new("颜色图例").small().weak());
-        egui::Grid::new("category_legend")
-            .num_columns(4)
-            .spacing([8.0, 4.0])
-            .show(ui, |ui| {
-                for category in [
-                    crate::color_palette::FileCategory::Executable,
-                    crate::color_palette::FileCategory::Document,
-                    crate::color_palette::FileCategory::Media,
-                    crate::color_palette::FileCategory::Code,
-                    crate::color_palette::FileCategory::System,
-                    crate::color_palette::FileCategory::Temporary,
-                    crate::color_palette::FileCategory::Archive,
-                    crate::color_palette::FileCategory::Data,
-                ] {
-                    let color = category.default_color();
-                    ui.colored_label(color, category.icon());
-                    ui.label(egui::RichText::new(category.label()).small());
-                }
-            });
+        // Show legend only if enough width
+        if !use_compact {
+            ui.add_space(4.0);
+            ui.label(egui::RichText::new("颜色图例").small().weak());
+            egui::Grid::new("category_legend")
+                .num_columns(4)
+                .spacing([8.0, 4.0])
+                .show(ui, |ui| {
+                    for category in [
+                        crate::color_palette::FileCategory::Executable,
+                        crate::color_palette::FileCategory::Document,
+                        crate::color_palette::FileCategory::Media,
+                        crate::color_palette::FileCategory::Code,
+                        crate::color_palette::FileCategory::System,
+                        crate::color_palette::FileCategory::Temporary,
+                        crate::color_palette::FileCategory::Archive,
+                        crate::color_palette::FileCategory::Data,
+                    ] {
+                        let color = category.default_color();
+                        ui.colored_label(color, category.icon());
+                        ui.label(egui::RichText::new(category.label()).small());
+                    }
+                });
+        }
     }
 
     fn draw_summary(&self, ui: &mut egui::Ui, stats: &ScanStats) {
