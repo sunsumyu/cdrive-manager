@@ -51,15 +51,15 @@ pub fn count(value: u64) -> String {
 /// Format duration in human-readable format (e.g., "2m 35s", "1h 15m", "45s")
 pub fn duration(d: std::time::Duration) -> String {
     let total_secs = d.as_secs();
-    
+
     if total_secs < 60 {
         return format!("{}s", total_secs);
     }
-    
+
     let hours = total_secs / 3600;
     let minutes = (total_secs % 3600) / 60;
     let secs = total_secs % 60;
-    
+
     if hours > 0 {
         format!("{}h {}m", hours, minutes)
     } else {

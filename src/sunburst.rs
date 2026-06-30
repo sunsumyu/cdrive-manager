@@ -1,6 +1,6 @@
 use std::{
     f32::consts::TAU,
-    hash::{Hash, Hasher, DefaultHasher},
+    hash::{DefaultHasher, Hash, Hasher},
     path::{Path, PathBuf},
 };
 
@@ -77,11 +77,11 @@ pub fn draw_sunburst(
                 let path_str = segment.path.to_string_lossy();
                 let ext_hint = path_str.rsplit('.').next().unwrap_or("");
                 color_palette.color_for_extension(ext_hint)
-            },
+            }
             SunburstSegmentKind::DirectFiles => Color32::from_rgb(96, 125, 139),
             SunburstSegmentKind::Other => Color32::from_rgb(88, 88, 96),
         };
-        
+
         // Draw with cushion shading effect
         draw_cushion_shaded_segment(&painter, rect.center(), segment, color);
 
@@ -436,21 +436,17 @@ fn draw_cushion_shaded_segment(
         let shade_factor = (layer as f32 / layer_count as f32) * 0.3;
         let layer_color = ColorPalette::darken(base_color, shade_factor);
         let shrink_radius = layer as f32 * 3.0;
-        
+
         let adjusted_segment = SunburstSegment {
             inner_radius: segment.inner_radius + shrink_radius,
             outer_radius: segment.outer_radius - shrink_radius,
             ..segment.clone()
         };
-        
+
         let points = annular_sector_points(center, &adjusted_segment);
-        painter.add(Shape::convex_polygon(
-            points,
-            layer_color,
-            Stroke::NONE,
-        ));
+        painter.add(Shape::convex_polygon(points, layer_color, Stroke::NONE));
     }
-    
+
     // Draw border
     let border_color = ColorPalette::darken(base_color, 0.4);
     let points = annular_sector_points(center, segment);

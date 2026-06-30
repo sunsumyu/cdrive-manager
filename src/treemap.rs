@@ -6,7 +6,7 @@ use std::{
 
 use egui::{Align2, Color32, FontId, Pos2, Rect, Sense, Stroke, Ui, Vec2};
 
-use crate::{format};
+use crate::format;
 
 #[derive(Debug, Clone)]
 pub struct TreemapItem {
@@ -159,7 +159,7 @@ pub fn draw_treemap(
                 let path_str = path.to_string_lossy();
                 let ext_hint = path_str.rsplit('.').next().unwrap_or("");
                 color_palette.color_for_extension(ext_hint)
-            },
+            }
             TreemapItemKind::DirectFiles { .. } => Color32::from_rgb(96, 125, 139),
             TreemapItemKind::Other { .. } => Color32::from_rgb(88, 88, 96),
         };
@@ -185,7 +185,7 @@ pub fn draw_treemap(
             painter.rect_stroke(
                 item_rect,
                 4.0,
-                Stroke::new(2.0, Color32::from_rgb(255, 215, 0)),  // Gold highlight
+                Stroke::new(2.0, Color32::from_rgb(255, 215, 0)), // Gold highlight
                 egui::StrokeKind::Outside,
             );
         }
@@ -350,7 +350,7 @@ fn draw_cushion_shaded_rect(
         };
         let shrink_amount = layer as f32 * 1.5;
         let layer_rect = rect.shrink(shrink_amount);
-        
+
         painter.rect_filled(layer_rect, corner_radius.max(0.0), layer_color);
     }
 

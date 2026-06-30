@@ -385,11 +385,11 @@ impl ScanAccumulator {
 
         // Sort by size (descending) then path
         top_level.sort_by(compare_size_then_path_dir);
-        
+
         // Cache the result
         self.cached_top_level_dirs = Some(top_level.clone());
         self.cache_dirty = false;
-        
+
         top_level
     }
 

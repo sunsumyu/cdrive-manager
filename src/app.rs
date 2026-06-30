@@ -1531,12 +1531,31 @@ impl CDriveManagerApp {
 
                 let has_ai_source =
                     self.current_cleanup_preview().is_some() || self.current_duplicate_preview().is_some();
+                // AI 分析需要候选来源：清理预览或重复文件预览。
+                // 没有候选来源时仍允许点击，但会给出明确指引而不是一直灰色不可点。
+                let ai_button = if has_ai_source {
+                    egui::Button::new("AI 分析审核")
+                } else {
+                    egui::Button::new("AI 分析审核（需先建预览）")
+                };
+                let ai_enabled = !busy && has_final_stats;
+                let ai_tooltip = if has_ai_source {
+                    "基于清理预览和/或重复文件预览调用 OpenAI 兼容 API。只生成报告，不删除文件。"
+                } else if !has_final_stats {
+                    "请先完成一次扫描，再生成清理预览或重复文件预览，然后即可进行 AI 分析审核。"
+                } else {
+                    "AI 分析需要候选来源：请先点击\"生成清理预览\"或\"查找重复文件\"建立候选，再进行 AI 分析审核。"
+                };
                 if ui
-                    .add_enabled(!busy && has_ai_source, egui::Button::new("AI 分析审核"))
-                    .on_hover_text("基于清理预览和/或重复文件预览调用 OpenAI 兼容 API。只生成报告，不删除文件。")
+                    .add_enabled(ai_enabled, ai_button)
+                    .on_hover_text(ai_tooltip)
                     .clicked()
                 {
-                    self.start_ai_analysis();
+                    if has_ai_source {
+                        self.start_ai_analysis();
+                    } else {
+                        self.status_message = "AI 分析审核需要候选来源：请先点击\"生成清理预览\"或\"查找重复文件\"，再启动 AI 分析审核。".to_owned();
+                    }
                 }
 
                 if ui
@@ -1676,165 +1695,102 @@ impl CDriveManagerApp {
     fn draw_wiztree_layout(&mut self, ui: &mut egui::Ui, stats: &ScanStats) {
         let available_height = ui.available_height();
         let available_width = ui.available_width();
+        let start = ui.cursor().min;
 
         // Use 55% height for visualization area, rest for tabs
         let viz_height = (available_height * 0.55).max(280.0).min(520.0);
         let splitter_width = 6.0;
 
-        // Calculate panel widths from ratios with constraints
-        // Ensure total doesn't exceed available width
-        let max_left = available_width * 0.35;
-        let max_right = available_width * 0.25;
+        // Clamp ratios to keep all three panels usable.
+        let left_ratio = self.left_panel_ratio.clamp(0.12, 0.35);
+        let right_ratio = self.right_panel_ratio.clamp(0.10, 0.25);
+        self.left_panel_ratio = left_ratio;
+        self.right_panel_ratio = right_ratio;
+
+        let raw_left = available_width * left_ratio;
+        let raw_right = available_width * right_ratio;
+        // Guarantee the center stays at least 40% even if the user drags both
+        // splitters aggressively.
         let min_center = available_width * 0.40;
+        let total_side = (raw_left + raw_right + splitter_width * 2.0).max(0.0);
+        let center_width = (available_width - total_side).max(min_center);
+        // Recompute side widths so left + center + right + splitters == available
+        let side_budget = (available_width - center_width - splitter_width * 2.0).max(0.0);
+        let left_width = raw_left.min(side_budget - raw_right.max(0.0)).max(150.0);
+        let right_width = (side_budget - left_width).max(120.0);
 
-        let left_width = (available_width * self.left_panel_ratio)
-            .min(max_left)
-            .max(150.0);
-        let right_width = (available_width * self.right_panel_ratio)
-            .min(max_right)
-            .max(120.0);
-        let center_width =
-            (available_width - left_width - right_width - splitter_width * 2.0).max(min_center);
-
-        // Record starting position
-        let start_y = ui.cursor().min.y;
-        let start_x = ui.cursor().min.x;
+        let left_rect = egui::Rect::from_min_size(start, egui::vec2(left_width, viz_height));
+        let left_splitter_rect = egui::Rect::from_min_size(
+            egui::pos2(left_rect.max.x, start.y),
+            egui::vec2(splitter_width, viz_height),
+        );
+        let center_rect = egui::Rect::from_min_size(
+            egui::pos2(left_splitter_rect.max.x, start.y),
+            egui::vec2(center_width, viz_height),
+        );
+        let right_splitter_rect = egui::Rect::from_min_size(
+            egui::pos2(center_rect.max.x, start.y),
+            egui::vec2(splitter_width, viz_height),
+        );
+        let right_rect = egui::Rect::from_min_size(
+            egui::pos2(right_splitter_rect.max.x, start.y),
+            egui::vec2(right_width, viz_height),
+        );
 
         // === Left panel: Directory tree ===
-        {
-            let left_rect = egui::Rect::from_min_size(
-                egui::pos2(start_x, start_y),
-                egui::vec2(left_width, viz_height),
-            );
-
-            ui.allocate_new_ui(
-                egui::UiBuilder::new().max_rect(left_rect),
-                |ui: &mut egui::Ui| {
-                    egui::Frame::group(ui.style()).show(ui, |ui| {
-                        ui.set_min_height(viz_height - 8.0);
-                        self.draw_directory_tree_panel(ui, stats);
-                    });
-                },
-            );
-        }
-
-        // === Left splitter ===
-        let left_splitter_x = start_x + left_width;
-        let left_splitter_rect = egui::Rect::from_min_size(
-            egui::pos2(left_splitter_x, start_y),
-            egui::vec2(splitter_width, viz_height),
+        ui.scope_builder(
+            egui::UiBuilder::new().max_rect(left_rect),
+            |ui: &mut egui::Ui| {
+                egui::Frame::group(ui.style()).show(ui, |ui| {
+                    ui.set_min_height(viz_height - 8.0);
+                    self.draw_directory_tree_panel(ui, stats);
+                });
+            },
         );
-
-        let left_splitter_id = ui.make_persistent_id("viz_left_splitter");
-        let left_splitter_response =
-            ui.interact(left_splitter_rect, left_splitter_id, egui::Sense::drag());
-
-        if left_splitter_response.dragged() {
-            if let Some(pos) = ui.ctx().pointer_interact_pos() {
-                let new_ratio = ((pos.x - start_x) / available_width).clamp(0.12, 0.35);
-                self.left_panel_ratio = new_ratio;
-            }
-        }
-
-        // Draw left splitter
-        let left_splitter_color = if left_splitter_response.dragged() {
-            egui::Color32::from_rgb(100, 150, 200)
-        } else if left_splitter_response.hovered() {
-            egui::Color32::from_rgb(80, 120, 180)
-        } else {
-            egui::Color32::from_rgb(45, 50, 60)
-        };
-        ui.painter()
-            .rect_filled(left_splitter_rect, 0.0, left_splitter_color);
-
-        // Draw resize indicator
-        if left_splitter_response.hovered() || left_splitter_response.dragged() {
-            ui.painter().text(
-                left_splitter_rect.center(),
-                egui::Align2::CENTER_CENTER,
-                "⟷",
-                egui::FontId::proportional(10.0),
-                egui::Color32::from_gray(180),
-            );
-        }
 
         // === Center panel: Treemap/Sunburst ===
-        {
-            let center_start_x = left_splitter_x + splitter_width;
-            let center_rect = egui::Rect::from_min_size(
-                egui::pos2(center_start_x, start_y),
-                egui::vec2(center_width, viz_height),
-            );
-
-            ui.allocate_new_ui(
-                egui::UiBuilder::new().max_rect(center_rect),
-                |ui: &mut egui::Ui| {
-                    egui::Frame::group(ui.style()).show(ui, |ui| {
-                        ui.set_min_height(viz_height - 8.0);
-                        self.draw_treemap_panel(ui, stats);
-                    });
-                },
-            );
-        }
-
-        // === Right splitter ===
-        let right_splitter_x = left_splitter_x + splitter_width + center_width;
-        let right_splitter_rect = egui::Rect::from_min_size(
-            egui::pos2(right_splitter_x, start_y),
-            egui::vec2(splitter_width, viz_height),
+        ui.scope_builder(
+            egui::UiBuilder::new().max_rect(center_rect),
+            |ui: &mut egui::Ui| {
+                egui::Frame::group(ui.style()).show(ui, |ui| {
+                    ui.set_min_height(viz_height - 8.0);
+                    self.draw_treemap_panel(ui, stats);
+                });
+            },
         );
 
-        let right_splitter_id = ui.make_persistent_id("viz_right_splitter");
-        let right_splitter_response =
-            ui.interact(right_splitter_rect, right_splitter_id, egui::Sense::drag());
-
-        if right_splitter_response.dragged() {
-            if let Some(pos) = ui.ctx().pointer_interact_pos() {
-                let new_ratio =
-                    ((available_width - pos.x + start_x) / available_width).clamp(0.10, 0.25);
-                self.right_panel_ratio = new_ratio;
-            }
-        }
-
-        // Draw right splitter
-        let right_splitter_color = if right_splitter_response.dragged() {
-            egui::Color32::from_rgb(100, 150, 200)
-        } else if right_splitter_response.hovered() {
-            egui::Color32::from_rgb(80, 120, 180)
-        } else {
-            egui::Color32::from_rgb(45, 50, 60)
-        };
-        ui.painter()
-            .rect_filled(right_splitter_rect, 0.0, right_splitter_color);
-
-        if right_splitter_response.hovered() || right_splitter_response.dragged() {
-            ui.painter().text(
-                right_splitter_rect.center(),
-                egui::Align2::CENTER_CENTER,
-                "⟷",
-                egui::FontId::proportional(10.0),
-                egui::Color32::from_gray(180),
-            );
-        }
-
         // === Right panel: Extension/File type distribution ===
-        {
-            let right_start_x = right_splitter_x + splitter_width;
-            let right_rect = egui::Rect::from_min_size(
-                egui::pos2(right_start_x, start_y),
-                egui::vec2(right_width, viz_height),
-            );
+        ui.scope_builder(
+            egui::UiBuilder::new().max_rect(right_rect),
+            |ui: &mut egui::Ui| {
+                egui::Frame::group(ui.style()).show(ui, |ui| {
+                    ui.set_min_height(viz_height - 8.0);
+                    self.draw_extension_panel(ui, stats);
+                });
+            },
+        );
 
-            ui.allocate_new_ui(
-                egui::UiBuilder::new().max_rect(right_rect),
-                |ui: &mut egui::Ui| {
-                    egui::Frame::group(ui.style()).show(ui, |ui| {
-                        ui.set_min_height(viz_height - 8.0);
-                        self.draw_extension_panel(ui, stats);
-                    });
-                },
-            );
-        }
+        // === Splitters (drawn last so they sit on top and always receive drags) ===
+        self.draw_resizable_splitter(
+            ui,
+            left_splitter_rect,
+            "viz_left_splitter",
+            &|pos| {
+                let ratio = (pos.x - start.x) / available_width;
+                ratio.clamp(0.12, 0.35)
+            },
+            |app, ratio| app.left_panel_ratio = ratio,
+        );
+        self.draw_resizable_splitter(
+            ui,
+            right_splitter_rect,
+            "viz_right_splitter",
+            &|pos| {
+                let ratio = (start.x + available_width - pos.x) / available_width;
+                ratio.clamp(0.10, 0.25)
+            },
+            |app, ratio| app.right_panel_ratio = ratio,
+        );
 
         // Advance cursor to below the visualization area
         ui.allocate_space(egui::vec2(available_width, viz_height));
@@ -1843,6 +1799,45 @@ impl CDriveManagerApp {
         ui.add_space(6.0);
         ui.separator();
         self.draw_tabs(ui, stats);
+    }
+
+    /// Draws a draggable splitter bar that updates the given panel ratio.
+    fn draw_resizable_splitter(
+        &mut self,
+        ui: &mut egui::Ui,
+        rect: egui::Rect,
+        id_source: &str,
+        ratio_from_pos: &dyn Fn(egui::Pos2) -> f32,
+        apply: impl FnOnce(&mut Self, f32),
+    ) {
+        let id = ui.make_persistent_id(id_source);
+        let response = ui.interact(rect, id, egui::Sense::drag());
+
+        if response.dragged() {
+            if let Some(pos) = ui.ctx().pointer_interact_pos() {
+                let ratio = ratio_from_pos(pos);
+                apply(self, ratio);
+            }
+        }
+
+        let color = if response.dragged() {
+            egui::Color32::from_rgb(100, 150, 200)
+        } else if response.hovered() {
+            egui::Color32::from_rgb(80, 120, 180)
+        } else {
+            egui::Color32::from_rgb(45, 50, 60)
+        };
+        ui.painter().rect_filled(rect, 0.0, color);
+
+        if response.hovered() || response.dragged() {
+            ui.painter().text(
+                rect.center(),
+                egui::Align2::CENTER_CENTER,
+                "⟷",
+                egui::FontId::proportional(10.0),
+                egui::Color32::from_gray(180),
+            );
+        }
     }
 
     /// Left panel: Directory tree view

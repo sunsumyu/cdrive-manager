@@ -1,7 +1,7 @@
 mod ai_analysis;
 mod app;
-mod color_palette;
 mod cleanup;
+mod color_palette;
 mod duplicates;
 mod format;
 #[cfg(windows)]
@@ -18,23 +18,20 @@ use app::CDriveManagerApp;
 fn main() -> eframe::Result<()> {
     // Setup Chinese font support
     let mut fonts = egui::FontDefinitions::default();
-    
+
     // Add Chinese font family
     fonts.font_data.insert(
         "chinese".to_owned(),
-        egui::FontData::from_static(include_bytes!(
-            "C:\\Windows\\Fonts\\msyh.ttc"
-        ))
-        .into(),
+        egui::FontData::from_static(include_bytes!("C:\\Windows\\Fonts\\msyh.ttc")).into(),
     );
-    
+
     // Set Chinese font as primary for prose text
     fonts
         .families
         .entry(egui::FontFamily::Proportional)
         .or_default()
         .insert(0, "chinese".to_owned());
-    
+
     fonts
         .families
         .entry(egui::FontFamily::Monospace)

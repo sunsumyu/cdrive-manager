@@ -3,14 +3,14 @@ use std::{
     env,
     path::PathBuf,
     sync::{
-        atomic::{AtomicBool, Ordering},
         Arc,
+        atomic::{AtomicBool, Ordering},
     },
     thread,
     time::Duration,
 };
 
-use crossbeam_channel::{unbounded, Receiver};
+use crossbeam_channel::{Receiver, unbounded};
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -641,7 +641,9 @@ pub fn spawn_ai_analysis(options: AiAnalysisOptions) -> AiAnalysisHandle {
             }
         };
 
-        let report = Arc::new(AiAnalysisReport::from_findings(root, &config, findings, errors));
+        let report = Arc::new(AiAnalysisReport::from_findings(
+            root, &config, findings, errors,
+        ));
         let _ = sender.send(AiAnalysisEvent::Progress(AiAnalysisProgress {
             report: Arc::clone(&report),
             phase: AiAnalysisPhase::Finished,
@@ -713,7 +715,12 @@ fn collect_candidates(options: &AiAnalysisOptions) -> Vec<CandidateRecord> {
         }
     }
 
-    candidates.sort_by(|left, right| right.size.cmp(&left.size).then_with(|| left.path.cmp(&right.path)));
+    candidates.sort_by(|left, right| {
+        right
+            .size
+            .cmp(&left.size)
+            .then_with(|| left.path.cmp(&right.path))
+    });
     candidates.truncate(limit);
     candidates
 }
@@ -764,17 +771,18 @@ fn request_audit(
         .collect())
 }
 
-fn chat_completion(config: &AiProviderConfig, system_prompt: &str, user_prompt: &str) -> anyhow::Result<String> {
+fn chat_completion(
+    config: &AiProviderConfig,
+    system_prompt: &str,
+    user_prompt: &str,
+) -> anyhow::Result<String> {
     let api_key = env::var(&config.api_key_env).map_err(|_| {
         anyhow::anyhow!(
             "未找到环境变量 {}。请设置 OpenAI 兼容 API Key；程序不会保存或导出该密钥。",
             config.api_key_env
         )
     })?;
-    let endpoint = format!(
-        "{}/chat/completions",
-        config.base_url.trim_end_matches('/')
-    );
+    let endpoint = format!("{}/chat/completions", config.base_url.trim_end_matches('/'));
     let request = ChatRequest {
         model: config.model.clone(),
         messages: vec![
@@ -820,7 +828,10 @@ fn chat_completion(config: &AiProviderConfig, system_prompt: &str, user_prompt: 
         .ok_or_else(|| anyhow::anyhow!("OpenAI 兼容接口没有返回有效内容"))
 }
 
-fn candidate_payloads(config: &AiProviderConfig, candidates: &[CandidateRecord]) -> Vec<CandidatePayload> {
+fn candidate_payloads(
+    config: &AiProviderConfig,
+    candidates: &[CandidateRecord],
+) -> Vec<CandidatePayload> {
     candidates
         .iter()
         .map(|candidate| CandidatePayload {
@@ -1000,7 +1011,10 @@ fn audited_fallback_findings(
     findings
 }
 
-fn finish_cancelled(sender: &crossbeam_channel::Sender<AiAnalysisEvent>, report: Arc<AiAnalysisReport>) {
+fn finish_cancelled(
+    sender: &crossbeam_channel::Sender<AiAnalysisEvent>,
+    report: Arc<AiAnalysisReport>,
+) {
     let _ = sender.send(AiAnalysisEvent::Progress(AiAnalysisProgress {
         report: Arc::clone(&report),
         phase: AiAnalysisPhase::Finished,

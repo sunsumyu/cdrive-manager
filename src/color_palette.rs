@@ -3,20 +3,20 @@
 //! Provides consistent color mapping based on file extensions and categories.
 //! Used by Treemap, Sunburst, and ExtensionPanel for color-coordinated display.
 
-use std::collections::HashMap;
 use egui::Color32;
+use std::collections::HashMap;
 
 /// File category classification
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum FileCategory {
-    Executable,    // exe, dll, msi, cab
-    Document,      // doc, pdf, txt, rtf, odt
-    Media,         // mp4, mp3, jpg, png, avi, mov
-    Code,          // rs, py, js, cpp, h, java
-    System,        // sys, drv, cat, inf, reg
-    Temporary,     // tmp, log, bak, old, temp
-    Archive,       // zip, rar, 7z, tar, gz, bz2
-    Data,          // json, xml, csv, yaml, toml
+    Executable, // exe, dll, msi, cab
+    Document,   // doc, pdf, txt, rtf, odt
+    Media,      // mp4, mp3, jpg, png, avi, mov
+    Code,       // rs, py, js, cpp, h, java
+    System,     // sys, drv, cat, inf, reg
+    Temporary,  // tmp, log, bak, old, temp
+    Archive,    // zip, rar, 7z, tar, gz, bz2
+    Data,       // json, xml, csv, yaml, toml
     Other,
 }
 
@@ -51,15 +51,15 @@ impl FileCategory {
 
     pub fn default_color(self) -> Color32 {
         match self {
-            Self::Executable => Color32::from_rgb(220, 53, 69),      // Red
-            Self::Document => Color32::from_rgb(72, 166, 233),       // Light Blue
-            Self::Media => Color32::from_rgb(156, 39, 176),          // Purple
-            Self::Code => Color32::from_rgb(76, 175, 80),            // Green
-            Self::System => Color32::from_rgb(255, 152, 0),          // Orange
-            Self::Temporary => Color32::from_rgb(158, 158, 158),     // Gray
-            Self::Archive => Color32::from_rgb(255, 193, 7),         // Amber/Yellow
-            Self::Data => Color32::from_rgb(0, 150, 136),            // Teal
-            Self::Other => Color32::from_rgb(121, 134, 203),         // Soft Blue
+            Self::Executable => Color32::from_rgb(220, 53, 69), // Red
+            Self::Document => Color32::from_rgb(72, 166, 233),  // Light Blue
+            Self::Media => Color32::from_rgb(156, 39, 176),     // Purple
+            Self::Code => Color32::from_rgb(76, 175, 80),       // Green
+            Self::System => Color32::from_rgb(255, 152, 0),     // Orange
+            Self::Temporary => Color32::from_rgb(158, 158, 158), // Gray
+            Self::Archive => Color32::from_rgb(255, 193, 7),    // Amber/Yellow
+            Self::Data => Color32::from_rgb(0, 150, 136),       // Teal
+            Self::Other => Color32::from_rgb(121, 134, 203),    // Soft Blue
         }
     }
 }
@@ -75,7 +75,6 @@ const EXTENSION_CATEGORIES: &[(&str, FileCategory)] = &[
     ("bat", FileCategory::Executable),
     ("cmd", FileCategory::Executable),
     ("ps1", FileCategory::Executable),
-    
     // Document
     ("doc", FileCategory::Document),
     ("docx", FileCategory::Document),
@@ -90,7 +89,6 @@ const EXTENSION_CATEGORIES: &[(&str, FileCategory)] = &[
     ("md", FileCategory::Document),
     ("html", FileCategory::Document),
     ("htm", FileCategory::Document),
-    
     // Media
     ("mp4", FileCategory::Media),
     ("mp3", FileCategory::Media),
@@ -114,7 +112,6 @@ const EXTENSION_CATEGORIES: &[(&str, FileCategory)] = &[
     ("ico", FileCategory::Media),
     ("tiff", FileCategory::Media),
     ("webp", FileCategory::Media),
-    
     // Code
     ("rs", FileCategory::Code),
     ("py", FileCategory::Code),
@@ -139,7 +136,6 @@ const EXTENSION_CATEGORIES: &[(&str, FileCategory)] = &[
     ("psm1", FileCategory::Code),
     ("asm", FileCategory::Code),
     ("s", FileCategory::Code),
-    
     // System
     ("sys", FileCategory::System),
     ("drv", FileCategory::System),
@@ -149,7 +145,6 @@ const EXTENSION_CATEGORIES: &[(&str, FileCategory)] = &[
     ("dll", FileCategory::System),
     ("ocx", FileCategory::System),
     ("ax", FileCategory::System),
-    
     // Temporary
     ("tmp", FileCategory::Temporary),
     ("temp", FileCategory::Temporary),
@@ -158,7 +153,6 @@ const EXTENSION_CATEGORIES: &[(&str, FileCategory)] = &[
     ("old", FileCategory::Temporary),
     ("swp", FileCategory::Temporary),
     ("cache", FileCategory::Temporary),
-    
     // Archive
     ("zip", FileCategory::Archive),
     ("rar", FileCategory::Archive),
@@ -173,7 +167,6 @@ const EXTENSION_CATEGORIES: &[(&str, FileCategory)] = &[
     ("pkg", FileCategory::Archive),
     ("deb", FileCategory::Archive),
     ("rpm", FileCategory::Archive),
-    
     // Data
     ("json", FileCategory::Data),
     ("xml", FileCategory::Data),
@@ -224,10 +217,12 @@ impl ColorPalette {
     /// Get color for file extension (thread-safe, no cache mutation)
     pub fn color_for_extension(&self, extension: &str) -> Color32 {
         let normalized = extension.to_ascii_lowercase();
-        
+
         // Find category and color directly
         let category = Self::category_for_extension_static(&normalized);
-        self.category_colors.get(&category).copied()
+        self.category_colors
+            .get(&category)
+            .copied()
             .unwrap_or_else(|| FileCategory::Other.default_color())
     }
 
@@ -240,7 +235,7 @@ impl ColorPalette {
     /// Get color for extension with caching (mutable version for performance)
     pub fn color_for_extension_cached(&mut self, extension: &str) -> Color32 {
         let normalized = extension.to_ascii_lowercase();
-        
+
         // Check cache first
         if let Some((_, color)) = self.extension_cache.get(&normalized) {
             return *color;
@@ -248,12 +243,15 @@ impl ColorPalette {
 
         // Find category and color
         let category = Self::category_for_extension_static(&normalized);
-        let color = self.category_colors.get(&category).copied()
+        let color = self
+            .category_colors
+            .get(&category)
+            .copied()
             .unwrap_or_else(|| FileCategory::Other.default_color());
 
         // Cache the result
         self.extension_cache.insert(normalized, (category, color));
-        
+
         color
     }
 
@@ -274,7 +272,9 @@ impl ColorPalette {
 
     /// Get color for category
     pub fn color_for_category(&self, category: FileCategory) -> Color32 {
-        self.category_colors.get(&category).copied()
+        self.category_colors
+            .get(&category)
+            .copied()
             .unwrap_or_else(|| FileCategory::Other.default_color())
     }
 
@@ -305,14 +305,14 @@ impl ColorPalette {
         depth_layers: usize,
     ) {
         let layer_count = depth_layers.min(4);
-        
+
         // Draw from outer to inner layers
         for layer in 0..layer_count {
             let shade_factor = (layer as f32 / layer_count as f32) * 0.4;
             let layer_color = Self::darken(base_color, shade_factor);
             let shrink_amount = layer as f32 * 1.5;
             let layer_rect = rect.shrink(shrink_amount);
-            
+
             painter.rect_filled(layer_rect, corner_radius.max(0.0), layer_color);
         }
 
@@ -359,12 +359,12 @@ mod tests {
     #[test]
     fn test_color_darken_lighten() {
         let base = Color32::from_rgb(100, 150, 200);
-        
+
         let darker = ColorPalette::darken(base, 0.5);
         assert!(darker.r() < base.r());
         assert!(darker.g() < base.g());
         assert!(darker.b() < base.b());
-        
+
         let lighter = ColorPalette::lighten(base, 0.5);
         assert!(lighter.r() > base.r());
         assert!(lighter.g() > base.g());
