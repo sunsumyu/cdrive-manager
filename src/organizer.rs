@@ -11,6 +11,7 @@
 //! - Conflict detection for existing files at the destination
 //! - Dry-run by default: nothing is moved until the user explicitly confirms
 
+use std::collections::HashSet;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{
@@ -32,6 +33,10 @@ pub enum PersonalFolder {
     Videos,
     Music,
     Favorites,
+    Objects3D,
+    Contacts,
+    SavedGames,
+    Searches,
 }
 
 impl Default for PersonalFolder {
@@ -49,7 +54,11 @@ impl PersonalFolder {
             Self::Pictures => "图片",
             Self::Videos => "视频",
             Self::Music => "音乐",
-            Self::Favorites => "收藏夹",
+            Self::Favorites => "收藏夹/链接",
+            Self::Objects3D => "3D 对象",
+            Self::Contacts => "联系人",
+            Self::SavedGames => "保存的游戏",
+            Self::Searches => "搜索",
         }
     }
 
@@ -62,6 +71,10 @@ impl PersonalFolder {
             Self::Videos => "Videos",
             Self::Music => "Music",
             Self::Favorites => "Favorites",
+            Self::Objects3D => "3D Objects",
+            Self::Contacts => "Contacts",
+            Self::SavedGames => "Saved Games",
+            Self::Searches => "Searches",
         }
     }
 
@@ -74,33 +87,113 @@ impl PersonalFolder {
             Self::Videos => "🎬",
             Self::Music => "🎵",
             Self::Favorites => "⭐",
+            Self::Objects3D => "🧊",
+            Self::Contacts => "👤",
+            Self::SavedGames => "🎮",
+            Self::Searches => "🔍",
         }
     }
 
     pub fn default_path(&self) -> Option<PathBuf> {
+        self.source_paths().into_iter().next()
+    }
+
+    pub fn source_paths(self) -> Vec<PathBuf> {
+        let mut candidates = Vec::new();
+
         match self {
-            Self::Desktop => dirs::desktop_dir(),
-            Self::Documents => dirs::document_dir(),
-            Self::Downloads => dirs::download_dir(),
-            Self::Pictures => dirs::picture_dir(),
-            Self::Videos => dirs::video_dir(),
-            Self::Music => dirs::audio_dir(),
-            Self::Favorites => {
-                if let Some(home) = dirs::home_dir() {
-                    let fav = home.join("Links");
-                    if fav.is_dir() {
-                        return Some(fav);
-                    }
-                    // Fallback: Windows stores Favorites as %USERPROFILE%\Favorites
-                    let legacy = home.join("Favorites");
-                    if legacy.is_dir() {
-                        return Some(legacy);
-                    }
+            Self::Desktop => candidates.extend(dirs::desktop_dir()),
+            Self::Documents => candidates.extend(dirs::document_dir()),
+            Self::Downloads => candidates.extend(dirs::download_dir()),
+            Self::Pictures => candidates.extend(dirs::picture_dir()),
+            Self::Videos => candidates.extend(dirs::video_dir()),
+            Self::Music => candidates.extend(dirs::audio_dir()),
+            _ => {}
+        }
+
+        let folder_names = self.candidate_folder_names();
+        for base in user_data_roots() {
+            for name in &folder_names {
+                candidates.push(base.join(name));
+            }
+        }
+
+        dedup_existing_dirs(candidates)
+    }
+
+    fn candidate_folder_names(self) -> Vec<&'static str> {
+        match self {
+            Self::Desktop => vec!["Desktop", "桌面"],
+            Self::Documents => vec!["Documents", "My Documents", "文档"],
+            Self::Downloads => vec!["Downloads", "下载"],
+            Self::Pictures => vec!["Pictures", "图片"],
+            Self::Videos => vec!["Videos", "视频"],
+            Self::Music => vec!["Music", "音乐"],
+            Self::Favorites => vec!["Favorites", "收藏夹", "Links", "链接"],
+            Self::Objects3D => vec!["3D Objects", "3D 对象"],
+            Self::Contacts => vec!["Contacts", "联系人"],
+            Self::SavedGames => vec!["Saved Games", "保存的游戏"],
+            Self::Searches => vec!["Searches", "搜索"],
+        }
+    }
+}
+
+fn user_data_roots() -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+
+    if let Some(home) = dirs::home_dir() {
+        roots.push(home.clone());
+
+        // OneDrive often redirects Desktop/Documents/Pictures away from the classic profile dirs.
+        roots.push(home.join("OneDrive"));
+        roots.push(home.join("OneDrive - Personal"));
+        roots.push(home.join("OneDrive - 个人"));
+
+        // Include any immediate OneDrive* directory under the user profile.
+        if let Ok(entries) = std::fs::read_dir(&home) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if !path.is_dir() {
+                    continue;
                 }
-                None
+                let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+                    continue;
+                };
+                if name.to_ascii_lowercase().starts_with("onedrive") {
+                    roots.push(path);
+                }
             }
         }
     }
+
+    for key in ["OneDrive", "OneDriveConsumer", "OneDriveCommercial"] {
+        if let Ok(value) = std::env::var(key) {
+            roots.push(PathBuf::from(value));
+        }
+    }
+
+    dedup_existing_dirs(roots)
+}
+
+fn dedup_existing_dirs(paths: Vec<PathBuf>) -> Vec<PathBuf> {
+    let mut seen = HashSet::new();
+    let mut result = Vec::new();
+
+    for path in paths {
+        if !path.is_dir() {
+            continue;
+        }
+        let key = path
+            .canonicalize()
+            .unwrap_or_else(|_| path.clone())
+            .to_string_lossy()
+            .to_ascii_lowercase();
+        if seen.insert(key) {
+            result.push(path);
+        }
+    }
+
+    result
 }
 
 /// How to handle a file that already exists at the destination.
@@ -188,7 +281,12 @@ pub struct OrganizerPreview {
 
 impl OrganizerPreview {
     pub fn enabled_folder_count(&self) -> usize {
-        self.folders.iter().filter(|f| f.total_items > 0).count()
+        self.folders
+            .iter()
+            .filter(|f| f.total_items > 0)
+            .map(|f| f.folder)
+            .collect::<HashSet<_>>()
+            .len()
     }
 }
 
@@ -269,6 +367,11 @@ impl PersonalFolder {
             Self::Pictures,
             Self::Videos,
             Self::Music,
+            Self::Favorites,
+            Self::Objects3D,
+            Self::Contacts,
+            Self::SavedGames,
+            Self::Searches,
         ]
     }
 }
@@ -291,85 +394,88 @@ pub fn build_preview(options: &OrganizerOptions) -> Result<OrganizerPreview> {
     let mut total_items: u64 = 0;
     let mut total_size: u64 = 0;
     let mut total_conflicts: u64 = 0;
+    let mut planned_targets = HashSet::new();
 
     for folder in &options.enabled_folders {
-        let source = match folder.default_path() {
-            Some(p) => p,
-            None => continue,
-        };
-        if !source.exists() {
+        let sources = folder.source_paths();
+        if sources.is_empty() {
             continue;
         }
-        let target_base = options.target_root.join(folder.default_folder_name());
 
-        let mut folder_stats = FolderCandidateStats {
-            folder: *folder,
-            source_path: source.clone(),
-            target_path: target_base.clone(),
-            total_items: 0,
-            total_size: 0,
-            directory_count: 0,
-            file_count: 0,
-            conflict_count: 0,
-        };
+        for source in sources {
+            let target_base = options.target_root.join(folder.default_folder_name());
 
-        let walker = walkdir::WalkDir::new(&source)
-            .follow_links(false)
-            .min_depth(1);
-
-        for entry in walker {
-            let entry = match entry {
-                Ok(e) => e,
-                Err(_) => continue,
-            };
-            let relative = match entry.path().strip_prefix(&source) {
-                Ok(r) => r.to_path_buf(),
-                Err(_) => continue,
-            };
-            let target_path = target_base.join(&relative);
-
-            let metadata = match entry.metadata() {
-                Ok(m) => m,
-                Err(_) => continue,
-            };
-
-            let is_directory = metadata.is_dir();
-            let size = if is_directory { 0 } else { metadata.len() };
-            let modified = metadata.modified().ok();
-            let conflict = if target_path.exists() {
-                ConflictStatus::Exists
-            } else {
-                ConflictStatus::None
-            };
-
-            folder_stats.total_items += 1;
-            folder_stats.total_size += size;
-            if is_directory {
-                folder_stats.directory_count += 1;
-            } else {
-                folder_stats.file_count += 1;
-            }
-            if conflict == ConflictStatus::Exists {
-                folder_stats.conflict_count += 1;
-                total_conflicts += 1;
-            }
-
-            total_items += 1;
-            total_size += size;
-
-            preview_items.push(OrganizerItem {
+            let mut folder_stats = FolderCandidateStats {
                 folder: *folder,
-                source_path: entry.path().to_path_buf(),
-                target_path,
-                size,
-                modified,
-                is_directory,
-                conflict,
-            });
-        }
+                source_path: source.clone(),
+                target_path: target_base.clone(),
+                total_items: 0,
+                total_size: 0,
+                directory_count: 0,
+                file_count: 0,
+                conflict_count: 0,
+            };
 
-        if folder_stats.total_items > 0 {
-            preview_folders.push(folder_stats);
+            let walker = walkdir::WalkDir::new(&source)
+                .follow_links(false)
+                .min_depth(1);
+
+            for entry in walker {
+                let entry = match entry {
+                    Ok(e) => e,
+                    Err(_) => continue,
+                };
+                let relative = match entry.path().strip_prefix(&source) {
+                    Ok(r) => r.to_path_buf(),
+                    Err(_) => continue,
+                };
+                let target_path = target_base.join(&relative);
+
+                let metadata = match entry.metadata() {
+                    Ok(m) => m,
+                    Err(_) => continue,
+                };
+
+                let is_directory = metadata.is_dir();
+                let size = if is_directory { 0 } else { metadata.len() };
+                let modified = metadata.modified().ok();
+                let target_key = target_path.to_string_lossy().to_ascii_lowercase();
+                let conflict = if target_path.exists() || planned_targets.contains(&target_key) {
+                    ConflictStatus::Exists
+                } else {
+                    ConflictStatus::None
+                };
+                planned_targets.insert(target_key);
+
+                folder_stats.total_items += 1;
+                folder_stats.total_size += size;
+                if is_directory {
+                    folder_stats.directory_count += 1;
+                } else {
+                    folder_stats.file_count += 1;
+                }
+                if conflict == ConflictStatus::Exists {
+                    folder_stats.conflict_count += 1;
+                    total_conflicts += 1;
+                }
+
+                total_items += 1;
+                total_size += size;
+
+                preview_items.push(OrganizerItem {
+                    folder: *folder,
+                    source_path: entry.path().to_path_buf(),
+                    target_path,
+                    size,
+                    modified,
+                    is_directory,
+                    conflict,
+                });
+            }
+
+            if folder_stats.total_items > 0 {
+                preview_folders.push(folder_stats);
+            }
         }
     }
 

@@ -319,6 +319,11 @@ impl CDriveManagerApp {
                 PersonalFolder::Pictures,
                 PersonalFolder::Videos,
                 PersonalFolder::Music,
+                PersonalFolder::Favorites,
+                PersonalFolder::Objects3D,
+                PersonalFolder::Contacts,
+                PersonalFolder::SavedGames,
+                PersonalFolder::Searches,
             ]),
             organizer_conflict_strategy: ConflictStrategy::Skip,
             organizer_preview: None,
@@ -2617,17 +2622,15 @@ impl CDriveManagerApp {
             PersonalFolder::Videos,
             PersonalFolder::Music,
             PersonalFolder::Favorites,
+            PersonalFolder::Objects3D,
+            PersonalFolder::Contacts,
+            PersonalFolder::SavedGames,
+            PersonalFolder::Searches,
         ];
 
         // Collect folder info for display
-        let folder_infos: Vec<(PersonalFolder, Option<PathBuf>, bool)> = all_folders
-            .iter()
-            .map(|f| {
-                let source = f.default_path();
-                let exists = source.as_ref().map_or(false, |p| p.exists());
-                (*f, source, exists)
-            })
-            .collect();
+        let folder_infos: Vec<(PersonalFolder, Vec<PathBuf>)> =
+            all_folders.iter().map(|f| (*f, f.source_paths())).collect();
 
         egui::Window::new("个人文件整理 - 将 C 盘个人数据转移到其他盘")
             .open(&mut window_open)
@@ -2663,31 +2666,36 @@ impl CDriveManagerApp {
                 ui.label(RichText::new("选择要转移的个人文件夹：").strong());
                 ui.add_space(4.0);
 
-                for (folder, source, exists) in &folder_infos {
-                    if !exists {
-                        continue;
-                    }
-                    let Some(source_path) = source else {
+                for (folder, sources) in &folder_infos {
+                    if sources.is_empty() {
                         ui.label(
                             RichText::new(format!(
-                                "  {} {} (无法定位源路径)",
+                                "  {} {} (未发现源路径)",
                                 folder.icon(),
                                 folder.label()
                             ))
                             .color(egui::Color32::from_gray(120)),
                         );
                         continue;
-                    };
+                    }
 
                     let mut enabled = enabled_folders.contains(folder);
+                    let source_text = if sources.len() == 1 {
+                        sources[0].display().to_string()
+                    } else {
+                        format!(
+                            "{} 个源目录：{}",
+                            sources.len(),
+                            sources
+                                .iter()
+                                .map(|p| p.display().to_string())
+                                .collect::<Vec<_>>()
+                                .join("；")
+                        )
+                    };
                     let response = ui.checkbox(
                         &mut enabled,
-                        format!(
-                            "{} {}  {}",
-                            folder.icon(),
-                            folder.label(),
-                            source_path.display()
-                        ),
+                        format!("{} {}  {}", folder.icon(), folder.label(), source_text),
                     );
                     if response.changed() {
                         if enabled {
