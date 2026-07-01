@@ -582,7 +582,6 @@ impl CDriveManagerApp {
             target_root: target,
             enabled_folders: enabled,
             conflict_strategy: self.organizer_conflict_strategy,
-            preview_item_cap: 1000,
         };
 
         match build_preview(&options) {
@@ -648,11 +647,18 @@ impl CDriveManagerApp {
             self.organizer_in_progress = false;
             self.organizer_handle = None;
 
-            if result.cancelled {
-                self.status_message = "文件转移已取消。".to_owned();
+            if result.cancelled || result.processed_items < result.total_items {
+                self.status_message = format!(
+                    "文件转移未完成：已处理 {}/{}，成功 {}、跳过 {}、失败 {}。源文件未完成部分仍保留。",
+                    result.processed_items,
+                    result.total_items,
+                    result.success_count,
+                    result.skipped_count,
+                    result.error_count
+                );
             } else if result.error_count > 0 {
                 self.status_message = format!(
-                    "转移完成：成功 {}、跳过 {}、失败 {}。请查看报告中的失败详情。",
+                    "转移已结束但有失败：成功 {}、跳过 {}、失败 {}。请查看报告中的失败详情。",
                     result.success_count, result.skipped_count, result.error_count
                 );
             } else {
@@ -2819,9 +2825,7 @@ impl CDriveManagerApp {
                     ui.add_space(8.0);
                     ui.group(|ui| {
                         ui.label(RichText::new("转移进度：").strong());
-                        let ratio = if progress.total_bytes > 0 {
-                            progress.processed_bytes as f32 / progress.total_bytes as f32
-                        } else if progress.total_items > 0 {
+                        let ratio = if progress.total_items > 0 {
                             progress.processed_items as f32 / progress.total_items as f32
                         } else {
                             0.0
@@ -2844,12 +2848,23 @@ impl CDriveManagerApp {
                 if let Some(result) = &organizer_finished {
                     ui.add_space(8.0);
                     ui.group(|ui| {
-                        ui.label(RichText::new("转移结果：").strong());
+                        let completed_all =
+                            result.processed_items >= result.total_items && !result.cancelled;
+                        let title = if completed_all {
+                            "转移结果："
+                        } else {
+                            "转移未完成："
+                        };
+                        ui.label(RichText::new(title).strong());
+                        ui.label(format!(
+                            "处理进度：{} / {}",
+                            result.processed_items, result.total_items
+                        ));
                         ui.label(format!(
                             "成功：{}  跳过：{}  失败：{}",
                             result.success_count, result.skipped_count, result.error_count
                         ));
-                        ui.label(format!("转移大小：{}", format::bytes(result.moved_bytes)));
+                        ui.label(format!("已转移大小：{}", format::bytes(result.moved_bytes)));
 
                         if !result.errors.is_empty() {
                             ui.add_space(4.0);

@@ -11,6 +11,7 @@
 //! - Conflict detection for existing files at the destination
 //! - Dry-run by default: nothing is moved until the user explicitly confirms
 
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{
     Arc,
@@ -218,6 +219,8 @@ pub struct OrganizerFinished {
     pub skipped_count: u64,
     pub error_count: u64,
     pub moved_bytes: u64,
+    pub processed_items: u64,
+    pub total_items: u64,
     pub errors: Vec<OrganizerError>,
     pub cancelled: bool,
 }
@@ -245,8 +248,6 @@ pub struct OrganizerOptions {
     pub target_root: PathBuf,
     pub enabled_folders: Vec<PersonalFolder>,
     pub conflict_strategy: ConflictStrategy,
-    /// Maximum number of files collected per folder before truncating the preview.
-    pub preview_item_cap: usize,
 }
 
 impl Default for OrganizerOptions {
@@ -255,7 +256,6 @@ impl Default for OrganizerOptions {
             target_root: PathBuf::new(),
             enabled_folders: PersonalFolder::default_enabled(),
             conflict_strategy: ConflictStrategy::default(),
-            preview_item_cap: 2000,
         }
     }
 }
@@ -357,17 +357,15 @@ pub fn build_preview(options: &OrganizerOptions) -> Result<OrganizerPreview> {
             total_items += 1;
             total_size += size;
 
-            if preview_items.len() < options.preview_item_cap {
-                preview_items.push(OrganizerItem {
-                    folder: *folder,
-                    source_path: entry.path().to_path_buf(),
-                    target_path,
-                    size,
-                    modified,
-                    is_directory,
-                    conflict,
-                });
-            }
+            preview_items.push(OrganizerItem {
+                folder: *folder,
+                source_path: entry.path().to_path_buf(),
+                target_path,
+                size,
+                modified,
+                is_directory,
+                conflict,
+            });
         }
 
         if folder_stats.total_items > 0 {
@@ -517,12 +515,26 @@ fn run_transfer(
             }
             processed_items += 1;
         } else {
-            match copy_file_verify(&item.source_path, &target) {
-                Ok(bytes_copied) => {
+            // Use chunked copy with progress reporting and cancel support
+            match copy_file_with_progress(
+                &item.source_path,
+                &target,
+                item.size,
+                processed_bytes,
+                preview.total_size,
+                preview.total_items,
+                processed_items,
+                success_count,
+                skipped_count,
+                error_count,
+                sender,
+                cancel_flag,
+            ) {
+                Ok(Some(bytes_copied)) => {
                     // Verify size matches before removing the source.
                     let verify_ok = std::fs::metadata(&target)
                         .ok()
-                        .map(|m| m.len() == bytes_copied as u64);
+                        .map(|m| m.len() == bytes_copied);
 
                     if verify_ok == Some(true) {
                         if std::fs::remove_file(&item.source_path).is_ok() {
@@ -547,6 +559,18 @@ fn run_transfer(
                             message: "复制后大小校验失败，源文件已保留".to_owned(),
                         });
                     }
+                }
+                Ok(None) => {
+                    // Cancelled during copy - stop processing remaining items
+                    error_count += 1;
+                    errors.push(OrganizerError {
+                        source: item.source_path.clone(),
+                        target: target.clone(),
+                        message: "复制被取消，源文件已保留".to_owned(),
+                    });
+                    processed_items += 1;
+                    processed_bytes += item.size;
+                    break;
                 }
                 Err(error) => {
                     error_count += 1;
@@ -581,6 +605,8 @@ fn run_transfer(
         skipped_count,
         error_count,
         moved_bytes,
+        processed_items,
+        total_items: preview.total_items,
         errors,
         cancelled: cancel_flag.load(Ordering::Relaxed),
     }));
@@ -614,9 +640,22 @@ fn emit_progress(
     }));
 }
 
-/// Copy a single file and return the number of bytes copied.
-/// Uses a streaming copy so large files do not need to fit in memory.
-fn copy_file_verify(source: &Path, target: &Path) -> Result<u64> {
+/// Copy a single file with progress reporting and cancellation support.
+/// Returns the number of bytes copied, or None if cancelled.
+fn copy_file_with_progress(
+    source: &Path,
+    target: &Path,
+    item_size: u64,
+    base_processed_bytes: u64,
+    total_bytes: u64,
+    total_items: u64,
+    processed_items: u64,
+    success_count: u64,
+    skipped_count: u64,
+    error_count: u64,
+    sender: &Sender<OrganizerEvent>,
+    cancel_flag: &AtomicBool,
+) -> Result<Option<u64>> {
     if let Some(parent) = target.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("无法创建目标目录 {}", parent.display()))?;
@@ -627,14 +666,58 @@ fn copy_file_verify(source: &Path, target: &Path) -> Result<u64> {
     let mut dst_file = std::fs::File::create(target)
         .with_context(|| format!("无法创建目标文件 {}", target.display()))?;
 
-    let bytes_copied = std::io::copy(&mut src_file, &mut dst_file)
-        .with_context(|| format!("复制 {} 失败", source.display()))?;
+    // Use a buffer for chunked copying (64KB chunks)
+    let buffer_size = 64 * 1024;
+    let mut buffer = vec![0u8; buffer_size];
+    let mut bytes_copied: u64 = 0;
+    let mut last_report_bytes: u64 = 0;
+    let report_interval: u64 = 512 * 1024; // Report every 512KB
+
+    loop {
+        if cancel_flag.load(Ordering::Relaxed) {
+            // Cancelled: clean up partial file
+            let _ = std::fs::remove_file(target);
+            return Ok(None);
+        }
+
+        let read = src_file
+            .read(&mut buffer)
+            .with_context(|| format!("读取 {} 失败", source.display()))?;
+        if read == 0 {
+            break; // EOF
+        }
+
+        dst_file
+            .write_all(&buffer[..read])
+            .with_context(|| format!("写入 {} 失败", target.display()))?;
+
+        bytes_copied += read as u64;
+
+        // Report progress every report_interval bytes or at completion
+        let current_total_bytes = base_processed_bytes + bytes_copied;
+        if bytes_copied - last_report_bytes >= report_interval || bytes_copied == item_size {
+            last_report_bytes = bytes_copied;
+            let _ = sender.send(OrganizerEvent::Progress(OrganizerProgress {
+                processed_items,
+                processed_bytes: current_total_bytes,
+                total_items,
+                total_bytes,
+                current_source: source.to_path_buf(),
+                current_target: target.to_path_buf(),
+                success_count,
+                skipped_count,
+                error_count,
+                finished: false,
+                cancelled: false,
+            }));
+        }
+    }
 
     dst_file
         .sync_all()
         .with_context(|| format!("同步目标文件失败 {}", target.display()))?;
 
-    Ok(bytes_copied)
+    Ok(Some(bytes_copied))
 }
 
 #[cfg(test)]
