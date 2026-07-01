@@ -7,6 +7,7 @@ mod format;
 #[cfg(windows)]
 mod mft;
 mod model;
+mod organizer;
 mod scan_cache;
 mod scanner;
 mod split_panel;

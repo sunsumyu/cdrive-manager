@@ -30,6 +30,11 @@ use crate::{
         DirectoryRecord, DirectoryTree, ExtensionRecord, FileRecord, ScanFilterConfig, ScanStats,
         normalize_extension_filter,
     },
+    organizer::{
+        ConflictStrategy, OrganizerEvent, OrganizerFinished, OrganizerHandle, OrganizerOptions,
+        OrganizerPreview, OrganizerProgress, PersonalFolder, build_preview,
+        spawn_organizer_transfer,
+    },
     scan_cache::{
         ScanCacheEntry, default_cache_db_path, delete_scan_cache_by_root_key, format_saved_at_time,
         get_cache_db_size, list_scan_cache_entries, load_latest_scan, load_scan_cache_by_root_key,
@@ -98,6 +103,17 @@ pub struct CDriveManagerApp {
     estimated_total_dirs: Option<u64>,
     estimated_total_files: Option<u64>,
     quick_scan_complete: bool,
+    // Personal file organizer state
+    organizer_target_root: String,
+    organizer_enabled_folders: std::collections::HashSet<PersonalFolder>,
+    organizer_conflict_strategy: ConflictStrategy,
+    organizer_preview: Option<Arc<OrganizerPreview>>,
+    organizer_handle: Option<OrganizerHandle>,
+    organizer_in_progress: bool,
+    organizer_cancel_requested: bool,
+    organizer_progress: Option<OrganizerProgress>,
+    organizer_finished: Option<OrganizerFinished>,
+    organizer_window_open: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -294,6 +310,24 @@ impl CDriveManagerApp {
             estimated_total_dirs: None,
             estimated_total_files: None,
             quick_scan_complete: false,
+            // Organizer defaults
+            organizer_target_root: String::new(),
+            organizer_enabled_folders: std::collections::HashSet::from([
+                PersonalFolder::Desktop,
+                PersonalFolder::Documents,
+                PersonalFolder::Downloads,
+                PersonalFolder::Pictures,
+                PersonalFolder::Videos,
+                PersonalFolder::Music,
+            ]),
+            organizer_conflict_strategy: ConflictStrategy::Skip,
+            organizer_preview: None,
+            organizer_handle: None,
+            organizer_in_progress: false,
+            organizer_cancel_requested: false,
+            organizer_progress: None,
+            organizer_finished: None,
+            organizer_window_open: false,
         }
     }
 
@@ -528,6 +562,112 @@ impl CDriveManagerApp {
             handle.cancel();
             self.ai_analysis_cancel_requested = true;
             self.status_message = "正在取消 AI 分析审核，已生成的报告会保留……".to_owned();
+        }
+    }
+
+    fn start_organizer_preview(&mut self) {
+        let target = PathBuf::from(self.organizer_target_root.trim());
+        if !target.exists() || !target.is_dir() {
+            self.status_message = "请选择有效的目标数据盘根目录。".to_owned();
+            return;
+        }
+
+        let enabled: Vec<PersonalFolder> = self.organizer_enabled_folders.iter().copied().collect();
+        if enabled.is_empty() {
+            self.status_message = "请至少勾选一个要转移的个人文件夹类型。".to_owned();
+            return;
+        }
+
+        let options = OrganizerOptions {
+            target_root: target,
+            enabled_folders: enabled,
+            conflict_strategy: self.organizer_conflict_strategy,
+            preview_item_cap: 1000,
+        };
+
+        match build_preview(&options) {
+            Ok(preview) => {
+                let arc = Arc::new(preview);
+                self.status_message = format!(
+                    "已生成转移预览：{} 个文件夹、{} 个文件、共 {}",
+                    arc.enabled_folder_count(),
+                    arc.total_items,
+                    format::bytes(arc.total_size)
+                );
+                self.organizer_preview = Some(arc);
+            }
+            Err(error) => {
+                self.status_message = format!("生成转移预览失败：{:#}", error);
+            }
+        }
+    }
+
+    fn start_organizer_transfer(&mut self) {
+        let Some(preview) = self.organizer_preview.as_ref().map(Arc::clone) else {
+            self.status_message = "请先生成转移预览。".to_owned();
+            return;
+        };
+
+        self.organizer_handle = Some(spawn_organizer_transfer(preview));
+        self.organizer_in_progress = true;
+        self.organizer_cancel_requested = false;
+        self.organizer_progress = None;
+        self.organizer_finished = None;
+        self.status_message = "正在转移个人文件（复制并验证后删除源文件）……".to_owned();
+    }
+
+    fn cancel_organizer_transfer(&mut self) {
+        if let Some(handle) = &self.organizer_handle {
+            handle.cancel();
+            self.organizer_cancel_requested = true;
+            self.status_message = "正在取消文件转移，已转移的文件会保留……".to_owned();
+        }
+    }
+
+    fn poll_organizer_events(&mut self, ctx: &egui::Context) {
+        let Some(handle) = &self.organizer_handle else {
+            return;
+        };
+        let receiver = &handle.receiver;
+
+        let mut latest_progress = None;
+        let mut finished = None;
+
+        while let Ok(event) = receiver.try_recv() {
+            match event {
+                OrganizerEvent::Progress(progress) => latest_progress = Some(progress),
+                OrganizerEvent::Finished(result) => finished = Some(result),
+            }
+        }
+
+        if let Some(progress) = latest_progress {
+            self.organizer_progress = Some(progress);
+        }
+
+        if let Some(result) = finished {
+            self.organizer_in_progress = false;
+            self.organizer_handle = None;
+
+            if result.cancelled {
+                self.status_message = "文件转移已取消。".to_owned();
+            } else if result.error_count > 0 {
+                self.status_message = format!(
+                    "转移完成：成功 {}、跳过 {}、失败 {}。请查看报告中的失败详情。",
+                    result.success_count, result.skipped_count, result.error_count
+                );
+            } else {
+                self.status_message = format!(
+                    "转移完成：成功 {} 个文件、共 {}。源文件已删除。",
+                    result.success_count,
+                    format::bytes(result.moved_bytes)
+                );
+            }
+
+            self.organizer_finished = Some(result);
+        }
+
+        if self.organizer_in_progress {
+            ctx.request_repaint_after(Duration::from_millis(120));
         }
     }
 
@@ -1357,7 +1497,8 @@ impl CDriveManagerApp {
                 let busy = self.scan_in_progress
                     || self.cleanup_in_progress
                     || self.duplicate_in_progress
-                    || self.ai_analysis_in_progress;
+                    || self.ai_analysis_in_progress
+                    || self.organizer_in_progress;
                 ui.heading("C 盘空间管理器");
                 ui.separator();
                 ui.label("扫描目录：");
@@ -1595,6 +1736,16 @@ impl CDriveManagerApp {
                     .clicked()
                 {
                     self.open_cache_manager();
+                }
+
+                ui.separator();
+
+                if ui
+                    .add_enabled(!busy, egui::Button::new("个人文件整理"))
+                    .on_hover_text("将桌面、文档、下载等个人数据转移到其他盘")
+                    .clicked()
+                {
+                    self.organizer_window_open = true;
                 }
 
                 if busy {
@@ -2430,6 +2581,337 @@ impl CDriveManagerApp {
         }
     }
 
+    fn draw_organizer_window(&mut self, ctx: &egui::Context) {
+        if !self.organizer_window_open {
+            return;
+        }
+
+        // Collect read-only state before the UI closure
+        let organizer_in_progress = self.organizer_in_progress;
+        let organizer_cancel_requested = self.organizer_cancel_requested;
+        let organizer_preview = self.organizer_preview.clone();
+        let organizer_progress = self.organizer_progress.clone();
+        let organizer_finished = self.organizer_finished.clone();
+
+        // Mutable state for UI interactions
+        let mut window_open = self.organizer_window_open;
+        let mut target_root = self.organizer_target_root.clone();
+        let mut enabled_folders = self.organizer_enabled_folders.clone();
+        let mut conflict_strategy = self.organizer_conflict_strategy;
+        let mut start_preview_clicked = false;
+        let mut start_transfer_clicked = false;
+        let mut cancel_transfer_clicked = false;
+        let mut choose_directory_clicked = false;
+
+        let all_folders = [
+            PersonalFolder::Desktop,
+            PersonalFolder::Documents,
+            PersonalFolder::Downloads,
+            PersonalFolder::Pictures,
+            PersonalFolder::Videos,
+            PersonalFolder::Music,
+            PersonalFolder::Favorites,
+        ];
+
+        // Collect folder info for display
+        let folder_infos: Vec<(PersonalFolder, Option<PathBuf>, bool)> = all_folders
+            .iter()
+            .map(|f| {
+                let source = f.default_path();
+                let exists = source.as_ref().map_or(false, |p| p.exists());
+                (*f, source, exists)
+            })
+            .collect();
+
+        egui::Window::new("个人文件整理 - 将 C 盘个人数据转移到其他盘")
+            .open(&mut window_open)
+            .default_size([720.0, 560.0])
+            .resizable(true)
+            .show(ctx, |ui| {
+                ui.label(
+                    RichText::new(
+                        "将桌面、文档、下载等文件夹中的个人数据文件复制到指定盘的数据目录中。",
+                    )
+                    .small(),
+                );
+                ui.label(
+                    RichText::new("转移采用「复制 + 校验 + 删除源文件」模式，确保数据安全。")
+                        .small()
+                        .weak(),
+                );
+
+                ui.add_space(6.0);
+                ui.separator();
+                ui.add_space(6.0);
+
+                // Target directory selector
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("目标数据盘目录：").strong());
+                    ui.text_edit_singleline(&mut target_root);
+                    if ui.button("选择目录").clicked() {
+                        choose_directory_clicked = true;
+                    }
+                });
+
+                ui.add_space(8.0);
+                ui.label(RichText::new("选择要转移的个人文件夹：").strong());
+                ui.add_space(4.0);
+
+                for (folder, source, exists) in &folder_infos {
+                    if !exists {
+                        continue;
+                    }
+                    let Some(source_path) = source else {
+                        ui.label(
+                            RichText::new(format!(
+                                "  {} {} (无法定位源路径)",
+                                folder.icon(),
+                                folder.label()
+                            ))
+                            .color(egui::Color32::from_gray(120)),
+                        );
+                        continue;
+                    };
+
+                    let mut enabled = enabled_folders.contains(folder);
+                    let response = ui.checkbox(
+                        &mut enabled,
+                        format!(
+                            "{} {}  {}",
+                            folder.icon(),
+                            folder.label(),
+                            source_path.display()
+                        ),
+                    );
+                    if response.changed() {
+                        if enabled {
+                            enabled_folders.insert(*folder);
+                        } else {
+                            enabled_folders.remove(folder);
+                        }
+                    }
+                }
+
+                ui.add_space(8.0);
+                ui.separator();
+                ui.add_space(6.0);
+
+                // Conflict strategy
+                ui.label(RichText::new("遇到同名文件时的处理方式：").strong());
+                ui.add_space(4.0);
+                for strategy in [
+                    ConflictStrategy::Skip,
+                    ConflictStrategy::Overwrite,
+                    ConflictStrategy::RenameNew,
+                    ConflictStrategy::KeepNewer,
+                ] {
+                    let selected = conflict_strategy == strategy;
+                    if ui.selectable_label(selected, strategy.label()).clicked() {
+                        conflict_strategy = strategy;
+                    }
+                }
+
+                ui.add_space(10.0);
+                ui.separator();
+                ui.add_space(6.0);
+
+                // Preview / transfer controls
+                ui.horizontal(|ui| {
+                    if ui
+                        .add_enabled(
+                            !organizer_in_progress && !target_root.is_empty(),
+                            egui::Button::new("生成转移预览"),
+                        )
+                        .on_hover_text("分析源目录文件，显示转移预览（不会移动任何文件）")
+                        .clicked()
+                    {
+                        start_preview_clicked = true;
+                    }
+
+                    let preview_ready = organizer_preview.is_some() && !organizer_in_progress;
+                    if ui
+                        .add_enabled(
+                            preview_ready,
+                            egui::Button::new(
+                                RichText::new("开始转移")
+                                    .strong()
+                                    .color(egui::Color32::from_rgb(255, 140, 60)),
+                            ),
+                        )
+                        .on_hover_text("复制文件到目标盘，验证后删除源文件")
+                        .clicked()
+                    {
+                        start_transfer_clicked = true;
+                    }
+
+                    if organizer_in_progress && !organizer_cancel_requested {
+                        if ui.button("取消转移").clicked() {
+                            cancel_transfer_clicked = true;
+                        }
+                    }
+                });
+
+                ui.add_space(8.0);
+
+                // Preview summary
+                if let Some(preview) = &organizer_preview {
+                    ui.group(|ui| {
+                        ui.label(RichText::new("转移预览：").strong());
+                        ui.add_space(2.0);
+                        ui.label(format!("目标目录：{}", preview.target_root.display()));
+                        ui.label(format!(
+                            "文件夹类型：{} 种、文件：{} 个、总大小：{}",
+                            preview.enabled_folder_count(),
+                            preview.total_items,
+                            format::bytes(preview.total_size)
+                        ));
+                        if preview.total_conflicts > 0 {
+                            ui.label(
+                                RichText::new(format!(
+                                    "⚠ 冲突文件：{} 个（按当前策略处理）",
+                                    preview.total_conflicts
+                                ))
+                                .color(egui::Color32::from_rgb(255, 200, 100)),
+                            );
+                        }
+                        ui.add_space(4.0);
+                        ui.label(
+                            RichText::new(
+                                "⚠ 转移会复制文件到目标盘并删除源文件，请确认目标盘容量充足。",
+                            )
+                            .color(egui::Color32::from_rgb(255, 180, 80))
+                            .small(),
+                        );
+                    });
+
+                    ui.add_space(6.0);
+
+                    // Folder summary table
+                    egui::Grid::new("organizer_folder_summary")
+                        .num_columns(5)
+                        .spacing([8.0, 4.0])
+                        .striped(true)
+                        .show(ui, |ui| {
+                            ui.label(RichText::new("类型").strong());
+                            ui.label(RichText::new("源目录").strong());
+                            ui.label(RichText::new("目标目录").strong());
+                            ui.label(RichText::new("文件数").strong());
+                            ui.label(RichText::new("大小").strong());
+                            ui.end_row();
+
+                            for folder in &preview.folders {
+                                ui.label(folder.folder.label());
+                                ui.label(
+                                    RichText::new(folder.source_path.display().to_string()).small(),
+                                );
+                                ui.label(
+                                    RichText::new(folder.target_path.display().to_string()).small(),
+                                );
+                                ui.label(format!("{}", folder.file_count));
+                                ui.label(format::bytes(folder.total_size));
+                                ui.end_row();
+                            }
+                        });
+                }
+
+                // Transfer progress
+                if let Some(progress) = &organizer_progress {
+                    ui.add_space(8.0);
+                    ui.group(|ui| {
+                        ui.label(RichText::new("转移进度：").strong());
+                        let ratio = if progress.total_bytes > 0 {
+                            progress.processed_bytes as f32 / progress.total_bytes as f32
+                        } else if progress.total_items > 0 {
+                            progress.processed_items as f32 / progress.total_items as f32
+                        } else {
+                            0.0
+                        };
+                        ui.add(egui::ProgressBar::new(ratio).text(format!(
+                            "{} / {}  ({})",
+                            progress.processed_items,
+                            progress.total_items,
+                            format::bytes(progress.processed_bytes)
+                        )));
+                        ui.label(format!("当前：{}", progress.current_source.display()));
+                        ui.label(format!(
+                            "成功：{}  跳过：{}  失败：{}",
+                            progress.success_count, progress.skipped_count, progress.error_count
+                        ));
+                    });
+                }
+
+                // Transfer finished report
+                if let Some(result) = &organizer_finished {
+                    ui.add_space(8.0);
+                    ui.group(|ui| {
+                        ui.label(RichText::new("转移结果：").strong());
+                        ui.label(format!(
+                            "成功：{}  跳过：{}  失败：{}",
+                            result.success_count, result.skipped_count, result.error_count
+                        ));
+                        ui.label(format!("转移大小：{}", format::bytes(result.moved_bytes)));
+
+                        if !result.errors.is_empty() {
+                            ui.add_space(4.0);
+                            ui.label(
+                                RichText::new("失败详情：")
+                                    .strong()
+                                    .color(egui::Color32::from_rgb(255, 120, 120)),
+                            );
+                            egui::ScrollArea::vertical()
+                                .max_height(140.0)
+                                .show(ui, |ui| {
+                                    for error in &result.errors {
+                                        ui.label(
+                                            RichText::new(format!(
+                                                "• {} → {}",
+                                                error.source.display(),
+                                                error.target.display()
+                                            ))
+                                            .small(),
+                                        );
+                                        ui.label(
+                                            RichText::new(format!("  {}", error.message))
+                                                .small()
+                                                .weak(),
+                                        );
+                                    }
+                                });
+                        }
+                    });
+                }
+            });
+
+        // Write back state changes after the UI closure
+        self.organizer_window_open = window_open;
+        self.organizer_target_root = target_root;
+        self.organizer_enabled_folders = enabled_folders;
+        self.organizer_conflict_strategy = conflict_strategy;
+
+        // Handle directory picker
+        if choose_directory_clicked {
+            let mut dialog = FileDialog::new().set_title("选择目标数据盘目录");
+            let current = PathBuf::from(self.organizer_target_root.trim());
+            if current.is_dir() {
+                dialog = dialog.set_directory(current);
+            }
+            if let Some(path) = dialog.pick_folder() {
+                self.organizer_target_root = path.display().to_string();
+            }
+        }
+
+        // Handle button clicks
+        if start_preview_clicked {
+            self.start_organizer_preview();
+        }
+        if start_transfer_clicked {
+            self.start_organizer_transfer();
+        }
+        if cancel_transfer_clicked {
+            self.cancel_organizer_transfer();
+        }
+    }
+
     fn draw_tabs(&mut self, ui: &mut egui::Ui, stats: &ScanStats) {
         ui.horizontal(|ui| {
             tab_button(
@@ -2974,8 +3456,10 @@ impl eframe::App for CDriveManagerApp {
         self.poll_cleanup_preview_events(ctx);
         self.poll_duplicate_preview_events(ctx);
         self.poll_ai_analysis_events(ctx);
+        self.poll_organizer_events(ctx);
         self.draw_top_bar(ctx);
         self.draw_cache_manager_window(ctx);
+        self.draw_organizer_window(ctx);
 
         egui::CentralPanel::default().show(ctx, |ui| {
             let Some(stats) = self.current_stats() else {
