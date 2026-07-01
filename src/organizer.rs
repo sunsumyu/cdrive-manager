@@ -565,7 +565,67 @@ fn run_transfer(
     let mut moved_bytes = 0u64;
     let mut errors = Vec::new();
 
-    for item in &preview.items {
+    // Phase 1: create every destination root and subdirectory first.
+    // This preserves empty directories and makes subfolder support explicit.
+    let mut directory_items: Vec<&OrganizerItem> = preview
+        .items
+        .iter()
+        .filter(|item| item.is_directory)
+        .collect();
+    directory_items.sort_by_key(|item| item.source_path.components().count());
+
+    for folder in &preview.folders {
+        if cancel_flag.load(Ordering::Relaxed) {
+            break;
+        }
+        if let Err(error) = std::fs::create_dir_all(&folder.target_path) {
+            error_count += 1;
+            errors.push(OrganizerError {
+                source: folder.source_path.clone(),
+                target: folder.target_path.clone(),
+                message: format!("创建目标根目录失败：{}", error),
+            });
+        }
+    }
+
+    for item in &directory_items {
+        if cancel_flag.load(Ordering::Relaxed) {
+            break;
+        }
+
+        // Directories are not copied like files: create_dir_all is idempotent and should
+        // succeed even when the directory already exists. Do not apply file conflict
+        // strategies to directories, otherwise empty folders can be skipped incorrectly.
+        match std::fs::create_dir_all(&item.target_path) {
+            Ok(()) => success_count += 1,
+            Err(error) => {
+                error_count += 1;
+                errors.push(OrganizerError {
+                    source: item.source_path.clone(),
+                    target: item.target_path.clone(),
+                    message: format!("创建子目录失败：{}", error),
+                });
+            }
+        }
+        processed_items += 1;
+        emit_progress(
+            sender,
+            processed_items,
+            processed_bytes,
+            preview,
+            &item.source_path,
+            &item.target_path,
+            success_count,
+            skipped_count,
+            error_count,
+            false,
+            false,
+        );
+    }
+
+    // Phase 2: copy files. Parent folders already exist, but copy still creates parent
+    // directories defensively in case the target was removed during the operation.
+    for item in preview.items.iter().filter(|item| !item.is_directory) {
         if cancel_flag.load(Ordering::Relaxed) {
             break;
         }
@@ -607,88 +667,83 @@ fn run_transfer(
             false,
         );
 
-        if item.is_directory {
-            match std::fs::create_dir_all(&target) {
-                Ok(()) => success_count += 1,
-                Err(error) => {
-                    error_count += 1;
-                    errors.push(OrganizerError {
-                        source: item.source_path.clone(),
-                        target: target.clone(),
-                        message: format!("创建目录失败：{}", error),
-                    });
-                }
-            }
-            processed_items += 1;
-        } else {
-            // Use chunked copy with progress reporting and cancel support
-            match copy_file_with_progress(
-                &item.source_path,
-                &target,
-                item.size,
-                processed_bytes,
-                preview.total_size,
-                preview.total_items,
-                processed_items,
-                success_count,
-                skipped_count,
-                error_count,
-                sender,
-                cancel_flag,
-            ) {
-                Ok(Some(bytes_copied)) => {
-                    // Verify size matches before removing the source.
-                    let verify_ok = std::fs::metadata(&target)
-                        .ok()
-                        .map(|m| m.len() == bytes_copied);
+        match copy_file_with_progress(
+            &item.source_path,
+            &target,
+            item.size,
+            processed_bytes,
+            preview.total_size,
+            preview.total_items,
+            processed_items,
+            success_count,
+            skipped_count,
+            error_count,
+            sender,
+            cancel_flag,
+        ) {
+            Ok(Some(bytes_copied)) => {
+                // Verify size matches before removing the source.
+                let verify_ok = std::fs::metadata(&target)
+                    .ok()
+                    .map(|m| m.len() == bytes_copied);
 
-                    if verify_ok == Some(true) {
-                        if std::fs::remove_file(&item.source_path).is_ok() {
-                            success_count += 1;
-                            moved_bytes += bytes_copied;
-                        } else {
-                            // Copy succeeded but remove failed; count as success but warn.
-                            success_count += 1;
-                            moved_bytes += bytes_copied;
-                            errors.push(OrganizerError {
-                                source: item.source_path.clone(),
-                                target: target.clone(),
-                                message: "文件已复制，但删除源文件失败（文件仍保留在原位）"
-                                    .to_owned(),
-                            });
-                        }
+                if verify_ok == Some(true) {
+                    if std::fs::remove_file(&item.source_path).is_ok() {
+                        success_count += 1;
+                        moved_bytes += bytes_copied;
                     } else {
-                        error_count += 1;
+                        // Copy succeeded but remove failed; count as success but warn.
+                        success_count += 1;
+                        moved_bytes += bytes_copied;
                         errors.push(OrganizerError {
                             source: item.source_path.clone(),
                             target: target.clone(),
-                            message: "复制后大小校验失败，源文件已保留".to_owned(),
+                            message: "文件已复制，但删除源文件失败（文件仍保留在原位）".to_owned(),
                         });
                     }
-                }
-                Ok(None) => {
-                    // Cancelled during copy - stop processing remaining items
+                } else {
                     error_count += 1;
                     errors.push(OrganizerError {
                         source: item.source_path.clone(),
                         target: target.clone(),
-                        message: "复制被取消，源文件已保留".to_owned(),
-                    });
-                    processed_items += 1;
-                    processed_bytes += item.size;
-                    break;
-                }
-                Err(error) => {
-                    error_count += 1;
-                    errors.push(OrganizerError {
-                        source: item.source_path.clone(),
-                        target: target.clone(),
-                        message: format!("{}", error),
+                        message: "复制后大小校验失败，源文件已保留".to_owned(),
                     });
                 }
             }
-            processed_items += 1;
-            processed_bytes += item.size;
+            Ok(None) => {
+                // Cancelled during copy - stop processing remaining items.
+                error_count += 1;
+                errors.push(OrganizerError {
+                    source: item.source_path.clone(),
+                    target: target.clone(),
+                    message: "复制被取消，源文件已保留".to_owned(),
+                });
+                break;
+            }
+            Err(error) => {
+                error_count += 1;
+                errors.push(OrganizerError {
+                    source: item.source_path.clone(),
+                    target: target.clone(),
+                    message: format!("{}", error),
+                });
+            }
+        }
+        processed_items += 1;
+        processed_bytes += item.size;
+    }
+
+    // Phase 3: remove source directories that are now empty. Reverse depth order is
+    // required so children are removed before their parents. Non-empty directories are
+    // intentionally left in place.
+    if !cancel_flag.load(Ordering::Relaxed) {
+        let mut source_dirs: Vec<PathBuf> = directory_items
+            .iter()
+            .map(|item| item.source_path.clone())
+            .collect();
+        source_dirs.sort_by_key(|path| std::cmp::Reverse(path.components().count()));
+        for dir in source_dirs {
+            let _ = std::fs::remove_dir(&dir);
         }
     }
 
