@@ -317,6 +317,7 @@ pub struct OrganizerFinished {
     pub skipped_count: u64,
     pub error_count: u64,
     pub moved_bytes: u64,
+    pub verified_cleanup_count: u64,
     pub processed_items: u64,
     pub total_items: u64,
     pub errors: Vec<OrganizerError>,
@@ -563,6 +564,7 @@ fn run_transfer(
     let mut skipped_count = 0u64;
     let mut error_count = 0u64;
     let mut moved_bytes = 0u64;
+    let mut verified_cleanup_count = 0u64;
     let mut errors = Vec::new();
 
     // Phase 1: create every destination root and subdirectory first.
@@ -628,6 +630,46 @@ fn run_transfer(
     for item in preview.items.iter().filter(|item| !item.is_directory) {
         if cancel_flag.load(Ordering::Relaxed) {
             break;
+        }
+
+        // If a previous interrupted run already copied the same file to the target,
+        // verify content by hash and clean up the source safely. This handles the
+        // common "target exists but source was not deleted" recovery case.
+        if item.conflict == ConflictStatus::Exists
+            && item.target_path.is_file()
+            && files_identical(&item.source_path, &item.target_path).unwrap_or(false)
+        {
+            match std::fs::remove_file(&item.source_path) {
+                Ok(()) => {
+                    success_count += 1;
+                    verified_cleanup_count += 1;
+                    moved_bytes += item.size;
+                }
+                Err(error) => {
+                    error_count += 1;
+                    errors.push(OrganizerError {
+                        source: item.source_path.clone(),
+                        target: item.target_path.clone(),
+                        message: format!("目标文件已存在且内容一致，但删除源文件失败：{}", error),
+                    });
+                }
+            }
+            processed_items += 1;
+            processed_bytes += item.size;
+            emit_progress(
+                sender,
+                processed_items,
+                processed_bytes,
+                preview,
+                &item.source_path,
+                &item.target_path,
+                success_count,
+                skipped_count,
+                error_count,
+                false,
+                false,
+            );
+            continue;
         }
 
         let target = match resolve_conflict(item, preview.conflict_strategy) {
@@ -766,6 +808,7 @@ fn run_transfer(
         skipped_count,
         error_count,
         moved_bytes,
+        verified_cleanup_count,
         processed_items,
         total_items: preview.total_items,
         errors,
@@ -879,6 +922,41 @@ fn copy_file_with_progress(
         .with_context(|| format!("同步目标文件失败 {}", target.display()))?;
 
     Ok(Some(bytes_copied))
+}
+
+fn files_identical(left: &Path, right: &Path) -> Result<bool> {
+    let left_meta = std::fs::metadata(left)
+        .with_context(|| format!("无法读取源文件元数据 {}", left.display()))?;
+    let right_meta = std::fs::metadata(right)
+        .with_context(|| format!("无法读取目标文件元数据 {}", right.display()))?;
+
+    if !left_meta.is_file() || !right_meta.is_file() {
+        return Ok(false);
+    }
+    if left_meta.len() != right_meta.len() {
+        return Ok(false);
+    }
+
+    Ok(hash_file(left)? == hash_file(right)?)
+}
+
+fn hash_file(path: &Path) -> Result<blake3::Hash> {
+    let mut file = std::fs::File::open(path)
+        .with_context(|| format!("无法打开文件用于校验 {}", path.display()))?;
+    let mut hasher = blake3::Hasher::new();
+    let mut buffer = vec![0_u8; 128 * 1024];
+
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .with_context(|| format!("读取文件用于校验失败 {}", path.display()))?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+
+    Ok(hasher.finalize())
 }
 
 #[cfg(test)]

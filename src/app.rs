@@ -654,22 +654,27 @@ impl CDriveManagerApp {
 
             if result.cancelled || result.processed_items < result.total_items {
                 self.status_message = format!(
-                    "文件转移未完成：已处理 {}/{}，成功 {}、跳过 {}、失败 {}。源文件未完成部分仍保留。",
+                    "文件转移未完成：已处理 {}/{}，成功 {}、已验证清理 {}、跳过 {}、失败 {}。源文件未完成部分仍保留。",
                     result.processed_items,
                     result.total_items,
                     result.success_count,
+                    result.verified_cleanup_count,
                     result.skipped_count,
                     result.error_count
                 );
             } else if result.error_count > 0 {
                 self.status_message = format!(
-                    "转移已结束但有失败：成功 {}、跳过 {}、失败 {}。请查看报告中的失败详情。",
-                    result.success_count, result.skipped_count, result.error_count
+                    "转移已结束但有失败：成功 {}、已验证清理 {}、跳过 {}、失败 {}。请查看报告中的失败详情。",
+                    result.success_count,
+                    result.verified_cleanup_count,
+                    result.skipped_count,
+                    result.error_count
                 );
             } else {
                 self.status_message = format!(
-                    "转移完成：成功 {} 个文件、共 {}。源文件已删除。",
+                    "转移完成：成功 {} 个文件（其中已验证清理 {} 个）、共 {}。源文件已删除。",
                     result.success_count,
+                    result.verified_cleanup_count,
                     format::bytes(result.moved_bytes)
                 );
             }
@@ -2869,10 +2874,16 @@ impl CDriveManagerApp {
                             result.processed_items, result.total_items
                         ));
                         ui.label(format!(
-                            "成功：{}  跳过：{}  失败：{}",
-                            result.success_count, result.skipped_count, result.error_count
+                            "成功：{}  已验证清理：{}  跳过：{}  失败：{}",
+                            result.success_count,
+                            result.verified_cleanup_count,
+                            result.skipped_count,
+                            result.error_count
                         ));
-                        ui.label(format!("已转移大小：{}", format::bytes(result.moved_bytes)));
+                        ui.label(format!(
+                            "已转移/确认大小：{}",
+                            format::bytes(result.moved_bytes)
+                        ));
 
                         if !result.errors.is_empty() {
                             ui.add_space(4.0);
