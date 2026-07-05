@@ -31,9 +31,9 @@ use crate::{
         normalize_extension_filter,
     },
     organizer::{
-        ConflictStrategy, OrganizerEvent, OrganizerFinished, OrganizerHandle, OrganizerOptions,
-        OrganizerPreview, OrganizerProgress, PersonalFolder, build_preview,
-        spawn_organizer_transfer,
+        ConflictKind, ConflictResolution, ConflictStrategy, OrganizerEvent, OrganizerFinished,
+        OrganizerHandle, OrganizerOptions, OrganizerPreview, OrganizerProgress, PersonalFolder,
+        build_preview, spawn_organizer_transfer,
     },
     scan_cache::{
         ScanCacheEntry, default_cache_db_path, delete_scan_cache_by_root_key, format_saved_at_time,
@@ -103,10 +103,16 @@ pub struct CDriveManagerApp {
     estimated_total_dirs: Option<u64>,
     estimated_total_files: Option<u64>,
     quick_scan_complete: bool,
+    #[cfg(windows)]
+    mft_elevation_prompt: Option<MftElevationPrompt>,
+    // Right-side actions panel
+    actions_panel_visible: bool,
+    actions_panel_width: f32,
     // Personal file organizer state
     organizer_target_root: String,
     organizer_enabled_folders: std::collections::HashSet<PersonalFolder>,
     organizer_conflict_strategy: ConflictStrategy,
+    organizer_conflict_choices: std::collections::HashMap<String, ConflictResolution>,
     organizer_preview: Option<Arc<OrganizerPreview>>,
     organizer_handle: Option<OrganizerHandle>,
     organizer_in_progress: bool,
@@ -131,6 +137,56 @@ enum ResultTab {
 enum VisualizationMode {
     Treemap,
     Sunburst,
+}
+
+#[cfg(windows)]
+#[derive(Debug, Clone)]
+struct MftElevationPrompt {
+    root: String,
+    excluded_dirs: String,
+    excluded_extensions: String,
+    same_file_system: bool,
+}
+
+#[cfg(windows)]
+#[derive(Debug, Clone, Default)]
+struct MftStartupOptions {
+    auto_start_root: Option<String>,
+    excluded_dirs: String,
+    excluded_extensions: String,
+    same_file_system: bool,
+}
+
+#[cfg(windows)]
+impl MftStartupOptions {
+    fn from_env() -> Self {
+        let mut options = Self::default();
+        let mut args = std::env::args().skip(1);
+        while let Some(arg) = args.next() {
+            match arg.as_str() {
+                "--mft-scan-root" => {
+                    if let Some(value) = args.next() {
+                        options.auto_start_root = Some(value);
+                    }
+                }
+                "--scan-excluded-dirs" => {
+                    if let Some(value) = args.next() {
+                        options.excluded_dirs = value;
+                    }
+                }
+                "--scan-excluded-extensions" => {
+                    if let Some(value) = args.next() {
+                        options.excluded_extensions = value;
+                    }
+                }
+                "--scan-same-file-system" => {
+                    options.same_file_system = true;
+                }
+                _ => {}
+            }
+        }
+        options
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -254,8 +310,35 @@ const DEFAULT_DUPLICATE_MIN_SIZE_BYTES: u64 = 1024;
 
 impl CDriveManagerApp {
     pub fn new(_cc: &eframe::CreationContext<'_>) -> Self {
-        Self {
-            root_input: default_root(),
+        #[cfg(windows)]
+        let mft_startup_options = MftStartupOptions::from_env();
+        #[cfg(windows)]
+        let auto_start_mft = mft_startup_options.auto_start_root.is_some();
+        #[cfg(windows)]
+        let root_input = mft_startup_options
+            .auto_start_root
+            .clone()
+            .unwrap_or_else(default_root);
+        #[cfg(not(windows))]
+        let root_input = default_root();
+
+        #[cfg(windows)]
+        let scan_filter_excluded_dirs = mft_startup_options.excluded_dirs.clone();
+        #[cfg(not(windows))]
+        let scan_filter_excluded_dirs = String::new();
+
+        #[cfg(windows)]
+        let scan_filter_excluded_extensions = mft_startup_options.excluded_extensions.clone();
+        #[cfg(not(windows))]
+        let scan_filter_excluded_extensions = String::new();
+
+        #[cfg(windows)]
+        let scan_filter_same_file_system = mft_startup_options.same_file_system;
+        #[cfg(not(windows))]
+        let scan_filter_same_file_system = false;
+
+        let mut app = Self {
+            root_input,
             scan_handle: None,
             scan_in_progress: false,
             cancel_requested: false,
@@ -297,9 +380,9 @@ impl CDriveManagerApp {
             expanded_dirs: std::collections::HashSet::new(),
             color_palette: crate::color_palette::ColorPalette::new(),
             selected_extensions: std::collections::HashSet::new(),
-            scan_filter_excluded_dirs: String::new(),
-            scan_filter_excluded_extensions: String::new(),
-            scan_filter_same_file_system: false,
+            scan_filter_excluded_dirs,
+            scan_filter_excluded_extensions,
+            scan_filter_same_file_system,
             duplicate_min_size_bytes: DEFAULT_DUPLICATE_MIN_SIZE_BYTES,
             cache_manager_open: false,
             cache_entries: Vec::new(),
@@ -310,6 +393,10 @@ impl CDriveManagerApp {
             estimated_total_dirs: None,
             estimated_total_files: None,
             quick_scan_complete: false,
+            #[cfg(windows)]
+            mft_elevation_prompt: None,
+            actions_panel_visible: true,
+            actions_panel_width: 168.0,
             // Organizer defaults
             organizer_target_root: String::new(),
             organizer_enabled_folders: std::collections::HashSet::from([
@@ -326,6 +413,7 @@ impl CDriveManagerApp {
                 PersonalFolder::Searches,
             ]),
             organizer_conflict_strategy: ConflictStrategy::Skip,
+            organizer_conflict_choices: std::collections::HashMap::new(),
             organizer_preview: None,
             organizer_handle: None,
             organizer_in_progress: false,
@@ -333,7 +421,23 @@ impl CDriveManagerApp {
             organizer_progress: None,
             organizer_finished: None,
             organizer_window_open: false,
+        };
+
+        #[cfg(windows)]
+        if auto_start_mft {
+            if matches!(
+                crate::mft::windows_mft::current_privilege_status(),
+                crate::mft::windows_mft::MftPrivilegeStatus::Elevated
+            ) {
+                app.start_mft_scan();
+            } else {
+                app.status_message =
+                    "已收到 MFT 高速扫描启动参数，但当前仍不是管理员权限。请确认 UAC 授权后重试。"
+                        .to_owned();
+            }
         }
+
+        app
     }
 
     #[cfg(windows)]
@@ -397,9 +501,15 @@ impl CDriveManagerApp {
             privilege,
             crate::mft::windows_mft::MftPrivilegeStatus::NotElevated
         ) {
+            self.mft_elevation_prompt = Some(MftElevationPrompt {
+                root: root.display().to_string(),
+                excluded_dirs: self.scan_filter_excluded_dirs.clone(),
+                excluded_extensions: self.scan_filter_excluded_extensions.clone(),
+                same_file_system: self.scan_filter_same_file_system,
+            });
             self.status_message =
-                "当前进程不是管理员权限。MFT 可能会失败；如果失败将自动回退到多线程扫描。"
-                    .to_owned();
+                "MFT 高速扫描需要管理员权限，请在确认对话框中选择是否以管理员权限重启。".to_owned();
+            return;
         }
 
         let filter_config = self.build_scan_filter_config();
@@ -591,6 +701,15 @@ impl CDriveManagerApp {
 
         match build_preview(&options) {
             Ok(preview) => {
+                let valid_keys = preview
+                    .items
+                    .iter()
+                    .filter(|item| item.conflict_kind.needs_user_choice())
+                    .map(|item| item.conflict_key())
+                    .collect::<std::collections::HashSet<_>>();
+                self.organizer_conflict_choices
+                    .retain(|key, _| valid_keys.contains(key));
+
                 let arc = Arc::new(preview);
                 self.status_message = format!(
                     "已生成转移预览：{} 个文件夹、{} 个文件、共 {}",
@@ -607,12 +726,36 @@ impl CDriveManagerApp {
     }
 
     fn start_organizer_transfer(&mut self) {
-        let Some(preview) = self.organizer_preview.as_ref().map(Arc::clone) else {
+        let Some(preview_arc) = self.organizer_preview.as_ref().map(Arc::clone) else {
             self.status_message = "请先生成转移预览。".to_owned();
             return;
         };
 
-        self.organizer_handle = Some(spawn_organizer_transfer(preview));
+        let mut preview = (*preview_arc).clone();
+        let mut unresolved = 0usize;
+        for item in &mut preview.items {
+            if item.conflict_kind.needs_user_choice() {
+                let choice = self
+                    .organizer_conflict_choices
+                    .get(&item.conflict_key())
+                    .copied()
+                    .unwrap_or(ConflictResolution::Unresolved);
+                item.conflict_resolution = choice;
+                if choice == ConflictResolution::Unresolved {
+                    unresolved += 1;
+                }
+            }
+        }
+
+        if unresolved > 0 {
+            self.status_message = format!(
+                "还有 {} 个同名但内容不同的文件未选择处理方式，请先在冲突列表中选择。",
+                unresolved
+            );
+            return;
+        }
+
+        self.organizer_handle = Some(spawn_organizer_transfer(Arc::new(preview)));
         self.organizer_in_progress = true;
         self.organizer_cancel_requested = false;
         self.organizer_progress = None;
@@ -1554,7 +1697,7 @@ impl CDriveManagerApp {
                     let mft_tooltip = if !is_drive_root {
                         "⚠️ MFT 扫描只支持驱动器根目录（如 C:\\）\n当前路径如果是 C:\\Users 这类子目录，请改用普通扫描"
                     } else if needs_admin {
-                        "⚠️ 当前程序不是管理员权限\nMFT 需要打开 \\\\.\\C: 这类原始卷，非管理员通常会收到 Windows 错误码 5（访问被拒绝）\n点击后仍会尝试，失败会自动回退到多线程扫描"
+                        "⚠️ MFT 高速扫描需要管理员权限\n点击后会先弹出确认对话框；确认后程序会请求 UAC 授权并以管理员权限重启"
                     } else {
                         "直接读取 NTFS MFT，速度极快\n当前已检测到管理员权限"
                     };
@@ -1594,175 +1737,20 @@ impl CDriveManagerApp {
 
                 ui.separator();
 
-                if ui
-                    .add_enabled(!busy, egui::Button::new("打开结果"))
-                    .clicked()
-                {
-                    self.open_scan_result();
-                }
-
-                if ui
-                    .add_enabled(!busy, egui::Button::new("打开缓存"))
-                    .clicked()
-                {
-                    self.open_cached_scan_result();
-                }
-
-                let has_final_stats = self.stats.is_some();
-                if ui
-                    .add_enabled(!busy && has_final_stats, egui::Button::new("保存结果"))
-                    .clicked()
-                {
-                    self.save_scan_result();
-                }
-
-                if ui
-                    .add_enabled(!busy && has_final_stats, egui::Button::new("导出 CSV"))
-                    .clicked()
-                {
-                    self.export_csv_report();
-                }
-
-                ui.separator();
-
-                if ui
-                    .add_enabled(
-                        !busy && has_final_stats && self.enabled_cleanup_rule_count() > 0,
-                        egui::Button::new("生成清理预览"),
-                    )
-                    .clicked()
-                {
-                    self.start_cleanup_preview();
-                }
-
-                if ui
-                    .add_enabled(
-                        self.cleanup_in_progress && !self.cleanup_cancel_requested,
-                        egui::Button::new("取消预览"),
-                    )
-                    .clicked()
-                {
-                    self.cancel_cleanup_preview();
-                }
-
-                if ui
-                    .add_enabled(
-                        !busy && self.current_cleanup_preview().is_some(),
-                        egui::Button::new("导出预览 CSV"),
-                    )
-                    .clicked()
-                {
-                    self.export_cleanup_preview_csv();
-                }
-
-                ui.separator();
-
-                if ui
-                    .add_enabled(!busy && has_final_stats, egui::Button::new("查找重复文件"))
-                    .clicked()
-                {
-                    self.start_duplicate_preview();
-                }
-
-                if ui
-                    .add_enabled(
-                        self.duplicate_in_progress && !self.duplicate_cancel_requested,
-                        egui::Button::new("取消重复检测"),
-                    )
-                    .clicked()
-                {
-                    self.cancel_duplicate_preview();
-                }
-
-                if ui
-                    .add_enabled(
-                        !busy && self.current_duplicate_preview().is_some(),
-                        egui::Button::new("导出重复 CSV"),
-                    )
-                    .clicked()
-                {
-                    self.export_duplicate_preview_csv();
-                }
-
-                ui.separator();
-
-                let has_ai_source =
-                    self.current_cleanup_preview().is_some() || self.current_duplicate_preview().is_some();
-                // AI 分析需要候选来源：清理预览或重复文件预览。
-                // 没有候选来源时仍允许点击，但会给出明确指引而不是一直灰色不可点。
-                let ai_button = if has_ai_source {
-                    egui::Button::new("AI 分析审核")
+                let actions_label = if self.actions_panel_visible {
+                    "操作 ⊡"
                 } else {
-                    egui::Button::new("AI 分析审核（需先建预览）")
-                };
-                let ai_enabled = !busy && has_final_stats;
-                let ai_tooltip = if has_ai_source {
-                    "基于清理预览和/或重复文件预览调用 OpenAI 兼容 API。只生成报告，不删除文件。"
-                } else if !has_final_stats {
-                    "请先完成一次扫描，再生成清理预览或重复文件预览，然后即可进行 AI 分析审核。"
-                } else {
-                    "AI 分析需要候选来源：请先点击\"生成清理预览\"或\"查找重复文件\"建立候选，再进行 AI 分析审核。"
+                    "操作 ▦"
                 };
                 if ui
-                    .add_enabled(ai_enabled, ai_button)
-                    .on_hover_text(ai_tooltip)
+                    .button(actions_label)
+                    .on_hover_text("显示/隐藏右侧操作面板")
                     .clicked()
                 {
-                    if has_ai_source {
-                        self.start_ai_analysis();
-                    } else {
-                        self.status_message = "AI 分析审核需要候选来源：请先点击\"生成清理预览\"或\"查找重复文件\"，再启动 AI 分析审核。".to_owned();
-                    }
-                }
-
-                if ui
-                    .add_enabled(
-                        self.ai_analysis_in_progress && !self.ai_analysis_cancel_requested,
-                        egui::Button::new("取消 AI 分析"),
-                    )
-                    .clicked()
-                {
-                    self.cancel_ai_analysis();
-                }
-
-                if ui
-                    .add_enabled(
-                        !busy && self.current_ai_analysis_report().is_some(),
-                        egui::Button::new("导出 AI 报告 CSV"),
-                    )
-                    .clicked()
-                {
-                    self.export_ai_analysis_report_csv();
-                }
-
-                if ui
-                    .add_enabled(
-                        !busy && self.current_ai_analysis_report().is_some(),
-                        egui::Button::new("导出待删清单 CSV"),
-                    )
-                    .clicked()
-                {
-                    self.export_ai_delete_list_csv();
+                    self.actions_panel_visible = !self.actions_panel_visible;
                 }
 
                 ui.separator();
-
-                if ui
-                    .add_enabled(!busy, egui::Button::new("缓存管理"))
-                    .clicked()
-                {
-                    self.open_cache_manager();
-                }
-
-                ui.separator();
-
-                if ui
-                    .add_enabled(!busy, egui::Button::new("个人文件整理"))
-                    .on_hover_text("将桌面、文档、下载等个人数据转移到其他盘")
-                    .clicked()
-                {
-                    self.organizer_window_open = true;
-                }
 
                 if busy {
                     ui.spinner();
@@ -1799,6 +1787,282 @@ impl CDriveManagerApp {
             });
             ui.label(RichText::new(&self.status_message).small());
         });
+    }
+
+    fn draw_actions_panel(&mut self, ctx: &egui::Context) {
+        // Collect read-only state before the UI closure to avoid &mut self borrow conflicts.
+        let busy = self.scan_in_progress
+            || self.cleanup_in_progress
+            || self.duplicate_in_progress
+            || self.ai_analysis_in_progress
+            || self.organizer_in_progress;
+        let has_final_stats = self.stats.is_some();
+        let cleanup_in_progress = self.cleanup_in_progress;
+        let cleanup_cancel_requested = self.cleanup_cancel_requested;
+        let has_cleanup_preview = self.current_cleanup_preview().is_some();
+        let cleanup_rule_count = self.enabled_cleanup_rule_count();
+        let duplicate_in_progress = self.duplicate_in_progress;
+        let duplicate_cancel_requested = self.duplicate_cancel_requested;
+        let has_duplicate_preview = self.current_duplicate_preview().is_some();
+        let ai_analysis_in_progress = self.ai_analysis_in_progress;
+        let ai_analysis_cancel_requested = self.ai_analysis_cancel_requested;
+        let has_ai_report = self.current_ai_analysis_report().is_some();
+        let has_ai_source = has_cleanup_preview || has_duplicate_preview;
+
+        let mut panel_width = self.actions_panel_width;
+
+        // Click flags collected inside the closure.
+        let mut open_result_clicked = false;
+        let mut open_cache_clicked = false;
+        let mut save_result_clicked = false;
+        let mut export_csv_clicked = false;
+        let mut start_cleanup_clicked = false;
+        let mut cancel_cleanup_clicked = false;
+        let mut export_cleanup_csv_clicked = false;
+        let mut start_duplicate_clicked = false;
+        let mut cancel_duplicate_clicked = false;
+        let mut export_duplicate_csv_clicked = false;
+        let mut start_ai_clicked = false;
+        let mut cancel_ai_clicked = false;
+        let mut export_ai_report_clicked = false;
+        let mut export_ai_delete_clicked = false;
+        let mut cache_manager_clicked = false;
+        let mut organizer_clicked = false;
+
+        egui::SidePanel::right("actions_panel")
+            .resizable(true)
+            .min_width(120.0)
+            .default_width(self.actions_panel_width)
+            .max_width(280.0)
+            .show(ctx, |ui| {
+                panel_width = ui.available_width();
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, true])
+                    .show(ui, |ui| {
+                        ui.add_space(4.0);
+
+                        // === 结果组 ===
+                        egui::CollapsingHeader::new("结果")
+                            .default_open(true)
+                            .show(ui, |ui| {
+                                if ui
+                                    .add_enabled(!busy, egui::Button::new("打开结果"))
+                                    .clicked()
+                                {
+                                    open_result_clicked = true;
+                                }
+                                if ui
+                                    .add_enabled(!busy, egui::Button::new("打开缓存"))
+                                    .clicked()
+                                {
+                                    open_cache_clicked = true;
+                                }
+                                if ui
+                                    .add_enabled(!busy && has_final_stats, egui::Button::new("保存结果"))
+                                    .clicked()
+                                {
+                                    save_result_clicked = true;
+                                }
+                                if ui
+                                    .add_enabled(!busy && has_final_stats, egui::Button::new("导出 CSV"))
+                                    .clicked()
+                                {
+                                    export_csv_clicked = true;
+                                }
+                            });
+
+                        ui.add_space(4.0);
+
+                        // === 分析组 ===
+                        egui::CollapsingHeader::new("分析")
+                            .default_open(true)
+                            .show(ui, |ui| {
+                                ui.label(RichText::new("清理预览").strong().small());
+                                if ui
+                                    .add_enabled(
+                                        !busy && has_final_stats && cleanup_rule_count > 0,
+                                        egui::Button::new("生成清理预览"),
+                                    )
+                                    .clicked()
+                                {
+                                    start_cleanup_clicked = true;
+                                }
+                                if ui
+                                    .add_enabled(
+                                        cleanup_in_progress && !cleanup_cancel_requested,
+                                        egui::Button::new("取消预览"),
+                                    )
+                                    .clicked()
+                                {
+                                    cancel_cleanup_clicked = true;
+                                }
+                                if ui
+                                    .add_enabled(
+                                        !busy && has_cleanup_preview,
+                                        egui::Button::new("导出预览 CSV"),
+                                    )
+                                    .clicked()
+                                {
+                                    export_cleanup_csv_clicked = true;
+                                }
+
+                                ui.add_space(4.0);
+                                ui.label(RichText::new("重复文件").strong().small());
+                                if ui
+                                    .add_enabled(!busy && has_final_stats, egui::Button::new("查找重复文件"))
+                                    .clicked()
+                                {
+                                    start_duplicate_clicked = true;
+                                }
+                                if ui
+                                    .add_enabled(
+                                        duplicate_in_progress && !duplicate_cancel_requested,
+                                        egui::Button::new("取消重复检测"),
+                                    )
+                                    .clicked()
+                                {
+                                    cancel_duplicate_clicked = true;
+                                }
+                                if ui
+                                    .add_enabled(
+                                        !busy && has_duplicate_preview,
+                                        egui::Button::new("导出重复 CSV"),
+                                    )
+                                    .clicked()
+                                {
+                                    export_duplicate_csv_clicked = true;
+                                }
+
+                                ui.add_space(4.0);
+                                ui.label(RichText::new("AI 审核").strong().small());
+                                let ai_button = if has_ai_source {
+                                    egui::Button::new("AI 分析审核")
+                                } else {
+                                    egui::Button::new("AI 分析审核（需先建预览）")
+                                };
+                                let ai_enabled = !busy && has_final_stats;
+                                let ai_tooltip = if has_ai_source {
+                                    "基于清理预览和/或重复文件预览调用 OpenAI 兼容 API。只生成报告，不删除文件。"
+                                } else if !has_final_stats {
+                                    "请先完成一次扫描，再生成清理预览或重复文件预览，然后即可进行 AI 分析审核。"
+                                } else {
+                                    "AI 分析需要候选来源：请先点击\"生成清理预览\"或\"查找重复文件\"建立候选，再进行 AI 分析审核。"
+                                };
+                                if ui
+                                    .add_enabled(ai_enabled, ai_button)
+                                    .on_hover_text(ai_tooltip)
+                                    .clicked()
+                                {
+                                    start_ai_clicked = true;
+                                }
+                                if ui
+                                    .add_enabled(
+                                        ai_analysis_in_progress && !ai_analysis_cancel_requested,
+                                        egui::Button::new("取消 AI 分析"),
+                                    )
+                                    .clicked()
+                                {
+                                    cancel_ai_clicked = true;
+                                }
+                                if ui
+                                    .add_enabled(
+                                        !busy && has_ai_report,
+                                        egui::Button::new("导出 AI 报告 CSV"),
+                                    )
+                                    .clicked()
+                                {
+                                    export_ai_report_clicked = true;
+                                }
+                                if ui
+                                    .add_enabled(
+                                        !busy && has_ai_report,
+                                        egui::Button::new("导出待删清单 CSV"),
+                                    )
+                                    .clicked()
+                                {
+                                    export_ai_delete_clicked = true;
+                                }
+                            });
+
+                        ui.add_space(4.0);
+
+                        // === 工具组 ===
+                        egui::CollapsingHeader::new("工具")
+                            .default_open(true)
+                            .show(ui, |ui| {
+                                if ui
+                                    .add_enabled(!busy, egui::Button::new("缓存管理"))
+                                    .clicked()
+                                {
+                                    cache_manager_clicked = true;
+                                }
+                                if ui
+                                    .add_enabled(!busy, egui::Button::new("个人文件整理"))
+                                    .on_hover_text("将桌面、文档、下载等个人数据转移到其他盘")
+                                    .clicked()
+                                {
+                                    organizer_clicked = true;
+                                }
+                            });
+                    });
+            });
+
+        // Persist the user-resized width.
+        self.actions_panel_width = panel_width;
+
+        // Apply clicks after the closure.
+        if open_result_clicked {
+            self.open_scan_result();
+        }
+        if open_cache_clicked {
+            self.open_cached_scan_result();
+        }
+        if save_result_clicked {
+            self.save_scan_result();
+        }
+        if export_csv_clicked {
+            self.export_csv_report();
+        }
+        if start_cleanup_clicked {
+            self.start_cleanup_preview();
+        }
+        if cancel_cleanup_clicked {
+            self.cancel_cleanup_preview();
+        }
+        if export_cleanup_csv_clicked {
+            self.export_cleanup_preview_csv();
+        }
+        if start_duplicate_clicked {
+            self.start_duplicate_preview();
+        }
+        if cancel_duplicate_clicked {
+            self.cancel_duplicate_preview();
+        }
+        if export_duplicate_csv_clicked {
+            self.export_duplicate_preview_csv();
+        }
+        if start_ai_clicked {
+            if has_ai_source {
+                self.start_ai_analysis();
+            } else {
+                self.status_message = "AI 分析审核需要候选来源：请先点击\"生成清理预览\"或\"查找重复文件\"，再启动 AI 分析审核。".to_owned();
+            }
+        }
+        if cancel_ai_clicked {
+            self.cancel_ai_analysis();
+        }
+        if export_ai_report_clicked {
+            self.export_ai_analysis_report_csv();
+        }
+        if export_ai_delete_clicked {
+            self.export_ai_delete_list_csv();
+        }
+        if cache_manager_clicked {
+            self.open_cache_manager();
+        }
+        if organizer_clicked {
+            self.organizer_window_open = true;
+        }
     }
 
     fn draw_progress_bar(&self, ui: &mut egui::Ui) {
@@ -2597,6 +2861,78 @@ impl CDriveManagerApp {
         }
     }
 
+    #[cfg(windows)]
+    fn draw_mft_elevation_dialog(&mut self, ctx: &egui::Context) {
+        let Some(prompt) = self.mft_elevation_prompt.clone() else {
+            return;
+        };
+
+        let mut open = true;
+        let mut confirm_restart = false;
+        let mut cancel = false;
+
+        egui::Window::new("MFT 高速扫描需要管理员权限")
+            .collapsible(false)
+            .resizable(false)
+            .open(&mut open)
+            .show(ctx, |ui| {
+                ui.label(RichText::new("需要以管理员权限重启程序").strong());
+                ui.add_space(6.0);
+                ui.label(format!("扫描目标：{}", prompt.root));
+                ui.label("MFT 高速扫描需要打开 Windows 原始卷（例如 \\\\.\\C:），普通权限无法访问。");
+                ui.label("点击确定后，系统会弹出 UAC 授权窗口；授权成功后会启动管理员实例并自动继续 MFT 高速扫描。");
+                ui.add_space(8.0);
+                ui.horizontal_wrapped(|ui| {
+                    if ui
+                        .button(RichText::new("确定，以管理员权限重启").strong())
+                        .clicked()
+                    {
+                        confirm_restart = true;
+                    }
+                    if ui.button("取消").clicked() {
+                        cancel = true;
+                    }
+                });
+            });
+
+        if confirm_restart {
+            match self.restart_for_mft_scan(&prompt) {
+                Ok(()) => {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                    self.mft_elevation_prompt = None;
+                    self.status_message =
+                        "已请求以管理员权限重启，请在 Windows UAC 窗口中确认。".to_owned();
+                }
+                Err(error) => {
+                    self.status_message = format!("请求管理员权限重启失败：{:#}", error);
+                }
+            }
+        } else if cancel || !open {
+            self.mft_elevation_prompt = None;
+            self.status_message = "已取消 MFT 高速扫描管理员重启。".to_owned();
+        }
+    }
+
+    #[cfg(not(windows))]
+    fn draw_mft_elevation_dialog(&mut self, _ctx: &egui::Context) {}
+
+    #[cfg(windows)]
+    fn restart_for_mft_scan(&self, prompt: &MftElevationPrompt) -> anyhow::Result<()> {
+        let mut arguments = vec!["--mft-scan-root".to_owned(), prompt.root.clone()];
+        if !prompt.excluded_dirs.is_empty() {
+            arguments.push("--scan-excluded-dirs".to_owned());
+            arguments.push(prompt.excluded_dirs.clone());
+        }
+        if !prompt.excluded_extensions.is_empty() {
+            arguments.push("--scan-excluded-extensions".to_owned());
+            arguments.push(prompt.excluded_extensions.clone());
+        }
+        if prompt.same_file_system {
+            arguments.push("--scan-same-file-system".to_owned());
+        }
+        crate::mft::windows_mft::restart_as_admin(&arguments)
+    }
+
     fn draw_organizer_window(&mut self, ctx: &egui::Context) {
         if !self.organizer_window_open {
             return;
@@ -2614,6 +2950,7 @@ impl CDriveManagerApp {
         let mut target_root = self.organizer_target_root.clone();
         let mut enabled_folders = self.organizer_enabled_folders.clone();
         let mut conflict_strategy = self.organizer_conflict_strategy;
+        let mut conflict_choices = self.organizer_conflict_choices.clone();
         let mut start_preview_clicked = false;
         let mut start_transfer_clicked = false;
         let mut cancel_transfer_clicked = false;
@@ -2787,7 +3124,7 @@ impl CDriveManagerApp {
                         if preview.total_conflicts > 0 {
                             ui.label(
                                 RichText::new(format!(
-                                    "⚠ 冲突文件：{} 个（按当前策略处理）",
+                                    "⚠ 同名/目标冲突：{} 个（内容不同的需要在下方选择）",
                                     preview.total_conflicts
                                 ))
                                 .color(egui::Color32::from_rgb(255, 200, 100)),
@@ -2831,6 +3168,117 @@ impl CDriveManagerApp {
                                 ui.end_row();
                             }
                         });
+                    let same_count = preview
+                        .items
+                        .iter()
+                        .filter(|item| item.conflict_kind == ConflictKind::Identical)
+                        .count();
+                    let need_choice_items: Vec<_> = preview
+                        .items
+                        .iter()
+                        .filter(|item| item.conflict_kind.needs_user_choice())
+                        .collect();
+                    let unresolved_count = need_choice_items
+                        .iter()
+                        .filter(|item| {
+                            conflict_choices
+                                .get(&item.conflict_key())
+                                .copied()
+                                .unwrap_or(ConflictResolution::Unresolved)
+                                == ConflictResolution::Unresolved
+                        })
+                        .count();
+                    if same_count > 0 || !need_choice_items.is_empty() {
+                        ui.add_space(6.0);
+                        ui.group(|ui| {
+                            ui.label(RichText::new("同名文件处理：").strong());
+                            if same_count > 0 {
+                                ui.label(format!(
+                                    "内容相同：{} 个，将自动保留目标文件并清理源文件。",
+                                    same_count
+                                ));
+                            }
+                            if !need_choice_items.is_empty() {
+                                ui.label(
+                                    RichText::new(format!(
+                                        "内容不同/目标冲突：{} 个，未选择：{} 个",
+                                        need_choice_items.len(),
+                                        unresolved_count
+                                    ))
+                                    .color(if unresolved_count > 0 {
+                                        egui::Color32::from_rgb(255, 180, 80)
+                                    } else {
+                                        egui::Color32::from_rgb(120, 200, 120)
+                                    }),
+                                );
+
+                                ui.horizontal_wrapped(|ui| {
+                                    if ui.button("全部保留源文件").clicked() {
+                                        for item in &need_choice_items {
+                                            conflict_choices.insert(
+                                                item.conflict_key(),
+                                                ConflictResolution::UseSource,
+                                            );
+                                        }
+                                    }
+                                    if ui.button("全部保留目标文件").clicked() {
+                                        for item in &need_choice_items {
+                                            conflict_choices.insert(
+                                                item.conflict_key(),
+                                                ConflictResolution::UseTarget,
+                                            );
+                                        }
+                                    }
+                                    if ui.button("全部两者都保留").clicked() {
+                                        for item in &need_choice_items {
+                                            conflict_choices.insert(
+                                                item.conflict_key(),
+                                                ConflictResolution::KeepBoth,
+                                            );
+                                        }
+                                    }
+                                });
+
+                                egui::ScrollArea::vertical()
+                                    .max_height(220.0)
+                                    .show(ui, |ui| {
+                                        for item in need_choice_items.iter().take(200) {
+                                            let key = item.conflict_key();
+                                            let current = conflict_choices
+                                                .get(&key)
+                                                .copied()
+                                                .unwrap_or(ConflictResolution::Unresolved);
+                                            ui.group(|ui| {
+                                                ui.label(RichText::new(item.conflict_kind.label()).strong());
+                                                ui.label(format!("源：{}", item.source_path.display()));
+                                                ui.label(format!("目标：{}", item.target_path.display()));
+                                                ui.label(format!("大小：{}", format::bytes(item.size)));
+                                                ui.horizontal_wrapped(|ui| {
+                                                    for choice in [
+                                                        ConflictResolution::UseSource,
+                                                        ConflictResolution::UseTarget,
+                                                        ConflictResolution::KeepBoth,
+                                                    ] {
+                                                        if ui
+                                                            .selectable_label(current == choice, choice.label())
+                                                            .clicked()
+                                                        {
+                                                            conflict_choices.insert(key.clone(), choice);
+                                                        }
+                                                    }
+                                                });
+                                            });
+                                        }
+                                        if need_choice_items.len() > 200 {
+                                            ui.label(format!(
+                                                "仅显示前 200 个冲突；剩余 {} 个也需要选择后才能开始转移。",
+                                                need_choice_items.len() - 200
+                                            ));
+                                        }
+                                    });
+                            }
+                        });
+                    }
                 }
 
                 // Transfer progress
@@ -2921,6 +3369,7 @@ impl CDriveManagerApp {
         self.organizer_target_root = target_root;
         self.organizer_enabled_folders = enabled_folders;
         self.organizer_conflict_strategy = conflict_strategy;
+        self.organizer_conflict_choices = conflict_choices;
 
         // Handle directory picker
         if choose_directory_clicked {
@@ -3492,8 +3941,12 @@ impl eframe::App for CDriveManagerApp {
         self.poll_ai_analysis_events(ctx);
         self.poll_organizer_events(ctx);
         self.draw_top_bar(ctx);
+        self.draw_mft_elevation_dialog(ctx);
         self.draw_cache_manager_window(ctx);
         self.draw_organizer_window(ctx);
+        if self.actions_panel_visible {
+            self.draw_actions_panel(ctx);
+        }
 
         egui::CentralPanel::default().show(ctx, |ui| {
             let Some(stats) = self.current_stats() else {
