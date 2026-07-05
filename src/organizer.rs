@@ -236,12 +236,67 @@ pub struct OrganizerItem {
     pub modified: Option<std::time::SystemTime>,
     pub is_directory: bool,
     pub conflict: ConflictStatus,
+    pub conflict_kind: ConflictKind,
+    pub conflict_resolution: ConflictResolution,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ConflictStatus {
     None,
     Exists,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ConflictKind {
+    None,
+    Identical,
+    Different,
+    TargetIsDirectory,
+    PlannedDuplicate,
+}
+
+impl ConflictKind {
+    pub fn needs_user_choice(self) -> bool {
+        matches!(
+            self,
+            Self::Different | Self::TargetIsDirectory | Self::PlannedDuplicate
+        )
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::None => "无冲突",
+            Self::Identical => "内容相同，自动清理源文件",
+            Self::Different => "内容不同，需要选择",
+            Self::TargetIsDirectory => "目标是目录，需要选择",
+            Self::PlannedDuplicate => "多个源文件目标相同，需要选择",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ConflictResolution {
+    Unresolved,
+    UseSource,
+    UseTarget,
+    KeepBoth,
+}
+
+impl Default for ConflictResolution {
+    fn default() -> Self {
+        Self::Unresolved
+    }
+}
+
+impl ConflictResolution {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Unresolved => "未选择",
+            Self::UseSource => "保留源文件（覆盖目标）",
+            Self::UseTarget => "保留目标文件（删除源）",
+            Self::KeepBoth => "两者都保留（重命名源）",
+        }
+    }
 }
 
 impl OrganizerItem {
@@ -251,6 +306,14 @@ impl OrganizerItem {
 
     pub fn display_target(&self) -> String {
         self.target_path.display().to_string()
+    }
+
+    pub fn conflict_key(&self) -> String {
+        format!(
+            "{}\n{}",
+            self.source_path.to_string_lossy().to_ascii_lowercase(),
+            self.target_path.to_string_lossy().to_ascii_lowercase()
+        )
     }
 }
 
@@ -441,10 +504,18 @@ pub fn build_preview(options: &OrganizerOptions) -> Result<OrganizerPreview> {
                 let size = if is_directory { 0 } else { metadata.len() };
                 let modified = metadata.modified().ok();
                 let target_key = target_path.to_string_lossy().to_ascii_lowercase();
-                let conflict = if target_path.exists() || planned_targets.contains(&target_key) {
+                let planned_duplicate = planned_targets.contains(&target_key);
+                let conflict = if target_path.exists() || planned_duplicate {
                     ConflictStatus::Exists
                 } else {
                     ConflictStatus::None
+                };
+                let conflict_kind =
+                    analyze_conflict(entry.path(), &target_path, is_directory, planned_duplicate);
+                let conflict_resolution = if conflict_kind == ConflictKind::Identical {
+                    ConflictResolution::UseTarget
+                } else {
+                    ConflictResolution::Unresolved
                 };
                 planned_targets.insert(target_key);
 
@@ -471,6 +542,8 @@ pub fn build_preview(options: &OrganizerOptions) -> Result<OrganizerPreview> {
                     modified,
                     is_directory,
                     conflict,
+                    conflict_kind,
+                    conflict_resolution,
                 });
             }
 
@@ -489,6 +562,31 @@ pub fn build_preview(options: &OrganizerOptions) -> Result<OrganizerPreview> {
         total_size,
         total_conflicts,
     })
+}
+
+fn analyze_conflict(
+    source_path: &Path,
+    target_path: &Path,
+    is_directory: bool,
+    planned_duplicate: bool,
+) -> ConflictKind {
+    if planned_duplicate {
+        return ConflictKind::PlannedDuplicate;
+    }
+    if !target_path.exists() {
+        return ConflictKind::None;
+    }
+    if is_directory {
+        return ConflictKind::TargetIsDirectory;
+    }
+    if !target_path.is_file() {
+        return ConflictKind::TargetIsDirectory;
+    }
+
+    match files_identical(source_path, target_path) {
+        Ok(true) => ConflictKind::Identical,
+        Ok(false) | Err(_) => ConflictKind::Different,
+    }
 }
 
 /// Compute the effective target path for an item according to the conflict strategy.
@@ -632,13 +730,7 @@ fn run_transfer(
             break;
         }
 
-        // If a previous interrupted run already copied the same file to the target,
-        // verify content by hash and clean up the source safely. This handles the
-        // common "target exists but source was not deleted" recovery case.
-        if item.conflict == ConflictStatus::Exists
-            && item.target_path.is_file()
-            && files_identical(&item.source_path, &item.target_path).unwrap_or(false)
-        {
+        if item.conflict_kind == ConflictKind::Identical {
             match std::fs::remove_file(&item.source_path) {
                 Ok(()) => {
                     success_count += 1;
@@ -672,7 +764,73 @@ fn run_transfer(
             continue;
         }
 
-        let target = match resolve_conflict(item, preview.conflict_strategy) {
+        let target = if item.conflict_kind.needs_user_choice() {
+            match item.conflict_resolution {
+                ConflictResolution::UseSource => Some(item.target_path.clone()),
+                ConflictResolution::KeepBoth => rename_with_suffix(&item.target_path),
+                ConflictResolution::UseTarget => {
+                    match std::fs::remove_file(&item.source_path) {
+                        Ok(()) => {
+                            success_count += 1;
+                            verified_cleanup_count += 1;
+                            moved_bytes += item.size;
+                        }
+                        Err(error) => {
+                            error_count += 1;
+                            errors.push(OrganizerError {
+                                source: item.source_path.clone(),
+                                target: item.target_path.clone(),
+                                message: format!("已选择保留目标文件，但删除源文件失败：{}", error),
+                            });
+                        }
+                    }
+                    processed_items += 1;
+                    processed_bytes += item.size;
+                    emit_progress(
+                        sender,
+                        processed_items,
+                        processed_bytes,
+                        preview,
+                        &item.source_path,
+                        &item.target_path,
+                        success_count,
+                        skipped_count,
+                        error_count,
+                        false,
+                        false,
+                    );
+                    continue;
+                }
+                ConflictResolution::Unresolved => {
+                    error_count += 1;
+                    errors.push(OrganizerError {
+                        source: item.source_path.clone(),
+                        target: item.target_path.clone(),
+                        message: "同名文件内容不同，尚未选择保留哪一个".to_owned(),
+                    });
+                    processed_items += 1;
+                    processed_bytes += item.size;
+                    emit_progress(
+                        sender,
+                        processed_items,
+                        processed_bytes,
+                        preview,
+                        &item.source_path,
+                        &item.target_path,
+                        success_count,
+                        skipped_count,
+                        error_count,
+                        false,
+                        false,
+                    );
+                    continue;
+                }
+            }
+        } else {
+            resolve_conflict(item, preview.conflict_strategy)
+        };
+
+        let target = match target {
             Some(t) => t,
             None => {
                 skipped_count += 1;
@@ -990,6 +1148,8 @@ mod tests {
             modified: None,
             is_directory: false,
             conflict: ConflictStatus::Exists,
+            conflict_kind: ConflictKind::Different,
+            conflict_resolution: ConflictResolution::Unresolved,
         };
         assert!(resolve_conflict(&item, ConflictStrategy::Skip).is_none());
     }
@@ -1004,8 +1164,43 @@ mod tests {
             modified: None,
             is_directory: false,
             conflict: ConflictStatus::Exists,
+            conflict_kind: ConflictKind::Different,
+            conflict_resolution: ConflictResolution::Unresolved,
         };
         let result = resolve_conflict(&item, ConflictStrategy::Overwrite).unwrap();
         assert_eq!(result, PathBuf::from("D:\\Data\\Documents\\a.txt"));
+    }
+
+    #[test]
+    fn analyze_conflict_detects_identical_and_different_files() {
+        let dir = std::env::temp_dir().join("cdrive_test_conflict_hash");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let source = dir.join("source.txt");
+        let target = dir.join("target.txt");
+        std::fs::write(&source, "same").unwrap();
+        std::fs::write(&target, "same").unwrap();
+        assert_eq!(
+            analyze_conflict(&source, &target, false, false),
+            ConflictKind::Identical
+        );
+
+        std::fs::write(&target, "different").unwrap();
+        assert_eq!(
+            analyze_conflict(&source, &target, false, false),
+            ConflictKind::Different
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn conflict_kind_requires_user_choice_only_for_dangerous_cases() {
+        assert!(!ConflictKind::None.needs_user_choice());
+        assert!(!ConflictKind::Identical.needs_user_choice());
+        assert!(ConflictKind::Different.needs_user_choice());
+        assert!(ConflictKind::TargetIsDirectory.needs_user_choice());
+        assert!(ConflictKind::PlannedDuplicate.needs_user_choice());
     }
 }
