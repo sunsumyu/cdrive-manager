@@ -13,7 +13,9 @@
 #[cfg(windows)]
 pub mod windows_mft {
     use std::collections::HashMap;
+    use std::ffi::OsStr;
     use std::fmt;
+    use std::os::windows::ffi::OsStrExt;
     use std::path::PathBuf;
     use std::ptr;
     use std::sync::{
@@ -32,7 +34,9 @@ pub mod windows_mft {
     use winapi::um::handleapi::*;
     use winapi::um::ioapiset::DeviceIoControl;
     use winapi::um::securitybaseapi::{AllocateAndInitializeSid, CheckTokenMembership, FreeSid};
+    use winapi::um::shellapi::ShellExecuteW;
     use winapi::um::winnt::*;
+    use winapi::um::winuser::SW_SHOWNORMAL;
 
     use crate::model::{FileRecord, ScanStats, file_extension_label};
     use crate::scanner::{ScanEvent, ScanProgress};
@@ -170,6 +174,73 @@ pub mod windows_mft {
                 MftPrivilegeStatus::NotElevated
             }
         }
+    }
+
+    fn to_wide_null(value: &OsStr) -> Vec<u16> {
+        value.encode_wide().chain(std::iter::once(0)).collect()
+    }
+
+    pub fn restart_as_admin(arguments: &[String]) -> Result<()> {
+        let exe = std::env::current_exe().context("无法获取当前程序路径")?;
+        let exe_wide = to_wide_null(exe.as_os_str());
+        let verb_wide = to_wide_null(OsStr::new("runas"));
+        let args = arguments
+            .iter()
+            .map(|arg| shell_quote_argument(arg))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let args_wide = to_wide_null(OsStr::new(&args));
+
+        let result = unsafe {
+            ShellExecuteW(
+                ptr::null_mut(),
+                verb_wide.as_ptr(),
+                exe_wide.as_ptr(),
+                if args.is_empty() {
+                    ptr::null()
+                } else {
+                    args_wide.as_ptr()
+                },
+                ptr::null(),
+                SW_SHOWNORMAL,
+            )
+        } as isize;
+
+        if result <= 32 {
+            anyhow::bail!("请求管理员权限重启失败，ShellExecuteW 返回码 {}", result);
+        }
+
+        Ok(())
+    }
+
+    fn shell_quote_argument(argument: &str) -> String {
+        if !argument.is_empty()
+            && !argument
+                .chars()
+                .any(|ch| ch.is_whitespace() || matches!(ch, '"' | '\\'))
+        {
+            return argument.to_owned();
+        }
+
+        let mut quoted = String::from("\"");
+        let mut backslashes = 0usize;
+        for ch in argument.chars() {
+            if ch == '\\' {
+                backslashes += 1;
+                continue;
+            }
+            if ch == '"' {
+                quoted.push_str(&"\\".repeat(backslashes * 2 + 1));
+                quoted.push('"');
+            } else {
+                quoted.push_str(&"\\".repeat(backslashes));
+                quoted.push(ch);
+            }
+            backslashes = 0;
+        }
+        quoted.push_str(&"\\".repeat(backslashes * 2));
+        quoted.push('"');
+        quoted
     }
 
     fn windows_error_hint(error: u32) -> &'static str {
