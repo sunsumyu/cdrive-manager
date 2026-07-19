@@ -23,6 +23,8 @@ use anyhow::{Context, Result};
 use crossbeam_channel::{Receiver, Sender, unbounded};
 use serde::{Deserialize, Serialize};
 
+use crate::engine::RiskEngine;
+
 /// Well-known personal data categories that live under the user profile.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum PersonalFolder {
@@ -238,6 +240,18 @@ pub struct OrganizerItem {
     pub conflict: ConflictStatus,
     pub conflict_kind: ConflictKind,
     pub conflict_resolution: ConflictResolution,
+    /// 引擎决策信息（可选）。
+    pub engine_info: Option<EngineDecision>,
+}
+
+/// 引擎对单个文件的决策结果（用于 organizer UI 展示）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EngineDecision {
+    pub category: String,
+    pub layer: String,
+    pub risk_score: u8,
+    pub recommendation: String,
+    pub impact_description: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -460,6 +474,9 @@ pub fn build_preview(options: &OrganizerOptions) -> Result<OrganizerPreview> {
     let mut total_conflicts: u64 = 0;
     let mut planned_targets = HashSet::new();
 
+    // 引擎用于分析文件分类和风险（可选）
+    let engine = RiskEngine::new();
+
     for folder in &options.enabled_folders {
         let sources = folder.source_paths();
         if sources.is_empty() {
@@ -534,6 +551,21 @@ pub fn build_preview(options: &OrganizerOptions) -> Result<OrganizerPreview> {
                 total_items += 1;
                 total_size += size;
 
+                // 引擎分析（仅对非目录文件）
+                let engine_info = if is_directory {
+                    None
+                } else {
+                    engine.analyze(entry.path()).map(|result| {
+                        EngineDecision {
+                            category: result.classification.category.label().to_string(),
+                            layer: result.classification.layer.label().to_string(),
+                            risk_score: result.risk.final_score,
+                            recommendation: result.risk.recommendation.label().to_string(),
+                            impact_description: result.impact_description,
+                        }
+                    })
+                };
+
                 preview_items.push(OrganizerItem {
                     folder: *folder,
                     source_path: entry.path().to_path_buf(),
@@ -544,6 +576,7 @@ pub fn build_preview(options: &OrganizerOptions) -> Result<OrganizerPreview> {
                     conflict,
                     conflict_kind,
                     conflict_resolution,
+                    engine_info,
                 });
             }
 
@@ -1150,6 +1183,7 @@ mod tests {
             conflict: ConflictStatus::Exists,
             conflict_kind: ConflictKind::Different,
             conflict_resolution: ConflictResolution::Unresolved,
+            engine_info: None,
         };
         assert!(resolve_conflict(&item, ConflictStrategy::Skip).is_none());
     }
@@ -1166,6 +1200,7 @@ mod tests {
             conflict: ConflictStatus::Exists,
             conflict_kind: ConflictKind::Different,
             conflict_resolution: ConflictResolution::Unresolved,
+            engine_info: None,
         };
         let result = resolve_conflict(&item, ConflictStrategy::Overwrite).unwrap();
         assert_eq!(result, PathBuf::from("D:\\Data\\Documents\\a.txt"));
