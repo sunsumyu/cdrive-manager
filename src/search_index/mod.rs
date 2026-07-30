@@ -1,22 +1,11 @@
 //! Persistent file search index for fast file lookup.
 //!
-//! Provides Everything-like instant search by maintaining a SQLite-backed
-//! file index that persists across application restarts.
-//!
-//! ## Usage
-//!
-//! ```ignore
-//! use cdrive_manager::search_index::{build_index_from_scan, search_by_name, FileSearchResult};
-//!
-//! // After a scan completes, build the index:
-//! // build_index_from_scan(&scan_stats)?;
-//!
-//! // Later, search the index:
-//! let results = search_by_name("c:/", "document", 50)?;
-//! ```
+//! Provides Everything-like instant search backed by tantivy full-text engine.
 
 mod schema;
 mod frn_db;
+mod query;
+mod indexer;
 mod db;
 mod usn_journal;
 mod worker;
@@ -29,15 +18,21 @@ pub use frn_db::{
     resolve_path_from_frn, delete_frn_path, clear_frn_for_root,
 };
 #[allow(unused_imports)]
-pub use db::{
-    build_index_from_scan, delete_entry, delete_entry_by_name, index_count, index_exists,
-    init_index_tables, root_key, search_by_name, upsert_entry,
-    FileSearchResult,
-};
+pub use query::{parse_query, parse_size, compile_query, QueryNode, CompareOp, DateValue, QueryParseError};
+#[allow(unused_imports)]
+pub use indexer::{SearchIndexer, root_key};
 #[allow(unused_imports)]
 pub use usn_journal::{spawn_usn_listener, UsnEvent, UsnListenerConfig, UsnListenerHandle};
 #[allow(unused_imports)]
 pub use worker::{
     spawn_build_index, spawn_search, spawn_usn_index_listener, SearchHandle,
     SearchIndexEvent, SearchIndexHandle, SearchResult,
+};
+// 兼容旧 API (db.rs)
+#[allow(unused_imports)]
+pub use db::{
+    build_index_from_scan, delete_entry, delete_entry_by_name, index_count, index_exists,
+    init_index_tables, search_by_name, FileSearchResult, upsert_entry,
+    lookup_frn_path as db_lookup_frn_path, upsert_frn_path as db_upsert_frn_path,
+    resolve_path_from_frn as db_resolve_path_from_frn, delete_frn_path as db_delete_frn_path,
 };

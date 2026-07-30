@@ -1,35 +1,45 @@
 //! tantivy schema 定义与索引目录管理。
 
 use std::path::PathBuf;
-use tantivy::schema::{Field, Schema, STORED, TEXT};
+use tantivy::schema::{
+    Field, Schema, INDEXED, STORED, TEXT, TextOptions, TextFieldIndexing,
+};
 
 /// 构建文件搜索索引的 tantivy schema。
 ///
 /// 字段说明:
 /// - `name`/`path`: TEXT+STORED, 支持全文搜索与结果返回
-/// - `extension`: TEXT+STORED, 支持扩展名过滤
+/// - `extension`: TEXT+STORED, 使用 raw 分词器以支持精确扩展名过滤
 /// - `parent_path`: STORED, 用于结果展示
 /// - `size`: STORED 数值, 支持范围查询与展示
 /// - `modified`: STORED 数值 (Unix 秒), 精确时间戳
 /// - `modified_days`: STORED 数值 (Unix 天), 天级, 用于日期范围查询
 /// - `is_directory`: bool+STORED, 文件/目录区分
-/// - `root_key`: TEXT+STORED, 多盘符支持
-/// - `frn`: STORED, File Reference Number
+/// - `root_key`: TEXT+STORED, raw 分词器, 多盘符精确匹配
+/// - `frn`: STORED, File Reference Number (raw)
 pub fn create_schema() -> Schema {
     let mut builder = Schema::builder();
 
     let name = builder.add_text_field("name", TEXT | STORED);
     let path = builder.add_text_field("path", TEXT | STORED);
+    // 使用 raw 分词器以支持精确匹配 (扩展名, 根键, FRN, path_exact)
+    let raw_text = TextOptions::default()
+        .set_indexing_options(
+            TextFieldIndexing::default().set_tokenizer("raw"),
+        )
+        .set_stored();
+    // path_exact: raw 分词, 用于按完整路径精确删除
+    let path_exact = builder.add_text_field("path_exact", raw_text.clone());
     let parent_path = builder.add_text_field("parent_path", STORED);
-    let extension = builder.add_text_field("extension", TEXT | STORED);
-    let size = builder.add_u64_field("size", STORED);
-    let modified = builder.add_u64_field("modified", STORED);
-    let modified_days = builder.add_u64_field("modified_days", STORED);
-    let is_directory = builder.add_bool_field("is_directory", STORED);
-    let root_key = builder.add_text_field("root_key", TEXT | STORED);
-    let frn = builder.add_text_field("frn", STORED);
+    let extension = builder.add_text_field("extension", raw_text.clone());
+    let size = builder.add_u64_field("size", INDEXED | STORED);
+    let modified = builder.add_u64_field("modified", INDEXED | STORED);
+    let modified_days = builder.add_u64_field("modified_days", INDEXED | STORED);
+    let is_directory = builder.add_bool_field("is_directory", INDEXED | STORED);
+    let root_key = builder.add_text_field("root_key", raw_text.clone());
+    let frn = builder.add_text_field("frn", raw_text);
 
-    let _ = (name, path, parent_path, extension, size, modified,
+    let _ = (name, path, path_exact, parent_path, extension, size, modified,
              modified_days, is_directory, root_key, frn);
     builder.build()
 }
@@ -45,6 +55,9 @@ impl FieldId {
     }
     pub fn path(schema: &Schema) -> Field {
         schema.get_field("path").expect("schema 必须包含 path 字段")
+    }
+    pub fn path_exact(schema: &Schema) -> Field {
+        schema.get_field("path_exact").expect("schema 必须包含 path_exact 字段")
     }
     pub fn parent_path(schema: &Schema) -> Field {
         schema.get_field("parent_path").expect("schema 必须包含 parent_path 字段")
