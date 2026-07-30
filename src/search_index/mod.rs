@@ -32,7 +32,10 @@ pub use worker::{
 #[allow(unused_imports)]
 pub use db::{
     build_index_from_scan, delete_entry, delete_entry_by_name, index_count, index_exists,
-    init_index_tables, search_by_name, FileSearchResult, upsert_entry,
+    init_index_tables, search_by_name, upsert_entry,
     lookup_frn_path as db_lookup_frn_path, upsert_frn_path as db_upsert_frn_path,
     resolve_path_from_frn as db_resolve_path_from_frn, delete_frn_path as db_delete_frn_path,
 };
+// FileSearchResult: 新索引统一使用 indexer 版本
+#[allow(unused_imports)]
+pub use indexer::FileSearchResult;

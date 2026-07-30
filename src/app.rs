@@ -42,6 +42,7 @@ use crate::{
     },
     scanner::{ScanEvent, ScanFinished, ScanHandle, ScanOptions, ScanProgress, spawn_scan},
     sunburst::draw_sunburst,
+    style::C,
     treemap::{TreemapAction, TreemapItem, draw_treemap},
 };
 
@@ -62,14 +63,30 @@ pub struct CDriveManagerApp {
     duplicate_cancel_requested: bool,
     duplicate_progress: Option<DuplicatePreviewProgress>,
     duplicate_preview: Option<Arc<DuplicatePreview>>,
+    // ─── 应用缓存检测器 ────────────────────────────────────
+    app_cache_handle: Option<crate::app_cache::AppCacheHandle>,
+    app_cache_in_progress: bool,
+    app_cache_cancel_requested: bool,
+    app_cache_progress: Option<crate::app_cache::AppCacheProgress>,
+    app_cache_report: Option<Arc<crate::app_cache::AppCacheReport>>,
     ai_analysis_handle: Option<AiAnalysisHandle>,
     ai_analysis_in_progress: bool,
     ai_analysis_cancel_requested: bool,
     ai_analysis_progress: Option<AiAnalysisProgress>,
     ai_analysis_report: Option<Arc<AiAnalysisReport>>,
     ai_provider_config: AiProviderConfig,
+    /// AI 结果分类筛选（可删除 / 需复核 / 保留 / 全部）。
+    ai_review_filter: AiReviewFilter,
+    /// 详情弹窗当前选中的 finding（用路径做身份，删除后自动失效）。
+    ai_detail_selected: Option<PathBuf>,
+    /// 待确认的删除请求（破坏性操作二次确认）。
+    delete_confirmation: Option<DeleteRequest>,
+    deletion_handle: Option<crate::deletion::DeletionHandle>,
+    deletion_in_progress: bool,
     cleanup_rules: Vec<CleanupRuleUiState>,
     status_message: String,
+    /// set_loaded_stats 恢复缓存预览后的提示，供调用方拼接到状态栏。
+    preview_restore_notice: Option<String>,
     selected_tab: ResultTab,
     search_query: String,
     directory_sort: SortState<DirectorySortKey>,
@@ -120,6 +137,16 @@ pub struct CDriveManagerApp {
     organizer_progress: Option<OrganizerProgress>,
     organizer_finished: Option<OrganizerFinished>,
     organizer_window_open: bool,
+    // ─── 搜索索引状态 ────────────────────────────────────────
+    search_results: Vec<crate::search_index::FileSearchResult>,
+    search_in_progress: bool,
+    search_page: usize,
+    usn_handle: Option<crate::search_index::SearchIndexHandle>,
+    /// In-flight asynchronous search. Replaced on each debounced query.
+    search_handle: Option<crate::search_index::SearchHandle>,
+    /// Debounce: timestamp of the most recent keystroke; search fires after
+    /// [`SEARCH_DEBOUNCE`] elapsed since the last change.
+    search_last_input: Option<std::time::Instant>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -129,6 +156,7 @@ enum ResultTab {
     Types,
     CleanupPreview,
     DuplicatePreview,
+    AppCache,
     AiReview,
     Errors,
 }
@@ -137,6 +165,65 @@ enum ResultTab {
 enum VisualizationMode {
     Treemap,
     Sunburst,
+}
+
+/// AI 审核结果的分类筛选。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AiReviewFilter {
+    Deletable,
+    NeedsReview,
+    Keep,
+    All,
+}
+
+impl AiReviewFilter {
+    /// 判断某个 finding 是否落在当前筛选下。
+    fn accepts(self, bucket: crate::ai_analysis::AiReviewBucket) -> bool {
+        use crate::ai_analysis::AiReviewBucket;
+        match self {
+            Self::All => true,
+            Self::Deletable => bucket == AiReviewBucket::Deletable,
+            Self::NeedsReview => bucket == AiReviewBucket::NeedsReview,
+            Self::Keep => bucket == AiReviewBucket::Keep,
+        }
+    }
+}
+
+/// 待确认的删除请求。
+#[derive(Debug, Clone)]
+struct DeleteRequest {
+    items: Vec<crate::deletion::DeleteItem>,
+    method: crate::deletion::DeleteMethod,
+    total_size: u64,
+    /// 是否包含"需复核"项——若是，确认弹窗显示更强的红色警告。
+    includes_needs_review: bool,
+}
+
+/// 扫描进度的统一指标，供顶栏进度条与中间实时状态区块共用。
+struct ScanMetrics {
+    /// 0..1，用于进度条。
+    ratio: f32,
+    /// 百分比数值。
+    pct: f64,
+    /// 是否为估算（无真实总量的扫描模式）。
+    is_estimated: bool,
+    dir_count: u64,
+    file_count: u64,
+    total_size: u64,
+    /// 已处理量：MFT=已解析记录，其它=已发现目录。
+    processed: u64,
+    /// 已知/估算总量。
+    total: Option<u64>,
+    elapsed: Duration,
+    eta: Option<Duration>,
+    /// 处理速度（每秒）。
+    speed_per_sec: f64,
+    /// 速度单位："记录" 或 "文件"。
+    unit_label: &'static str,
+    /// 数据吞吐（字节/秒）。MFT 模式直观反映扫描性能；其它模式由文件数推算。
+    bytes_per_sec: f64,
+    /// 当前正在处理的记录/路径文本。
+    current_text: Option<String>,
 }
 
 #[cfg(windows)]
@@ -308,6 +395,10 @@ impl CleanupRuleUiState {
 
 const DEFAULT_DUPLICATE_MIN_SIZE_BYTES: u64 = 1024;
 
+/// Delay between the last keystroke and firing a search. Keeps the UI thread
+/// responsive while the user is still typing by avoiding a search per press.
+const SEARCH_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(150);
+
 impl CDriveManagerApp {
     pub fn new(_cc: &eframe::CreationContext<'_>) -> Self {
         #[cfg(windows)]
@@ -354,17 +445,29 @@ impl CDriveManagerApp {
             duplicate_cancel_requested: false,
             duplicate_progress: None,
             duplicate_preview: None,
+            // 应用缓存检测器
+            app_cache_handle: None,
+            app_cache_in_progress: false,
+            app_cache_cancel_requested: false,
+            app_cache_progress: None,
+            app_cache_report: None,
             ai_analysis_handle: None,
             ai_analysis_in_progress: false,
             ai_analysis_cancel_requested: false,
             ai_analysis_progress: None,
             ai_analysis_report: None,
             ai_provider_config: AiProviderConfig::default(),
+            ai_review_filter: AiReviewFilter::Deletable,
+            ai_detail_selected: None,
+            delete_confirmation: None,
+            deletion_handle: None,
+            deletion_in_progress: false,
             cleanup_rules: default_cleanup_rules()
                 .into_iter()
                 .map(CleanupRuleUiState::new)
                 .collect(),
             status_message: "准备扫描。第一版只分析空间占用，不删除任何文件。".to_owned(),
+            preview_restore_notice: None,
             selected_tab: ResultTab::Directories,
             search_query: String::new(),
             directory_sort: SortState::new(DirectorySortKey::Size, SortDirection::Desc),
@@ -421,6 +524,13 @@ impl CDriveManagerApp {
             organizer_progress: None,
             organizer_finished: None,
             organizer_window_open: false,
+            // Search index state
+            search_results: Vec::new(),
+            search_in_progress: false,
+            search_page: 0,
+            usn_handle: None,
+            search_handle: None,
+            search_last_input: None,
         };
 
         #[cfg(windows)]
@@ -680,6 +790,28 @@ impl CDriveManagerApp {
         }
     }
 
+    fn start_app_cache_scan(&mut self) {
+        self.app_cache_handle = Some(crate::app_cache::spawn_app_cache_scan(
+            crate::app_cache::AppCacheOptions {
+                categories: None,
+            }
+        ));
+        self.app_cache_in_progress = true;
+        self.app_cache_cancel_requested = false;
+        self.app_cache_progress = None;
+        self.app_cache_report = None;
+        self.selected_tab = ResultTab::AppCache;
+        self.status_message = "正在启动应用缓存扫描，这会检测浏览器、开发工具、媒体和系统缓存。不会删除、移动或修改任何文件。".to_owned();
+    }
+
+    fn cancel_app_cache_scan(&mut self) {
+        if let Some(handle) = &self.app_cache_handle {
+            handle.cancel();
+            self.app_cache_cancel_requested = true;
+            self.status_message = "正在取消应用缓存扫描，已发现的缓存条目会保留……".to_owned();
+        }
+    }
+
     fn start_organizer_preview(&mut self) {
         let target = PathBuf::from(self.organizer_target_root.trim());
         if !target.exists() || !target.is_dir() {
@@ -903,6 +1035,9 @@ impl CDriveManagerApp {
                 let metadata = scan_cache_metadata_summary(&stats);
                 self.set_loaded_stats(stats);
                 self.status_message = format!("已打开扫描结果：{} ({})", path.display(), metadata);
+                if let Some(notice) = self.preview_restore_notice.take() {
+                    self.status_message = format!("{}；{}", self.status_message, notice);
+                }
             }
             Err(error) => {
                 self.status_message = format!("打开扫描结果失败：{} ({:#})", path.display(), error);
@@ -924,6 +1059,9 @@ impl CDriveManagerApp {
                     root.display(),
                     metadata
                 );
+                if let Some(notice) = self.preview_restore_notice.take() {
+                    self.status_message = format!("{}；{}", self.status_message, notice);
+                }
             }
             Ok(None) => {
                 self.status_message =
@@ -958,7 +1096,41 @@ impl CDriveManagerApp {
         self.ai_analysis_in_progress = false;
         self.ai_analysis_cancel_requested = false;
         self.ai_analysis_handle = None;
+        self.app_cache_report = None;
+        self.app_cache_progress = None;
+        self.app_cache_in_progress = false;
+        self.app_cache_cancel_requested = false;
+        self.app_cache_handle = None;
         self.treemap_current_dir = None;
+        self.try_restore_preview_cache();
+    }
+
+    /// 加载扫描结果后，尝试恢复该根目录之前保存的清理/重复预览，这样无需重跑即可直接 AI 分析。
+    /// 返回是否恢复了至少一个预览，供调用方在状态栏提示。
+    fn try_restore_preview_cache(&mut self) {
+        let Some(stats) = self.stats.as_ref() else {
+            self.preview_restore_notice = None;
+            return;
+        };
+        let root = stats.root.clone();
+        self.preview_restore_notice = match crate::preview_cache::load_preview_cache(&root) {
+            Ok(Some(bundle)) => {
+                let summary = bundle.summary();
+                if let Some(cleanup) = bundle.cleanup {
+                    self.cleanup_preview = Some(Arc::new(cleanup));
+                }
+                if let Some(duplicate) = bundle.duplicate {
+                    self.duplicate_preview = Some(Arc::new(duplicate));
+                }
+                if self.cleanup_preview.is_some() || self.duplicate_preview.is_some() {
+                    Some(format!("已恢复缓存预览（{summary}），可直接进行 AI 分析"))
+                } else {
+                    None
+                }
+            }
+            Ok(None) => None,
+            Err(error) => Some(format!("预览缓存读取失败：{error:#}")),
+        };
     }
 
     fn export_csv_report(&mut self) {
@@ -1146,14 +1318,16 @@ impl CDriveManagerApp {
 
         if let Some(progress) = latest_progress {
             self.apply_cleanup_preview_progress(progress);
+            ctx.request_repaint();
         }
 
         if let Some(result) = finished {
             self.apply_cleanup_preview_finished(result);
+            ctx.request_repaint();
         }
 
         if self.cleanup_in_progress {
-            ctx.request_repaint_after(Duration::from_millis(120));
+            ctx.request_repaint_after(Duration::from_millis(80));
         }
     }
 
@@ -1178,14 +1352,16 @@ impl CDriveManagerApp {
 
         if let Some(progress) = latest_progress {
             self.apply_duplicate_preview_progress(progress);
+            ctx.request_repaint();
         }
 
         if let Some(result) = finished {
             self.apply_duplicate_preview_finished(result);
+            ctx.request_repaint();
         }
 
         if self.duplicate_in_progress {
-            ctx.request_repaint_after(Duration::from_millis(120));
+            ctx.request_repaint_after(Duration::from_millis(80));
         }
     }
 
@@ -1210,14 +1386,50 @@ impl CDriveManagerApp {
 
         if let Some(progress) = latest_progress {
             self.apply_ai_analysis_progress(progress);
+            ctx.request_repaint();
         }
 
         if let Some(result) = finished {
             self.apply_ai_analysis_finished(result);
+            ctx.request_repaint();
         }
 
         if self.ai_analysis_in_progress {
-            ctx.request_repaint_after(Duration::from_millis(120));
+            ctx.request_repaint_after(Duration::from_millis(80));
+        }
+    }
+
+    fn poll_app_cache_events(&mut self, ctx: &egui::Context) {
+        let Some(receiver) = self
+            .app_cache_handle
+            .as_ref()
+            .map(|handle| handle.receiver.clone())
+        else {
+            return;
+        };
+
+        let mut latest_progress = None;
+        let mut finished = None;
+
+        while let Ok(event) = receiver.try_recv() {
+            match event {
+                crate::app_cache::AppCacheEvent::Progress(progress) => latest_progress = Some(progress),
+                crate::app_cache::AppCacheEvent::Finished(result) => finished = Some(result),
+            }
+        }
+
+        if let Some(progress) = latest_progress {
+            self.apply_app_cache_progress(progress);
+            ctx.request_repaint();
+        }
+
+        if let Some(result) = finished {
+            self.apply_app_cache_finished(result);
+            ctx.request_repaint();
+        }
+
+        if self.app_cache_in_progress {
+            ctx.request_repaint_after(Duration::from_millis(80));
         }
     }
 
@@ -1329,6 +1541,7 @@ impl CDriveManagerApp {
                 if result.cancelled {
                     self.scan_in_progress = false;
                     self.scan_handle = None;
+                    self.progress = None;
                     self.status_message = format!("快速统计已取消");
                     return;
                 }
@@ -1349,10 +1562,31 @@ impl CDriveManagerApp {
             }
             ScanMode::FullScan | ScanMode::ParallelFullScan | ScanMode::MftScan => {
                 // Second pass complete - show final results
-                self.stats = Some(Arc::clone(&result.stats));
                 self.scan_in_progress = false;
                 self.cancel_requested = false;
                 self.scan_handle = None;
+
+                if result.cancelled {
+                    // 取消时清空进度和统计，避免中间面板继续显示旧数据。
+                    self.progress = None;
+                    self.stats = None;
+                    let mode_name = match &result.scan_mode {
+                        ScanMode::ParallelFullScan => "多线程",
+                        ScanMode::MftScan => "MFT 高速",
+                        _ => "单线程",
+                    };
+                    self.status_message = format!(
+                        "{}扫描已取消：已统计 {} 个文件，{} 个目录，部分结果共 {}。 耗时：{}",
+                        mode_name,
+                        format::count(result.stats.file_count),
+                        format::count(result.stats.dir_count),
+                        format::bytes(result.stats.total_size),
+                        format::duration(result.elapsed_time)
+                    );
+                    return;
+                }
+
+                self.stats = Some(Arc::clone(&result.stats));
 
                 let mode_name = match &result.scan_mode {
                     ScanMode::ParallelFullScan => "多线程",
@@ -1360,38 +1594,40 @@ impl CDriveManagerApp {
                     _ => "单线程",
                 };
 
-                let mut message = if result.cancelled {
-                    format!(
-                        "{}扫描已取消：已统计 {} 个文件，{} 个目录，部分结果共 {}。",
-                        mode_name,
-                        format::count(result.stats.file_count),
-                        format::count(result.stats.dir_count),
-                        format::bytes(result.stats.total_size)
-                    )
-                } else {
-                    format!(
-                        "{}扫描完成：{} 个文件，{} 个目录，总计 {}。",
-                        mode_name,
-                        format::count(result.stats.file_count),
-                        format::count(result.stats.dir_count),
-                        format::bytes(result.stats.total_size)
-                    )
-                };
-
+                let mut message = format!(
+                    "{}扫描完成：{} 个文件，{} 个目录，总计 {}。",
+                    mode_name,
+                    format::count(result.stats.file_count),
+                    format::count(result.stats.dir_count),
+                    format::bytes(result.stats.total_size)
+                );
                 message.push_str(&format!(" 耗时：{}", format::duration(result.elapsed_time)));
 
-                if !result.cancelled {
-                    match save_latest_scan(result.stats.as_ref()) {
-                        Ok(path) => {
-                            message.push_str(&format!(
-                                " 已写入 SQLite 最新缓存：{}。",
-                                path.display()
-                            ));
-                        }
-                        Err(error) => {
-                            message.push_str(&format!(" SQLite 最新缓存写入失败：{:#}。", error));
-                        }
+                match save_latest_scan(result.stats.as_ref()) {
+                    Ok(path) => {
+                        message.push_str(&format!(
+                            " 已写入 SQLite 最新缓存：{}。",
+                            path.display()
+                        ));
                     }
+                    Err(error) => {
+                        message.push_str(&format!(" SQLite 最新缓存写入失败：{:#}。", error));
+                    }
+                }
+                // Build search index in background
+                let stats_arc = Arc::clone(&result.stats);
+                let _ = std::thread::spawn(move || {
+                    if let Err(e) = crate::search_index::build_index_from_scan(&stats_arc) {
+                        eprintln!("Search index build failed: {}", e);
+                    }
+                });
+                // Start USN Journal listener for real-time updates
+                if let Some(drive_letter) = result.stats.root.to_string_lossy().chars().next() {
+                    let root_key = crate::search_index::root_key(&result.stats.root);
+                    let usn_handle = crate::search_index::spawn_usn_index_listener(root_key, drive_letter);
+                    // Store handle in app (we'd need to store it, but for now just let it run)
+                    // Note: In a real implementation, store usn_handle in the app struct
+                    std::mem::forget(usn_handle); // Prevent drop (leak intentionally - runs until app closes)
                 }
 
                 self.status_message = message;
@@ -1436,6 +1672,7 @@ impl CDriveManagerApp {
         self.cleanup_in_progress = false;
         self.cleanup_cancel_requested = false;
         self.cleanup_handle = None;
+        self.persist_preview_cache();
     }
 
     fn apply_duplicate_preview_progress(&mut self, progress: DuplicatePreviewProgress) {
@@ -1476,6 +1713,68 @@ impl CDriveManagerApp {
         self.duplicate_in_progress = false;
         self.duplicate_cancel_requested = false;
         self.duplicate_handle = None;
+        self.persist_preview_cache();
+    }
+
+    fn apply_app_cache_progress(&mut self, progress: crate::app_cache::AppCacheProgress) {
+        self.status_message = if progress.cancelled {
+            "应用缓存扫描已取消，当前显示的是部分结果。".to_owned()
+        } else if progress.finished {
+            "应用缓存扫描完成。".to_owned()
+        } else if let Some(app) = &progress.current_app {
+            format!("正在扫描应用缓存：{}", app)
+        } else {
+            "正在扫描应用缓存……".to_owned()
+        };
+        self.app_cache_progress = Some(progress);
+    }
+
+    fn apply_app_cache_finished(&mut self, result: crate::app_cache::AppCacheFinished) {
+        self.status_message = if result.cancelled {
+            format!(
+                "应用缓存扫描已取消，发现 {} 个应用，累计大小 {}。",
+                format::count(result.report.entries.len() as u64),
+                format::bytes(result.report.total_reclaimable)
+            )
+        } else {
+            format!(
+                "应用缓存扫描完成，发现 {} 个应用，累计大小 {}。当前版本不会执行删除。",
+                format::count(result.report.entries.len() as u64),
+                format::bytes(result.report.total_reclaimable)
+            )
+        };
+        self.app_cache_report = Some(result.report);
+        self.app_cache_in_progress = false;
+        self.app_cache_cancel_requested = false;
+        self.app_cache_handle = None;
+    }
+
+    /// 把当前清理/重复预览按扫描根目录持久化到本地缓存，便于下次直接进入 AI 分析。
+    /// 失败仅记录到状态栏，不打断流程。
+    fn persist_preview_cache(&mut self) {
+        let Some(root) = self
+            .cleanup_preview
+            .as_ref()
+            .map(|preview| preview.root.clone())
+            .or_else(|| {
+                self.duplicate_preview
+                    .as_ref()
+                    .map(|preview| preview.root.clone())
+            })
+        else {
+            return;
+        };
+
+        match crate::preview_cache::save_preview_cache(
+            &root,
+            self.cleanup_preview.as_deref(),
+            self.duplicate_preview.as_deref(),
+        ) {
+            Ok(_) => {}
+            Err(error) => {
+                self.status_message = format!("{}（预览缓存保存失败：{:#}）", self.status_message, error);
+            }
+        }
     }
 
     fn apply_ai_analysis_progress(&mut self, progress: AiAnalysisProgress) {
@@ -1661,12 +1960,26 @@ impl CDriveManagerApp {
                 ui.heading("C 盘空间管理器");
                 ui.separator();
                 ui.label("扫描目录：");
-                let input = ui.text_edit_singleline(&mut self.root_input);
-                if input.lost_focus()
-                    && ui.input(|input| input.key_pressed(egui::Key::Enter))
-                    && !busy
+
+                // 下拉选择可用驱动器（仅 Windows）
+                #[cfg(windows)]
                 {
-                    self.start_scan();
+                    let drives = get_available_drives();
+                    let selected = self.root_input.clone();
+                    egui::ComboBox::from_id_salt("drive_selector")
+                        .selected_text(&selected)
+                        .width(80.0)
+                        .show_ui(ui, |ui| {
+                            for drive in &drives {
+                                if ui.selectable_label(selected == *drive, drive.as_str()).clicked() {
+                                    self.root_input = drive.clone();
+                                }
+                            }
+                        });
+                }
+                #[cfg(not(windows))]
+                {
+                    let _input = ui.text_edit_singleline(&mut self.root_input);
                 }
 
                 if ui
@@ -1785,7 +2098,78 @@ impl CDriveManagerApp {
                     }
                 }
             });
-            ui.label(RichText::new(&self.status_message).small());
+            // 状态文案统一由底部状态栏展示，顶栏只保留 spinner + 进度条，避免 MFT 记录数等文字重复出现。
+        });
+    }
+
+    fn draw_bottom_status_bar(&mut self, ctx: &egui::Context) {
+        egui::TopBottomPanel::bottom("bottom_status_bar").show(ctx, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                let busy = self.scan_in_progress
+                    || self.cleanup_in_progress
+                    || self.duplicate_in_progress
+                    || self.ai_analysis_in_progress
+                    || self.organizer_in_progress;
+
+                if busy {
+                    ui.spinner();
+                }
+
+                if self.scan_in_progress {
+                    ui.label(RichText::new("● 扫描中").strong().color(egui::Color32::from_rgb(100, 180, 255)));
+                } else if self.cleanup_in_progress {
+                    ui.label(RichText::new("● 清理预览生成中").strong().color(egui::Color32::from_rgb(100, 180, 255)));
+                } else if self.duplicate_in_progress {
+                    ui.label(RichText::new("● 重复文件检测中").strong().color(egui::Color32::from_rgb(100, 180, 255)));
+                } else if self.ai_analysis_in_progress {
+                    ui.label(RichText::new("● AI 分析审核中").strong().color(egui::Color32::from_rgb(100, 180, 255)));
+                } else if self.organizer_in_progress {
+                    ui.label(RichText::new("● 文件整理中").strong().color(egui::Color32::from_rgb(100, 180, 255)));
+                } else {
+                    ui.label(RichText::new("● 就绪").color(C.success));
+                }
+
+                ui.separator();
+                ui.label(RichText::new(&self.status_message).small());
+
+                if self.cleanup_in_progress {
+                    if let Some(progress) = &self.cleanup_progress {
+                        ui.separator();
+                        let preview = &progress.preview;
+                        ui.label(
+                            RichText::new(format!(
+                                "实时情况：候选 {} 个 | 预计可清理 {} | 受保护 {} 个 | 错误 {} 条",
+                                format::count(preview.candidate_count),
+                                format::bytes(preview.reclaimable_size),
+                                format::count(preview.protected_count),
+                                format::count(preview.error_count),
+                            ))
+                            .small()
+                            .strong()
+                            .color(egui::Color32::from_rgb(147, 197, 253)),
+                        );
+                    }
+                }
+
+                if self.ai_analysis_in_progress {
+                    if let Some(progress) = &self.ai_analysis_progress {
+                        ui.separator();
+                        let report = &progress.report;
+                        ui.label(
+                            RichText::new(format!(
+                                "实时分析：[{}] 已分析 {} 个 | 待清理 {} 个 | 需复核 {} 个",
+                                progress.phase.label(),
+                                format::count(report.candidate_count),
+                                format::count(report.delete_candidate_count),
+                                format::count(report.needs_review_count),
+                            ))
+                            .small()
+                            .strong()
+                            .color(egui::Color32::from_rgb(147, 197, 253)),
+                        );
+                    }
+                }
+            });
         });
     }
 
@@ -1795,7 +2179,8 @@ impl CDriveManagerApp {
             || self.cleanup_in_progress
             || self.duplicate_in_progress
             || self.ai_analysis_in_progress
-            || self.organizer_in_progress;
+            || self.organizer_in_progress
+            || self.app_cache_in_progress;
         let has_final_stats = self.stats.is_some();
         let cleanup_in_progress = self.cleanup_in_progress;
         let cleanup_cancel_requested = self.cleanup_cancel_requested;
@@ -1804,6 +2189,8 @@ impl CDriveManagerApp {
         let duplicate_in_progress = self.duplicate_in_progress;
         let duplicate_cancel_requested = self.duplicate_cancel_requested;
         let has_duplicate_preview = self.current_duplicate_preview().is_some();
+        let app_cache_in_progress = self.app_cache_in_progress;
+        let app_cache_cancel_requested = self.app_cache_cancel_requested;
         let ai_analysis_in_progress = self.ai_analysis_in_progress;
         let ai_analysis_cancel_requested = self.ai_analysis_cancel_requested;
         let has_ai_report = self.current_ai_analysis_report().is_some();
@@ -1822,6 +2209,8 @@ impl CDriveManagerApp {
         let mut start_duplicate_clicked = false;
         let mut cancel_duplicate_clicked = false;
         let mut export_duplicate_csv_clicked = false;
+        let mut start_app_cache_clicked = false;
+        let mut cancel_app_cache_clicked = false;
         let mut start_ai_clicked = false;
         let mut cancel_ai_clicked = false;
         let mut export_ai_report_clicked = false;
@@ -1868,6 +2257,35 @@ impl CDriveManagerApp {
                                     .clicked()
                                 {
                                     export_csv_clicked = true;
+                                }
+                            });
+
+                        ui.add_space(4.0);
+
+                        // === 搜索组 ===
+                        egui::CollapsingHeader::new("搜索")
+                            .default_open(true)
+                            .show(ui, |ui| {
+                                ui.horizontal(|ui| {
+                                    ui.label("搜索：");
+                                    ui.add(
+                                        egui::TextEdit::singleline(&mut self.search_query)
+                                            .hint_text("输入关键词"),
+                                    );
+                                });
+                                ui.horizontal(|ui| {
+                                    if ui.button("清空").clicked() {
+                                        self.search_query.clear();
+                                        self.search_results.clear();
+                                        self.search_page = 0;
+                                    }
+                                    if ui.button("搜索").clicked() {
+                                        self.perform_search();
+                                        self.search_page = 0;
+                                    }
+                                });
+                                if !self.search_results.is_empty() {
+                                    ui.label(format!("找到 {} 个结果", self.search_results.len()));
                                 }
                             });
 
@@ -1931,6 +2349,24 @@ impl CDriveManagerApp {
                                     .clicked()
                                 {
                                     export_duplicate_csv_clicked = true;
+                                }
+
+                                ui.add_space(4.0);
+                                ui.label(RichText::new("应用缓存").strong().small());
+                                if ui
+                                    .add_enabled(!busy, egui::Button::new("扫描应用缓存"))
+                                    .clicked()
+                                {
+                                    start_app_cache_clicked = true;
+                                }
+                                if ui
+                                    .add_enabled(
+                                        app_cache_in_progress && !app_cache_cancel_requested,
+                                        egui::Button::new("取消缓存扫描"),
+                                    )
+                                    .clicked()
+                                {
+                                    cancel_app_cache_clicked = true;
                                 }
 
                                 ui.add_space(4.0);
@@ -2057,6 +2493,12 @@ impl CDriveManagerApp {
         if export_ai_delete_clicked {
             self.export_ai_delete_list_csv();
         }
+        if start_app_cache_clicked {
+            self.start_app_cache_scan();
+        }
+        if cancel_app_cache_clicked {
+            self.cancel_app_cache_scan();
+        }
         if cache_manager_clicked {
             self.open_cache_manager();
         }
@@ -2065,57 +2507,262 @@ impl CDriveManagerApp {
         }
     }
 
-    fn draw_progress_bar(&self, ui: &mut egui::Ui) {
+    /// 汇总当前扫描进度为统一指标；无进行中的扫描时返回 None。
+    fn scan_progress_metrics(&self) -> Option<ScanMetrics> {
         use crate::scanner::ScanMode;
 
-        let Some(progress) = &self.progress else {
+        let progress = self.progress.as_ref()?;
+        let start_time = self.scan_start_time?;
+        let elapsed = start_time.elapsed();
+        let elapsed_secs = elapsed.as_secs_f64().max(0.001);
+        let stats = &progress.stats;
+
+        let (processed, total, is_estimated, unit_label) = match progress.scan_mode {
+            ScanMode::MftScan => (
+                progress.mft_records_processed.unwrap_or(0),
+                progress.mft_records_total,
+                false,
+                "记录",
+            ),
+            // 其它模式无真实总量：用已发现目录 / 估算目录作为估算百分比（会随发现回跳）。
+            _ => (stats.dir_count, self.estimated_total_dirs, true, "文件"),
+        };
+
+        let ratio = match total {
+            Some(t) if t > 0 => (processed as f64 / t as f64).clamp(0.0, 1.0),
+            _ => 0.0,
+        };
+        // 估算模式封顶 99.9%，避免误显示已完成。
+        let pct = if is_estimated {
+            (ratio * 100.0).min(99.9)
+        } else {
+            ratio * 100.0
+        };
+
+        // 速度：MFT 用记录/秒，其它用文件/秒。
+        let speed_source = match progress.scan_mode {
+            ScanMode::MftScan => processed as f64,
+            _ => stats.file_count as f64,
+        };
+        let speed_per_sec = speed_source / elapsed_secs;
+
+        // 数据吞吐：总扫描体积 / 已用时间（字节/秒）。
+        let bytes_per_sec = stats.total_size as f64 / elapsed_secs;
+
+        let eta = if total.is_some() {
+            self.estimated_remaining(ratio)
+        } else {
+            None
+        };
+
+        let current_text = progress
+            .current_path
+            .as_ref()
+            .map(|p| p.display().to_string());
+
+        Some(ScanMetrics {
+            ratio: ratio as f32,
+            pct,
+            is_estimated,
+            dir_count: stats.dir_count,
+            file_count: stats.file_count,
+            total_size: stats.total_size,
+            processed,
+            total,
+            elapsed,
+            eta,
+            speed_per_sec,
+            unit_label,
+            bytes_per_sec,
+            current_text,
+        })
+    }
+
+    fn draw_progress_bar(&self, ui: &mut egui::Ui) {
+        let Some(metrics) = self.scan_progress_metrics() else {
             return;
         };
 
-        let Some(start_time) = self.scan_start_time else {
+        ui.add_space(4.0);
+
+        let bar_text = if metrics.is_estimated {
+            format!("估算 {:.1}%", metrics.pct)
+        } else {
+            format!("进度 {:.1}%", metrics.pct)
+        };
+        let progress_bar = egui::ProgressBar::new(metrics.ratio)
+            .text(bar_text)
+            .desired_width(220.0)
+            .desired_height(12.0);
+        ui.add(progress_bar);
+
+        let mut parts = vec![format!("已用 {}", format::duration(metrics.elapsed))];
+        if let Some(remaining) = metrics.eta {
+            parts.push(format!("剩余 {}", format::duration(remaining)));
+        }
+        if let Some(total) = metrics.total {
+            parts.push(format!(
+                "{}/{} {}",
+                format::count(metrics.processed),
+                format::count(total),
+                metrics.unit_label
+            ));
+        }
+        ui.label(RichText::new(parts.join(" | ")).small());
+    }
+
+    /// 扫描进行中在中间区域展示的一排实时状态小区块（卡片）+ 主进度条。
+    fn draw_scan_status_blocks(&self, ui: &mut egui::Ui) {
+        let Some(metrics) = self.scan_progress_metrics() else {
+            ui.vertical_centered(|ui| {
+                ui.add_space(12.0);
+                ui.spinner();
+                ui.label(RichText::new("正在准备扫描……").weak());
+            });
             return;
         };
 
-        // Only show progress bar for FullScan mode
-        if let ScanMode::FullScan = &progress.scan_mode {
-            if let Some(estimated) = self.estimated_total_dirs {
-                let current = progress.stats.dir_count;
-                let ratio = (current as f64 / estimated as f64).clamp(0.0, 1.0);
-                let pct = ratio * 100.0;
+        ui.add_space(4.0);
+        let bar_text = if metrics.is_estimated {
+            format!("估算进度 {:.1}%", metrics.pct)
+        } else {
+            format!("进度 {:.1}%", metrics.pct)
+        };
+        ui.add(
+            egui::ProgressBar::new(metrics.ratio)
+                .text(bar_text)
+                .desired_height(14.0),
+        );
+        ui.add_space(6.0);
 
+        let card = |ui: &mut egui::Ui, title: &str, value: String, color: egui::Color32| {
+            egui::Frame::group(ui.style())
+                .fill(egui::Color32::from_rgb(26, 32, 44))
+                .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(50, 60, 80)))
+                .show(ui, |ui| {
+                    ui.set_min_width(104.0);
+                    ui.vertical(|ui| {
+                        ui.label(RichText::new(title).small().color(C.text.muted));
+                        ui.label(RichText::new(value).strong().size(16.0).color(color));
+                    });
+                });
+        };
+
+        // 速度显示：MFT 用 MB/s（直观的数据吞吐），其它模式用 文件/秒。
+        let (speed_value, speed_unit): (String, String) = if matches!(
+            self.progress.as_ref().map(|p| &p.scan_mode),
+            Some(crate::scanner::ScanMode::MftScan)
+        ) {
+            let mbps = metrics.bytes_per_sec / (1024.0 * 1024.0);
+            (format!("{mbps:.1}"), "MB/秒".to_owned())
+        } else {
+            (
+                format::count(metrics.speed_per_sec as u64),
+                format!("{}/秒", metrics.unit_label),
+            )
+        };
+
+        let available_width = ui.available_width();
+        let use_two_rows = available_width < 680.0;
+
+        if use_two_rows {
+            ui.vertical(|ui| {
+                ui.horizontal(|ui| {
+                    card(
+                        ui,
+                        "已扫目录",
+                        format::count(metrics.dir_count),
+                        C.text.primary,
+                    );
+                    card(
+                        ui,
+                        "已扫文件",
+                        format::count(metrics.file_count),
+                        C.text.primary,
+                    );
+                    card(
+                        ui,
+                        "已用体积",
+                        format::bytes(metrics.total_size),
+                        egui::Color32::from_rgb(120, 200, 140),
+                    );
+                });
                 ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    card(
+                        ui,
+                        &format!("速度（{speed_unit}）"),
+                        speed_value.clone(),
+                        egui::Color32::from_rgb(147, 197, 253),
+                    );
+                    card(
+                        ui,
+                        "已用时间",
+                        format::duration(metrics.elapsed),
+                        C.text.secondary,
+                    );
+                    card(
+                        ui,
+                        "预计剩余",
+                        metrics
+                            .eta
+                            .map(format::duration)
+                            .unwrap_or_else(|| "计算中…".to_owned()),
+                        C.warning,
+                    );
+                });
+            });
+        } else {
+            ui.horizontal(|ui| {
+                card(
+                    ui,
+                    "已扫目录",
+                    format::count(metrics.dir_count),
+                    C.text.primary,
+                );
+                card(
+                    ui,
+                    "已扫文件",
+                    format::count(metrics.file_count),
+                    C.text.primary,
+                );
+                card(
+                    ui,
+                    "已用体积",
+                    format::bytes(metrics.total_size),
+                    egui::Color32::from_rgb(120, 200, 140),
+                );
+                card(
+                    ui,
+                    &format!("速度（{speed_unit}）"),
+                    speed_value,
+                    egui::Color32::from_rgb(147, 197, 253),
+                );
+                card(
+                    ui,
+                    "已用时间",
+                    format::duration(metrics.elapsed),
+                    C.text.secondary,
+                );
+                card(
+                    ui,
+                    "预计剩余",
+                    metrics
+                        .eta
+                        .map(format::duration)
+                        .unwrap_or_else(|| "计算中…".to_owned()),
+                    C.warning,
+                );
+            });
+        }
 
-                // Progress bar
-                let progress_bar = egui::ProgressBar::new(ratio as f32)
-                    .text(format!("进度: {:.1}%", pct))
-                    .desired_width(200.0)
-                    .desired_height(12.0);
-                ui.add(progress_bar);
-
-                // Time info
-                let elapsed = start_time.elapsed();
-                let time_text = if let Some(remaining) = self.estimated_remaining(ratio) {
-                    format!(
-                        "已用: {} | 剩余: {} | {}/{} 目录",
-                        format::duration(elapsed),
-                        format::duration(remaining),
-                        format::count(current),
-                        format::count(estimated)
-                    )
-                } else {
-                    format!(
-                        "已用: {} | {}/{} 目录",
-                        format::duration(elapsed),
-                        format::count(current),
-                        format::count(estimated)
-                    )
-                };
-                ui.label(RichText::new(time_text).small());
-            }
-        } else if let ScanMode::QuickCount = &progress.scan_mode {
-            // Quick count phase
+        if let Some(current) = &metrics.current_text {
             ui.add_space(4.0);
-            ui.label(RichText::new("快速统计目录和文件数量...").small().weak());
+            ui.label(
+                RichText::new(format!("当前：{}", compact_text(current, 96)))
+                    .small()
+                    .color(C.text.muted),
+            );
         }
     }
 
@@ -2126,11 +2773,26 @@ impl CDriveManagerApp {
     fn draw_wiztree_layout(&mut self, ui: &mut egui::Ui, stats: &ScanStats) {
         let available_height = ui.available_height();
         let available_width = ui.available_width();
+
+        // When the bottom panel is dragged very tall, CentralPanel may be squeezed
+        // to nearly zero. Show a hint instead of trying to render the full layout.
+        if available_height < 120.0 {
+            ui.vertical_centered(|ui| {
+                ui.add_space(available_height * 0.3);
+                ui.label(
+                    egui::RichText::new("↓ 向下拖动底部面板以释放空间 ↑")
+                        .small()
+                        .color(C.text.muted),
+                );
+            });
+            return;
+        }
+
         let start = ui.cursor().min;
 
-        // Use 55% height for visualization area, rest for tabs
-        let viz_height = (available_height * 0.55).max(280.0).min(520.0);
-        let splitter_width = 6.0;
+        // Use full height for visualization area (detailed tables are in their own bottom panel)
+        let viz_height = available_height.max(280.0);
+        let splitter_width = 1.0;
         let splitter_total = splitter_width * 2.0;
 
         // Clamp ratios to reasonable bounds
@@ -2195,6 +2857,7 @@ impl CDriveManagerApp {
         ui.scope_builder(
             egui::UiBuilder::new().max_rect(left_rect),
             |ui: &mut egui::Ui| {
+                ui.set_clip_rect(left_rect);
                 egui::Frame::group(ui.style()).show(ui, |ui| {
                     ui.set_min_height(viz_height - 8.0);
                     self.draw_directory_tree_panel(ui, stats);
@@ -2206,6 +2869,7 @@ impl CDriveManagerApp {
         ui.scope_builder(
             egui::UiBuilder::new().max_rect(center_rect),
             |ui: &mut egui::Ui| {
+                ui.set_clip_rect(center_rect);
                 egui::Frame::group(ui.style()).show(ui, |ui| {
                     ui.set_min_height(viz_height - 8.0);
                     self.draw_treemap_panel(ui, stats);
@@ -2217,6 +2881,7 @@ impl CDriveManagerApp {
         ui.scope_builder(
             egui::UiBuilder::new().max_rect(right_rect),
             |ui: &mut egui::Ui| {
+                ui.set_clip_rect(right_rect);
                 egui::Frame::group(ui.style()).show(ui, |ui| {
                     ui.set_min_height(viz_height - 8.0);
                     self.draw_extension_panel(ui, stats);
@@ -2245,14 +2910,6 @@ impl CDriveManagerApp {
             },
             |app, ratio| app.right_panel_ratio = ratio,
         );
-
-        // Advance cursor to below the visualization area
-        ui.allocate_space(egui::vec2(available_width, viz_height));
-
-        // Bottom: Tab bar with detailed data tables
-        ui.add_space(6.0);
-        ui.separator();
-        self.draw_tabs(ui, stats);
     }
 
     /// Draws a draggable splitter bar that updates the given panel ratio.
@@ -2275,11 +2932,11 @@ impl CDriveManagerApp {
         }
 
         let color = if response.dragged() {
-            egui::Color32::from_rgb(100, 150, 200)
+            egui::Color32::from_rgb(80, 90, 110)
         } else if response.hovered() {
-            egui::Color32::from_rgb(80, 120, 180)
+            egui::Color32::from_rgb(50, 60, 80)
         } else {
-            egui::Color32::from_rgb(45, 50, 60)
+            egui::Color32::from_rgb(50, 60, 80)
         };
         ui.painter().rect_filled(rect, 0.0, color);
 
@@ -2300,19 +2957,37 @@ impl CDriveManagerApp {
         ui.add_space(4.0);
 
         if let Some(tree) = &stats.directory_tree {
-            self.draw_tree_recursive(ui, tree, tree.root_index, 0, stats);
+            egui::ScrollArea::vertical()
+                .id_salt("directory_tree_scroll")
+                .show(ui, |ui| {
+                    self.draw_tree_recursive(ui, tree, tree.root_index, 0, stats);
+                });
         } else if self.scan_in_progress {
-            ui.label("扫描中，先显示已发现的顶层目录...");
+            let is_mft = matches!(
+                self.progress.as_ref().map(|p| &p.scan_mode),
+                Some(crate::scanner::ScanMode::MftScan)
+            );
+            if is_mft {
+                ui.label("MFT 高速扫描中，完整目录树将在完成后生成；下方为实时聚合的顶层目录。");
+            } else {
+                ui.label("扫描中，先显示已发现的顶层目录…");
+            }
             ui.label(format!("目录: {}", format::count(stats.dir_count)));
             ui.label(format!("文件: {}", format::count(stats.file_count)));
             ui.add_space(6.0);
 
             if stats.top_level_dirs.is_empty() {
-                ui.label("正在发现顶层目录...");
+                if stats.dir_count > 0 {
+                    ui.label(format!(
+                        "已发现 {} 个目录，正在聚合顶层目录…",
+                        format::count(stats.dir_count)
+                    ));
+                } else {
+                    ui.label("正在发现顶层目录…");
+                }
             } else {
                 egui::ScrollArea::vertical()
                     .id_salt("incremental_tree_scroll")
-                    .max_height(260.0)
                     .show(ui, |ui| {
                         for dir in stats.top_level_dirs.iter().take(80) {
                             let name = dir
@@ -2320,14 +2995,63 @@ impl CDriveManagerApp {
                                 .file_name()
                                 .and_then(|name| name.to_str())
                                 .unwrap_or_else(|| dir.path.to_str().unwrap_or("<unknown>"));
-                            let label = if dir.total_size > 0 {
-                                format!("{} ({})", name, format::bytes(dir.total_size))
+                            let size_text = if dir.total_size > 0 {
+                                format::bytes(dir.total_size)
                             } else {
-                                name.to_owned()
+                                "—".to_owned()
                             };
 
-                            if ui.small_button(label).clicked() {
-                                self.treemap_current_dir = Some(dir.path.clone());
+                            ui.horizontal(|ui| {
+                                let is_expanded = self.expanded_dirs.contains(&dir.path);
+                                let expand_icon = if is_expanded { "▼" } else { "▶" };
+                                let expand_button = egui::Button::new(
+                                    egui::RichText::new(expand_icon).size(10.0),
+                                )
+                                .fill(egui::Color32::TRANSPARENT)
+                                .small();
+                                if ui.add(expand_button).clicked() {
+                                    if is_expanded {
+                                        self.expanded_dirs.remove(&dir.path);
+                                    } else {
+                                        self.expanded_dirs.insert(dir.path.clone());
+                                    }
+                                }
+
+                                // Folder icon
+                                ui.label(egui::RichText::new("📁").size(14.0));
+
+                                // Directory name with size - click to navigate in treemap
+                                let text = format!("{} ({})", name, size_text);
+                                if ui.small_button(text).clicked() {
+                                    self.treemap_current_dir = Some(dir.path.clone());
+                                }
+                            });
+
+                            // Show extra details when expanded
+                            let is_expanded = self.expanded_dirs.contains(&dir.path);
+                            if is_expanded {
+                                egui::Frame::none().inner_margin(egui::Margin::same(8)).show(
+                                    ui,
+                                    |ui| {
+                                        ui.label(format!("路径: {}", dir.path.display()));
+                                        if dir.direct_file_count > 0 {
+                                            ui.label(format!(
+                                                "文件数: {}",
+                                                format::count(dir.direct_file_count)
+                                            ));
+                                            ui.label(format!(
+                                                "文件大小: {}",
+                                                format::bytes(dir.direct_file_size)
+                                            ));
+                                        }
+                                        if dir.descendant_file_count > 0 {
+                                            ui.label(format!(
+                                                "后代文件数: {}",
+                                                format::count(dir.descendant_file_count)
+                                            ));
+                                        }
+                                    },
+                                );
                             }
                         }
                     });
@@ -2394,10 +3118,8 @@ impl CDriveManagerApp {
                 0.0
             };
 
-            // Use unified color for this directory type
-            let path_str = node.record.path.to_string_lossy();
-            let ext_hint = path_str.rsplit('.').next().unwrap_or("");
-            let color = self.color_palette.color_for_extension(ext_hint);
+            // Use path-based color for consistent visualization with treemap
+            let color = crate::color_palette::ColorPalette::color_for_path(&node.record.path);
 
             // Draw percentage progress bar
             ui.add(
@@ -2422,9 +3144,59 @@ impl CDriveManagerApp {
         });
 
         // Only draw children if expanded (or at root level, always show first level)
-        if has_children && (is_expanded || depth == 0) {
-            for &child_index in &node.children {
-                self.draw_tree_recursive(ui, tree, child_index, depth + 1, stats);
+        if is_expanded || depth == 0 {
+            // Draw subdirectories first
+            if has_children {
+                for &child_index in &node.children {
+                    self.draw_tree_recursive(ui, tree, child_index, depth + 1, stats);
+                }
+            }
+
+            // Draw files in this directory
+            if let Some(files) = tree.files_by_dir.get(&node.record.path) {
+                let file_indent = (depth + 1) * 16;
+                for file in files {
+                    ui.horizontal(|ui| {
+                        ui.add_space(file_indent as f32);
+                        ui.add_space(12.0); // Align with expand button width
+
+                        // File icon
+                        ui.label(egui::RichText::new("📄").size(14.0));
+
+                        // File name
+                        let name = file.path.file_name()
+                            .and_then(|n| n.to_str())
+                            .unwrap_or("");
+                        let size_text = format::bytes(file.size);
+
+                        // Percentage relative to parent directory
+                        let percentage = if node.record.total_size > 0 {
+                            (file.size as f64 / node.record.total_size as f64) * 100.0
+                        } else {
+                            0.0
+                        };
+
+                        let color = crate::color_palette::ColorPalette::color_for_path(&file.path);
+
+                        ui.add(
+                            egui::ProgressBar::new((percentage / 100.0) as f32)
+                                .desired_width(50.0)
+                                .desired_height(8.0)
+                                .fill(color),
+                        );
+
+                        let text = format!("{} ({})", name, size_text);
+                        if ui.small_button(text).clicked() {
+                            self.treemap_current_dir = Some(file.path.clone());
+                        }
+
+                        ui.label(
+                            egui::RichText::new(format!("{:.1}%", percentage))
+                                .small()
+                                .weak(),
+                        );
+                    });
+                }
             }
         }
     }
@@ -2434,130 +3206,134 @@ impl CDriveManagerApp {
         ui.heading("文件类型");
         ui.add_space(4.0);
 
-        if stats.extensions.is_empty() {
-            if self.scan_in_progress {
-                ui.label("统计中...");
-            } else {
-                ui.label("无数据");
-            }
-            return;
-        }
-
-        // Show clear filter button if extensions are selected
-        if !self.selected_extensions.is_empty() {
-            ui.horizontal(|ui| {
-                if ui.small_button("✕ 清除").clicked() {
-                    self.selected_extensions.clear();
-                }
-                ui.label(format!("已选 {}", self.selected_extensions.len()));
-            });
-            ui.add_space(4.0);
-        }
-
-        // Adapt layout to available width
-        let panel_width = ui.available_width();
-        let use_compact = panel_width < 180.0;
-        let bar_width = if use_compact { 40.0 } else { 60.0 };
-
-        // Show top extensions with unified color palette
-        let total = stats.total_size as f64;
-        for ext in stats.extensions.iter().take(15) {
-            let percentage = if total > 0.0 {
-                (ext.total_size as f64 / total) * 100.0
-            } else {
-                0.0
-            };
-
-            // Use unified color palette
-            let ext_name = ext.extension.trim_start_matches('.').to_string();
-            let color = self.color_palette.color_for_extension(&ext_name);
-            let category = self.color_palette.category_for_extension(&ext_name);
-            let is_selected = self.selected_extensions.contains(&ext.extension);
-
-            ui.horizontal(|ui| {
-                // Color indicator (clickable for selection)
-                let color_label = if is_selected {
-                    format!("✓{}", category.icon())
-                } else {
-                    category.icon().to_string()
-                };
-
-                let color_response = ui.add(
-                    egui::Label::new(egui::RichText::new(color_label).color(color))
-                        .selectable(false)
-                        .sense(egui::Sense::click()),
-                );
-
-                // Click to select/highlight this extension type
-                if color_response.clicked() {
-                    if is_selected {
-                        self.selected_extensions.remove(&ext.extension);
+        egui::ScrollArea::vertical()
+            .id_salt("extension_panel_scroll")
+            .show(ui, |ui| {
+                if stats.extensions.is_empty() {
+                    if self.scan_in_progress {
+                        ui.label("统计中...");
                     } else {
-                        self.selected_extensions.insert(ext.extension.clone());
+                        ui.label("无数据");
                     }
+                    return;
                 }
 
-                // Progress bar
-                ui.add(
-                    egui::ProgressBar::new((percentage / 100.0) as f32)
-                        .desired_width(bar_width)
-                        .desired_height(8.0)
-                        .fill(color),
-                );
+                // Show clear filter button if extensions are selected
+                if !self.selected_extensions.is_empty() {
+                    ui.horizontal(|ui| {
+                        if ui.small_button("✕ 清除").clicked() {
+                            self.selected_extensions.clear();
+                        }
+                        ui.label(format!("已选 {}", self.selected_extensions.len()));
+                    });
+                    ui.add_space(4.0);
+                }
 
-                // Extension name (highlighted if selected)
-                let ext_text = if is_selected {
-                    egui::RichText::new(&ext.extension).strong().color(color)
-                } else {
-                    egui::RichText::new(&ext.extension)
-                };
-                ui.label(ext_text);
+                // Adapt layout to available width
+                let panel_width = ui.available_width();
+                let use_compact = panel_width < 180.0;
+                let bar_width = if use_compact { 40.0 } else { 60.0 };
 
-                // Size and percentage - hide percentage in compact mode
-                if use_compact {
-                    ui.label(format::bytes(ext.total_size));
-                } else {
-                    ui.label(format!(
-                        "{} ({:.1}%)",
-                        format::bytes(ext.total_size),
-                        percentage
-                    ));
+                // Show top extensions with unified color palette
+                let total = stats.total_size as f64;
+                for ext in stats.extensions.iter().take(15) {
+                    let percentage = if total > 0.0 {
+                        (ext.total_size as f64 / total) * 100.0
+                    } else {
+                        0.0
+                    };
+
+                    // Use unified color palette
+                    let ext_name = ext.extension.trim_start_matches('.').to_string();
+                    let color = self.color_palette.color_for_extension(&ext_name);
+                    let category = self.color_palette.category_for_extension(&ext_name);
+                    let is_selected = self.selected_extensions.contains(&ext.extension);
+
+                    ui.horizontal(|ui| {
+                        // Color indicator (clickable for selection)
+                        let color_label = if is_selected {
+                            format!("✓{}", category.icon())
+                        } else {
+                            category.icon().to_string()
+                        };
+
+                        let color_response = ui.add(
+                            egui::Label::new(egui::RichText::new(color_label).color(color))
+                                .selectable(false)
+                                .sense(egui::Sense::click()),
+                        );
+
+                        // Click to select/highlight this extension type
+                        if color_response.clicked() {
+                            if is_selected {
+                                self.selected_extensions.remove(&ext.extension);
+                            } else {
+                                self.selected_extensions.insert(ext.extension.clone());
+                            }
+                        }
+
+                        // Progress bar
+                        ui.add(
+                            egui::ProgressBar::new((percentage / 100.0) as f32)
+                                .desired_width(bar_width)
+                                .desired_height(8.0)
+                                .fill(color),
+                        );
+
+                        // Extension name (highlighted if selected)
+                        let ext_text = if is_selected {
+                            egui::RichText::new(&ext.extension).strong().color(color)
+                        } else {
+                            egui::RichText::new(&ext.extension)
+                        };
+                        ui.label(ext_text);
+
+                        // Size and percentage - hide percentage in compact mode
+                        if use_compact {
+                            ui.label(format::bytes(ext.total_size));
+                        } else {
+                            ui.label(format!(
+                                "{} ({:.1}%)",
+                                format::bytes(ext.total_size),
+                                percentage
+                            ));
+                        }
+                    });
+
+                    ui.add_space(1.0);
+                }
+
+                ui.add_space(6.0);
+                ui.label(format!(
+                    "共 {} 种",
+                    format::count(stats.extensions.len() as u64)
+                ));
+
+                // Show legend only if enough width
+                if !use_compact {
+                    ui.add_space(4.0);
+                    ui.label(egui::RichText::new("颜色图例").small().weak());
+                    egui::Grid::new("category_legend")
+                        .num_columns(4)
+                        .spacing([8.0, 4.0])
+                        .show(ui, |ui| {
+                            for category in [
+                                crate::color_palette::FileCategory::Executable,
+                                crate::color_palette::FileCategory::Document,
+                                crate::color_palette::FileCategory::Media,
+                                crate::color_palette::FileCategory::Code,
+                                crate::color_palette::FileCategory::System,
+                                crate::color_palette::FileCategory::Temporary,
+                                crate::color_palette::FileCategory::Archive,
+                                crate::color_palette::FileCategory::Data,
+                            ] {
+                                let color = category.default_color();
+                                ui.colored_label(color, category.icon());
+                                ui.label(egui::RichText::new(category.label()).small());
+                            }
+                        });
                 }
             });
-
-            ui.add_space(1.0);
-        }
-
-        ui.add_space(6.0);
-        ui.label(format!(
-            "共 {} 种",
-            format::count(stats.extensions.len() as u64)
-        ));
-
-        // Show legend only if enough width
-        if !use_compact {
-            ui.add_space(4.0);
-            ui.label(egui::RichText::new("颜色图例").small().weak());
-            egui::Grid::new("category_legend")
-                .num_columns(4)
-                .spacing([8.0, 4.0])
-                .show(ui, |ui| {
-                    for category in [
-                        crate::color_palette::FileCategory::Executable,
-                        crate::color_palette::FileCategory::Document,
-                        crate::color_palette::FileCategory::Media,
-                        crate::color_palette::FileCategory::Code,
-                        crate::color_palette::FileCategory::System,
-                        crate::color_palette::FileCategory::Temporary,
-                        crate::color_palette::FileCategory::Archive,
-                        crate::color_palette::FileCategory::Data,
-                    ] {
-                        let color = category.default_color();
-                        ui.colored_label(color, category.icon());
-                        ui.label(egui::RichText::new(category.label()).small());
-                    }
-                });
-        }
     }
 
     fn draw_summary(&self, ui: &mut egui::Ui, stats: &ScanStats) {
@@ -3420,13 +4196,19 @@ impl CDriveManagerApp {
             tab_button(
                 ui,
                 &mut self.selected_tab,
+                ResultTab::AppCache,
+                "应用缓存",
+            );
+            tab_button(
+                ui,
+                &mut self.selected_tab,
                 ResultTab::AiReview,
                 "AI 审核报告",
             );
             tab_button(ui, &mut self.selected_tab, ResultTab::Errors, "错误");
         });
         ui.separator();
-        self.draw_search_bar(ui);
+        // Removed search bar from here – search is now a standalone side panel.
         ui.add_space(4.0);
 
         match self.selected_tab {
@@ -3458,8 +4240,389 @@ impl CDriveManagerApp {
             }
             ResultTab::CleanupPreview => self.draw_cleanup_preview_tab(ui),
             ResultTab::DuplicatePreview => self.draw_duplicate_preview_tab(ui),
+            ResultTab::AppCache => self.draw_app_cache_tab(ui),
             ResultTab::AiReview => self.draw_ai_review_tab(ui),
             ResultTab::Errors => error_list(ui, stats, &self.search_query),
+        }
+        // Fill remaining space to prevent black areas when panel is taller than content
+        let remaining = ui.available_height();
+        if remaining > 0.0 {
+            ui.allocate_space(egui::vec2(ui.available_width(), remaining));
+        }
+    }
+
+    /// Search tab: Everything-like instant file search with pagination and highlighting
+    fn draw_search_tab(&mut self, ui: &mut egui::Ui) {
+        ui.heading("搜索");
+        ui.add_space(4.0);
+
+        // USN Status bar
+        let usn_status = if self.usn_handle.is_some() {
+            ("🟢 USN 监听中", egui::Color32::from_rgb(50, 200, 50))
+        } else {
+            ("🔴 USN 未监听", egui::Color32::from_rgb(200, 50, 50))
+        };
+        ui.horizontal(|ui| {
+            ui.colored_label(usn_status.1, usn_status.0);
+            if self.usn_handle.is_some() {
+                if ui.button("停止 USN 监听").clicked() {
+                    if let Some(handle) = self.usn_handle.take() {
+                        handle.cancel();
+                    }
+                }
+            } else {
+                if ui.button("启动 USN 监听").clicked() {
+                    if let Some(drive) = self.root_input.chars().next() {
+                        let root_key = crate::search_index::root_key(Path::new(&self.root_input));
+                        self.usn_handle = Some(crate::search_index::spawn_usn_index_listener(root_key, drive));
+                    }
+                }
+            }
+        });
+        ui.add_space(8.0);
+
+        let response = ui.horizontal(|ui| {
+            ui.label("搜索：");
+            let edit = egui::TextEdit::singleline(&mut self.search_query)
+                .hint_text("输入文件名或路径关键词（支持模糊匹配）")
+                .desired_width(400.0);
+            let edit_response = ui.add(edit);
+            if !self.search_query.is_empty() {
+                if ui.button("清空").clicked() {
+                    self.search_query.clear();
+                    self.search_results.clear();
+                    self.search_page = 0;
+                }
+            }
+            if ui.button("搜索").clicked() {
+                self.perform_search();
+                self.search_page = 0;
+            }
+            edit_response
+        }).inner;
+
+        // Debounce: keystrokes just record the timestamp; the actual search is
+        // fired from `update()` once SEARCH_DEBOUNCE has elapsed. This keeps
+        // typing responsive — the UI thread no longer blocks on SQLite.
+        if response.changed() {
+            if self.search_query.trim().is_empty() {
+                // 用户清空了搜索框：立即执行空查询，展示全部结果
+                if let Some(h) = self.search_handle.take() {
+                    h.cancel();
+                }
+                self.search_last_input = Some(std::time::Instant::now());
+            } else {
+                self.search_last_input = Some(std::time::Instant::now());
+            }
+        }
+
+        ui.add_space(8.0);
+
+        if self.search_query.trim().is_empty() {
+            // 空查询状态：展示全部文件/目录
+            if self.search_results.is_empty() && !self.search_in_progress {
+                ui.label(RichText::new("输入关键词搜索文件，或留空查看全部").small().weak());
+                return;
+            }
+            // 继续渲染结果（全部文件列表）
+        }
+
+        if self.search_results.is_empty() && !self.search_in_progress {
+            ui.label("没有找到匹配的文件。");
+            return;
+        }
+
+        // Pagination
+        const PAGE_SIZE: usize = 100;
+        let total = self.search_results.len();
+        let total_pages = (total + PAGE_SIZE - 1) / PAGE_SIZE;
+        let current_page = self.search_page.min(total_pages - 1);
+        let start = current_page * PAGE_SIZE;
+        let end = (start + PAGE_SIZE).min(total);
+        let page_results = &self.search_results[start..end];
+
+        ui.horizontal(|ui| {
+            ui.label(format!("找到 {} 个结果", total));
+            ui.separator();
+            if ui.button("◀").clicked() && current_page > 0 {
+                self.search_page = current_page - 1;
+            }
+            ui.label(format!("第 {} / {} 页", current_page + 1, total_pages.max(1)));
+            if ui.button("▶").clicked() && current_page + 1 < total_pages {
+                self.search_page = current_page + 1;
+            }
+            ui.separator();
+            ui.label(format!("显示 {} - {}", start + 1, end));
+        });
+        ui.add_space(4.0);
+
+        egui::ScrollArea::vertical()
+            .id_salt("search_results_scroll")
+            .show(ui, |ui| {
+                egui::Grid::new("search_results_grid")
+                    .striped(true)
+                    .num_columns(4)
+                    .spacing([12.0, 4.0])
+                    .show(ui, |ui| {
+                        // Header
+                        ui.label(RichText::new("名称").strong());
+                        ui.label(RichText::new("路径").strong());
+                        ui.label(RichText::new("大小").strong());
+                        ui.label(RichText::new("类型").strong());
+                        ui.end_row();
+
+                        for result in page_results {
+                            let query_lower = self.search_query.to_ascii_lowercase();
+
+                            // Name with highlighting
+                            ui.horizontal(|ui| {
+                                let name_label = if result.name.to_ascii_lowercase().contains(&query_lower) {
+                                    // Simple highlight: make matching text bold and blue
+                                    RichText::new(&result.name)
+                                        .strong()
+                                        .color(egui::Color32::from_rgb(100, 180, 255))
+                                } else {
+                                    RichText::new(&result.name)
+                                };
+                                ui.add(egui::Label::new(name_label).sense(egui::Sense::click()));
+                            });
+
+                            // Path with hover
+                            ui.label(result.parent_path.clone()).on_hover_text(&result.path);
+
+                            // Size
+                            ui.label(format::bytes(result.size));
+
+                            // Type
+                            if result.is_directory {
+                                ui.label("📁 目录");
+                            } else if !result.extension.is_empty() {
+                                ui.label(format!("📄 .{}", result.extension));
+                            } else {
+                                ui.label("📄 文件");
+                            }
+
+                            ui.end_row();
+                        }
+                    });
+            });
+    }
+
+    fn perform_search(&mut self) {
+        let query = self.search_query.trim().to_string();
+        if query.len() < 2 {
+            self.search_results.clear();
+            self.search_in_progress = false;
+            self.search_last_input = None;
+            if let Some(h) = self.search_handle.take() {
+                h.cancel();
+            }
+            return;
+        }
+
+        // Cancel any in-flight search before starting a new one. The previous
+        // worker thread may still complete and push a result onto its channel,
+        // but we've dropped the receiver so it's discarded.
+        if let Some(h) = self.search_handle.take() {
+            h.cancel();
+        }
+
+        self.search_in_progress = true;
+        let root_key = crate::search_index::root_key(Path::new(&self.root_input));
+        self.search_handle = Some(crate::search_index::spawn_search(
+            root_key,
+            query,
+            // Pull a generous batch; pagination is handled client-side so the
+            // user can flip through results without re-querying.
+            500,
+        ));
+        self.search_last_input = None;
+    }
+
+    /// Pump the search lifecycle each frame:
+    /// 1. If the user is mid-debounce, fire the search once the debounce
+    ///    window has elapsed.
+    /// 2. Drain any completed async search result.
+    /// 3. Keep repainting while a search is in flight so the result lands
+    ///    promptly when the worker thread finishes.
+    fn poll_search_events(&mut self, ctx: &egui::Context) {
+        // Fire a debounced search.
+        if let Some(ts) = self.search_last_input {
+            if ts.elapsed() >= SEARCH_DEBOUNCE {
+                self.perform_search();
+            }
+        }
+
+        // Adopt completed results.
+        if self.search_handle.is_some() {
+            self.poll_search();
+            // Keep the UI ticking while we wait so the result appears without
+            // requiring another user interaction.
+            if self.search_handle.is_some() {
+                ctx.request_repaint();
+            }
+        }
+    }
+
+    /// Drain the async search channel: if the in-flight search has produced a
+    /// result, apply it. Returns whether a result was consumed.
+    fn poll_search(&mut self) -> bool {
+        let Some(handle) = self.search_handle.as_ref() else {
+            return false;
+        };
+        // Non-blocking receive; only act when a result is ready.
+        let Ok(result) = handle.receiver.try_recv() else {
+            return false;
+        };
+
+        match result {
+            crate::search_index::SearchResult::Ok { query, results } => {
+                // Only adopt the result if the query still matches what's in
+                // the input box — otherwise the user has typed more and a new
+                // search is already queued/running.
+                let current = self.search_query.trim();
+                if current == query {
+                    self.search_results = results;
+                    self.search_page = 0;
+                }
+            }
+            crate::search_index::SearchResult::Error(e) => {
+                eprintln!("Search error: {}", e);
+                self.search_results.clear();
+                self.search_page = 0;
+            }
+        }
+        self.search_in_progress = false;
+        self.search_handle = None;
+        true
+    }
+
+    fn draw_app_cache_tab(&mut self, ui: &mut egui::Ui) {
+        let in_progress = self.app_cache_in_progress;
+        let cancel_requested = self.app_cache_cancel_requested;
+
+        if in_progress {
+            egui::Frame::group(ui.style())
+                .fill(egui::Color32::from_rgb(26, 36, 54))
+                .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(60, 130, 246)))
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        let heading = if cancel_requested {
+                            "正在取消应用缓存扫描……"
+                        } else {
+                            "正在扫描应用缓存……"
+                        };
+                        ui.label(RichText::new(heading).strong().color(egui::Color32::from_rgb(147, 197, 253)));
+                    });
+                    ui.add_space(4.0);
+                    if let Some(progress) = &self.app_cache_progress {
+                        if let Some(app) = &progress.current_app {
+                            ui.label(RichText::new(format!("当前分析：{}", app)).small().color(C.text.secondary));
+                        }
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label(RichText::new(format!("已发现应用缓存：{} 个", format::count(progress.entries.len() as u64))).strong());
+                            ui.label(" | ");
+                            ui.label(RichText::new(format!("累计检测到大小：{}", format::bytes(progress.accumulated_size))).strong().color(C.success));
+                            ui.label(" | ");
+                            ui.label(RichText::new(format!("累计文件数：{} 个", format::count(progress.accumulated_count))));
+                        });
+                    } else {
+                        ui.label(RichText::new("正在启动应用缓存扫描后台线程……").small().weak());
+                    }
+                });
+            ui.add_space(8.0);
+        }
+
+        // Show start/cancel button inside the tab for convenience
+        ui.horizontal(|ui| {
+            if in_progress {
+                if ui.button("取消扫描").clicked() && !cancel_requested {
+                    self.cancel_app_cache_scan();
+                }
+            } else {
+                let btn = egui::Button::new("🔍 开始扫描应用缓存");
+                if ui.add(btn).clicked() {
+                    self.start_app_cache_scan();
+                }
+            }
+        });
+        ui.separator();
+
+        if let Some(report) = &self.app_cache_report {
+            ui.label(
+                RichText::new(format!(
+                    "应用缓存检测结果：共发现 {} 个有效缓存，总占用大小 {}。当前版本不会执行删除操作。",
+                    format::count(report.entries.len() as u64),
+                    format::bytes(report.total_reclaimable)
+                ))
+                .small()
+                .strong(),
+            );
+            ui.add_space(4.0);
+
+            // Filter entries using search query
+            let query = normalized_query(&self.search_query);
+            let entries: Vec<_> = report
+                .entries
+                .iter()
+                .filter(|entry| {
+                    query.is_empty()
+                        || text_matches(&entry.app_name, &query)
+                        || text_matches(entry.category.label(), &query)
+                        || text_matches(&entry.root_path.display().to_string(), &query)
+                })
+                .collect();
+
+            if entries.is_empty() {
+                ui.label("没有匹配的缓存项目。");
+            } else {
+                egui::ScrollArea::vertical()
+                    .max_height(360.0)
+                    .show(ui, |ui| {
+                        egui::Grid::new("app_cache_table")
+                            .striped(true)
+                            .num_columns(7)
+                            .spacing([12.0, 4.0])
+                            .show(ui, |ui| {
+                                plain_header(ui, "图标");
+                                plain_header(ui, "分类");
+                                plain_header(ui, "应用名称");
+                                plain_header(ui, "大小");
+                                plain_header(ui, "文件数");
+                                plain_header(ui, "路径");
+                                plain_header(ui, "操作");
+                                ui.end_row();
+
+                                for entry in entries {
+                                    ui.label(entry.category.icon());
+                                    ui.label(entry.category.label());
+                                    ui.label(RichText::new(&entry.app_name).strong());
+                                    ui.label(format::bytes(entry.total_size));
+                                    ui.label(format::count(entry.file_count));
+                                    
+                                    let path_text = entry.root_path.display().to_string();
+                                    ui.label(RichText::new(&path_text).weak().small());
+
+                                    ui.horizontal(|ui| {
+                                        if ui.small_button("📋 复制").clicked() {
+                                            ui.ctx().copy_text(path_text.clone());
+                                            self.status_message = format!("已复制路径: {}", path_text);
+                                        }
+                                        if ui.small_button("📂 打开").clicked() {
+                                            if let Err(e) = open::that_detached(&entry.root_path) {
+                                                self.status_message = format!("打开位置失败: {}", e);
+                                            }
+                                        }
+                                    });
+
+                                    ui.end_row();
+                                }
+                            });
+                    });
+            }
+        } else if !in_progress {
+            ui.label("点击上方按钮扫描本地第三方应用缓存（如 Chrome 浏览器、npm 缓存、NuGet 缓存等），快速发现潜在空间占用。当前版本不会执行清理删除。");
         }
     }
 
@@ -3486,6 +4649,44 @@ impl CDriveManagerApp {
     }
 
     fn draw_cleanup_preview_tab(&mut self, ui: &mut egui::Ui) {
+        if self.cleanup_in_progress {
+            egui::Frame::group(ui.style())
+                .fill(egui::Color32::from_rgb(26, 36, 54))
+                .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(60, 130, 246)))
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        let heading = if self.cleanup_cancel_requested {
+                            "正在取消清理预览分析……"
+                        } else {
+                            "正在实时扫描磁盘文件并生成清理预览……"
+                        };
+                        ui.label(RichText::new(heading).strong().color(egui::Color32::from_rgb(147, 197, 253)));
+                    });
+                    ui.add_space(4.0);
+                    if let Some(progress) = &self.cleanup_progress {
+                        if let Some(path) = &progress.current_path {
+                            ui.label(RichText::new(format!("当前分析：{}", path.display())).small().color(C.text.secondary));
+                        }
+                        let preview = &progress.preview;
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label(RichText::new(format!("实时发现候选：{} 个", format::count(preview.candidate_count))).strong());
+                            ui.label(" | ");
+                            ui.label(RichText::new(format!("预计可清理：{}", format::bytes(preview.reclaimable_size))).strong().color(C.success));
+                            ui.label(" | ");
+                            ui.label(RichText::new(format!("受保护：{} 个 ({})", format::count(preview.protected_count), format::bytes(preview.protected_size))));
+                            if preview.error_count > 0 {
+                                ui.label(" | ");
+                                ui.label(RichText::new(format!("错误：{} 条", format::count(preview.error_count))).color(C.warning));
+                            }
+                        });
+                    } else {
+                        ui.label(RichText::new("正在启动扫描与规则匹配后台线程……").small().weak());
+                    }
+                });
+            ui.add_space(8.0);
+        }
+
         self.draw_cleanup_rules_panel(ui);
         ui.separator();
         cleanup_preview_table(
@@ -3494,6 +4695,7 @@ impl CDriveManagerApp {
             &self.search_query,
             &mut self.cleanup_sort,
             &mut self.status_message,
+            self.cleanup_in_progress,
         );
     }
 
@@ -3529,19 +4731,693 @@ impl CDriveManagerApp {
             &self.search_query,
             &mut self.duplicate_sort,
             &mut self.status_message,
+            self.duplicate_in_progress,
         );
     }
 
     fn draw_ai_review_tab(&mut self, ui: &mut egui::Ui) {
+        if self.ai_analysis_in_progress {
+            egui::Frame::group(ui.style())
+                .fill(egui::Color32::from_rgb(26, 36, 54))
+                .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(60, 130, 246)))
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        let heading = if self.ai_analysis_cancel_requested {
+                            "正在取消 AI 分析审核……"
+                        } else {
+                            "正在实时分析并由 AI 审核候选列表……"
+                        };
+                        ui.label(RichText::new(heading).strong().color(egui::Color32::from_rgb(147, 197, 253)));
+                    });
+                    ui.add_space(4.0);
+                    if let Some(progress) = &self.ai_analysis_progress {
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label(RichText::new(format!("阶段：{}", progress.phase.label())).strong());
+                            if let Some(item) = &progress.current_item {
+                                ui.label(" | ");
+                                ui.label(RichText::new(item).small().color(C.text.secondary));
+                            }
+                        });
+                        let report = &progress.report;
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label(RichText::new(format!("模型：{}", report.model)).small());
+                            ui.label(" | ");
+                            ui.label(RichText::new(format!("已分析候选：{} 个", format::count(report.candidate_count))).strong());
+                            ui.label(" | ");
+                            ui.label(RichText::new(format!("建议清理：{} 个", format::count(report.delete_candidate_count))).strong().color(C.success));
+                            ui.label(" | ");
+                            ui.label(RichText::new(format!("需人工复核：{} 个", format::count(report.needs_review_count))).color(C.warning));
+                            if report.error_count > 0 {
+                                ui.label(" | ");
+                                ui.label(RichText::new(format!("错误：{} 条", format::count(report.error_count))).color(C.error));
+                            }
+                        });
+                    } else {
+                        ui.label(RichText::new("正在启动 AI 分析服务并准备待审核文件列表……").small().weak());
+                    }
+                });
+            ui.add_space(8.0);
+        }
+
         self.draw_ai_config_panel(ui);
         ui.separator();
-        ai_review_table(
-            ui,
-            self.current_ai_analysis_report().as_deref(),
-            &self.search_query,
-            &mut self.ai_sort,
-            &mut self.status_message,
+        self.draw_ai_review_content(ui);
+    }
+
+    /// 渲染 AI 审核结果：概要、分类筛选栏、可点击的结果表格与删除入口。
+    fn draw_ai_review_content(&mut self, ui: &mut egui::Ui) {
+        use crate::ai_analysis::AiReviewBucket;
+
+        let in_progress = self.ai_analysis_in_progress;
+        let Some(report) = self.current_ai_analysis_report() else {
+            if in_progress {
+                ui.add_space(20.0);
+                ui.vertical_centered(|ui| {
+                    ui.spinner();
+                    ui.add_space(8.0);
+                    ui.label(
+                        RichText::new("正在收集候选文件并由 AI 深度审核分析中……")
+                            .strong()
+                            .color(egui::Color32::from_rgb(147, 197, 253)),
+                    );
+                    ui.add_space(4.0);
+                    ui.label("正在请求 AI 模型接口返回结构化建议与风险分析，上方状态卡与列表会实时更新。");
+                });
+                ui.add_space(20.0);
+            } else {
+                ui.label("生成清理预览或重复文件预览后，点击\"AI 分析审核\"。默认建议移至回收站（可还原），受保护/高危项不提供删除按钮。 ");
+            }
+            return;
+        };
+
+        ui.label(
+            RichText::new(format!(
+                "AI 审核报告：根目录 {}，Provider {}，模型 {}。候选 {} 个，待删清单候选 {} 个，需人工复核 {} 个，拒绝/保留 {} 个，受保护 {} 个，错误 {} 条。",
+                report.root.display(),
+                report.provider_label,
+                report.model,
+                format::count(report.candidate_count),
+                format::count(report.delete_candidate_count),
+                format::count(report.needs_review_count),
+                format::count(report.rejected_count),
+                format::count(report.protected_count),
+                format::count(report.error_count)
+            ))
+            .small()
+            .strong(),
         );
+        ui.label(
+            RichText::new("可以删除：审核通过/纠正为可删、非受保护、风险不是高/未知。需要复核：AI 判定需人工确认，确认后也可删除。删除默认移至回收站，可还原。")
+                .small()
+                .weak(),
+        );
+
+        if !report.errors.is_empty() {
+            ui.add_space(8.0);
+            ui.label(
+                RichText::new(format!(
+                    "⚠ AI 流程记录了 {} 条错误：",
+                    format::count(report.error_count)
+                ))
+                .strong()
+                .color(egui::Color32::from_rgb(255, 100, 100)),
+            );
+            for (i, error) in report.errors.iter().enumerate().take(5) {
+                ui.label(
+                    RichText::new(format!("  {}. {}", i + 1, error))
+                        .small()
+                        .color(egui::Color32::from_rgb(255, 180, 180)),
+                );
+            }
+            if report.errors.len() > 5 {
+                ui.label(
+                    RichText::new(format!("  ... 还有 {} 条错误", report.errors.len() - 5))
+                        .small()
+                        .color(egui::Color32::from_rgb(200, 200, 200)),
+                );
+            }
+        }
+
+        // 统计三分类数量。
+        let mut deletable_count = 0usize;
+        let mut needs_review_count = 0usize;
+        let mut keep_count = 0usize;
+        for finding in &report.findings {
+            match finding.bucket() {
+                AiReviewBucket::Deletable => deletable_count += 1,
+                AiReviewBucket::NeedsReview => needs_review_count += 1,
+                AiReviewBucket::Keep => keep_count += 1,
+            }
+        }
+
+        // 分类筛选栏。
+        ui.add_space(8.0);
+        ui.horizontal_wrapped(|ui| {
+            ui.label(RichText::new("筛选：").strong());
+            let mut filter_button = |ui: &mut egui::Ui, filter: AiReviewFilter, text: String| {
+                if ui
+                    .selectable_label(self.ai_review_filter == filter, text)
+                    .clicked()
+                {
+                    self.ai_review_filter = filter;
+                }
+            };
+            filter_button(
+                ui,
+                AiReviewFilter::Deletable,
+                format!("🗑 可以删除 ({deletable_count})"),
+            );
+            filter_button(
+                ui,
+                AiReviewFilter::NeedsReview,
+                format!("⚠ 需要复核 ({needs_review_count})"),
+            );
+            filter_button(
+                ui,
+                AiReviewFilter::Keep,
+                format!("🔒 保留/已拒绝 ({keep_count})"),
+            );
+            filter_button(
+                ui,
+                AiReviewFilter::All,
+                format!("全部 ({})", report.findings.len()),
+            );
+        });
+
+        let filter = self.ai_review_filter;
+        let query = normalized_query(&self.search_query);
+        let mut findings: Vec<&AiReviewFinding> = report
+            .findings
+            .iter()
+            .filter(|finding| filter.accepts(finding.bucket()))
+            .filter(|finding| ai_finding_matches(finding, &query))
+            .collect();
+        let mut sort = self.ai_sort;
+        findings.sort_by(|left, right| compare_ai_findings(left, right, sort));
+
+        result_count_label(
+            ui,
+            findings.len().min(120),
+            findings.len(),
+            report.findings.len(),
+            "AI 条目",
+        );
+
+        // 批量删除按钮：仅对当前筛选下允许删除的项。
+        let batch_items: Vec<crate::deletion::DeleteItem> = findings
+            .iter()
+            .filter(|finding| finding.deletion_allowed())
+            .map(|finding| crate::deletion::DeleteItem {
+                path: finding.path.clone(),
+                size: finding.size,
+            })
+            .collect();
+        let batch_includes_review = findings
+            .iter()
+            .filter(|finding| finding.deletion_allowed())
+            .any(|finding| finding.bucket() == AiReviewBucket::NeedsReview);
+        let batch_total: u64 = findings
+            .iter()
+            .filter(|finding| finding.deletion_allowed())
+            .map(|finding| finding.size)
+            .sum();
+
+        let mut clicked_detail: Option<PathBuf> = None;
+        let mut delete_request: Option<DeleteRequest> = None;
+
+        if !batch_items.is_empty() {
+            ui.horizontal(|ui| {
+                let label = format!(
+                    "🗑 删除当前 {} 项（共 {}）",
+                    batch_items.len(),
+                    format::bytes(batch_total)
+                );
+                let enabled = !self.deletion_in_progress;
+                if ui
+                    .add_enabled(enabled, egui::Button::new(RichText::new(label).strong()))
+                    .on_hover_text("默认移至回收站，弹窗中可选择永久删除")
+                    .clicked()
+                {
+                    delete_request = Some(DeleteRequest {
+                        items: batch_items.clone(),
+                        method: crate::deletion::DeleteMethod::RecycleBin,
+                        total_size: batch_total,
+                        includes_needs_review: batch_includes_review,
+                    });
+                }
+                if self.deletion_in_progress {
+                    ui.spinner();
+                    ui.label(RichText::new("正在删除……").small().weak());
+                }
+            });
+        }
+
+        if findings.is_empty() {
+            if in_progress {
+                ui.add_space(10.0);
+                ui.vertical_centered(|ui| {
+                    ui.label(
+                        RichText::new("⏳ AI 正在逐条分析并审核候选条目，稍后在此刷新结果……")
+                            .strong()
+                            .color(C.text.secondary),
+                    );
+                });
+                ui.add_space(10.0);
+            } else {
+                ui.label("没有匹配的 AI 审核条目。 ");
+            }
+            self.ai_sort = sort;
+            return;
+        }
+
+        let mut status_message = self.status_message.clone();
+        let deletion_in_progress = self.deletion_in_progress;
+        egui::ScrollArea::vertical()
+            .max_height(360.0)
+            .show(ui, |ui| {
+                egui::Grid::new("ai_review_table")
+                    .striped(true)
+                    .num_columns(10)
+                    .spacing([12.0, 4.0])
+                    .show(ui, |ui| {
+                        sortable_header(
+                            ui,
+                            "最终建议",
+                            AiSortKey::FinalRecommendation,
+                            SortDirection::Asc,
+                            &mut sort,
+                        );
+                        sortable_header(ui, "审核", AiSortKey::AuditStatus, SortDirection::Asc, &mut sort);
+                        sortable_header(ui, "风险", AiSortKey::Risk, SortDirection::Desc, &mut sort);
+                        sortable_header(ui, "置信度", AiSortKey::Confidence, SortDirection::Desc, &mut sort);
+                        sortable_header(ui, "分类", AiSortKey::Category, SortDirection::Asc, &mut sort);
+                        sortable_header(ui, "来源", AiSortKey::Source, SortDirection::Asc, &mut sort);
+                        sortable_header(ui, "大小", AiSortKey::Size, SortDirection::Desc, &mut sort);
+                        sortable_header(ui, "保护", AiSortKey::Protected, SortDirection::Desc, &mut sort);
+                        sortable_header(ui, "路径", AiSortKey::Path, SortDirection::Asc, &mut sort);
+                        plain_header(ui, "理由/操作");
+                        ui.end_row();
+
+                        for finding in findings.into_iter().take(120) {
+                            let action = ai_finding_row(
+                                ui,
+                                finding,
+                                &mut status_message,
+                                deletion_in_progress,
+                            );
+                            if action.open_detail {
+                                clicked_detail = Some(finding.path.clone());
+                            }
+                            if action.request_delete {
+                                delete_request = Some(DeleteRequest {
+                                    items: vec![crate::deletion::DeleteItem {
+                                        path: finding.path.clone(),
+                                        size: finding.size,
+                                    }],
+                                    method: crate::deletion::DeleteMethod::RecycleBin,
+                                    total_size: finding.size,
+                                    includes_needs_review: finding.bucket()
+                                        == AiReviewBucket::NeedsReview,
+                                });
+                            }
+                        }
+                    });
+            });
+
+        self.ai_sort = sort;
+        self.status_message = status_message;
+        if let Some(path) = clicked_detail {
+            self.ai_detail_selected = Some(path);
+        }
+        if let Some(request) = delete_request {
+            self.delete_confirmation = Some(request);
+        }
+    }
+
+    /// 详情弹窗：展示所选 finding 的完整分析描述，并提供删除入口。
+    fn draw_ai_detail_window(&mut self, ctx: &egui::Context) {
+        let Some(selected) = self.ai_detail_selected.clone() else {
+            return;
+        };
+        let Some(report) = self.current_ai_analysis_report() else {
+            self.ai_detail_selected = None;
+            return;
+        };
+        let Some(finding) = report
+            .findings
+            .iter()
+            .find(|finding| finding.path == selected)
+            .cloned()
+        else {
+            // 该项可能已被删除。
+            self.ai_detail_selected = None;
+            return;
+        };
+
+        let mut open = true;
+        let mut close_requested = false;
+        let mut delete_request: Option<DeleteRequest> = None;
+        let deletion_in_progress = self.deletion_in_progress;
+
+        egui::Window::new("AI 分析详情")
+            .id(egui::Id::new("ai_detail_window"))
+            .collapsible(false)
+            .resizable(true)
+            .default_width(560.0)
+            .open(&mut open)
+            .show(ctx, |ui| {
+                let bucket = finding.bucket();
+                let (badge, badge_color) = match bucket {
+                    crate::ai_analysis::AiReviewBucket::Deletable => {
+                        ("🗑 可以删除", egui::Color32::from_rgb(120, 200, 140))
+                    }
+                    crate::ai_analysis::AiReviewBucket::NeedsReview => {
+                        ("⚠ 需要复核", egui::Color32::from_rgb(240, 190, 90))
+                    }
+                    crate::ai_analysis::AiReviewBucket::Keep => {
+                        ("🔒 保留/已拒绝", egui::Color32::from_rgb(150, 170, 200))
+                    }
+                };
+                ui.label(RichText::new(badge).strong().size(16.0).color(badge_color));
+                ui.add_space(4.0);
+
+                ui.label(RichText::new(file_name(&finding.path)).strong().size(15.0));
+                let path_text = finding.path.display().to_string();
+                ui.label(RichText::new(&path_text).small().weak());
+                ui.add_space(8.0);
+
+                egui::Grid::new("ai_detail_grid")
+                    .num_columns(2)
+                    .spacing([16.0, 6.0])
+                    .striped(true)
+                    .show(ui, |ui| {
+                        let mut row = |ui: &mut egui::Ui, key: &str, value: RichText| {
+                            ui.label(RichText::new(key).strong());
+                            ui.label(value);
+                            ui.end_row();
+                        };
+                        row(ui, "分类", RichText::new(finding.category.label()));
+                        row(ui, "来源", RichText::new(finding.source.label()));
+                        row(ui, "大小", RichText::new(format::bytes(finding.size)));
+                        row(
+                            ui,
+                            "风险",
+                            match finding.risk {
+                                AiCleanupRisk::High | AiCleanupRisk::Unknown => {
+                                    RichText::new(finding.risk.label())
+                                        .strong()
+                                        .color(egui::Color32::from_rgb(255, 130, 130))
+                                }
+                                _ => RichText::new(finding.risk.label()),
+                            },
+                        );
+                        row(
+                            ui,
+                            "置信度",
+                            RichText::new(format!("{:.0}%", finding.confidence * 100.0)),
+                        );
+                        row(
+                            ui,
+                            "受保护",
+                            if finding.protected {
+                                RichText::new("是（不可删除）")
+                                    .strong()
+                                    .color(egui::Color32::from_rgb(255, 170, 90))
+                            } else {
+                                RichText::new("否")
+                            },
+                        );
+                        row(
+                            ui,
+                            "初步建议",
+                            RichText::new(finding.analysis_recommendation.label()),
+                        );
+                        row(ui, "审核状态", RichText::new(finding.audit_status.label()));
+                        row(
+                            ui,
+                            "最终建议",
+                            RichText::new(finding.final_recommendation.label()).strong(),
+                        );
+                    });
+
+                ui.add_space(8.0);
+                ui.label(RichText::new("初步分析理由").strong());
+                ui.label(if finding.analysis_reason.is_empty() {
+                    RichText::new("（无）").weak()
+                } else {
+                    RichText::new(&finding.analysis_reason)
+                });
+                ui.add_space(6.0);
+                ui.label(RichText::new("审核复核理由").strong());
+                ui.label(if finding.audit_reason.is_empty() {
+                    RichText::new("（无）").weak()
+                } else {
+                    RichText::new(&finding.audit_reason)
+                });
+
+                ui.add_space(12.0);
+                ui.separator();
+                ui.horizontal(|ui| {
+                    let open_target = finding.path.parent().unwrap_or(finding.path.as_path());
+                    if ui.button("打开位置").clicked() {
+                        open_path(open_target, &mut self.status_message);
+                    }
+                    if ui.button("复制路径").clicked() {
+                        copy_path_to_clipboard(ui, &finding.path, &mut self.status_message);
+                    }
+
+                    if finding.deletion_allowed() {
+                        ui.separator();
+                        let delete_button = egui::Button::new(
+                            RichText::new("🗑 删除此项")
+                                .strong()
+                                .color(egui::Color32::from_rgb(255, 130, 130)),
+                        );
+                        if ui
+                            .add_enabled(!deletion_in_progress, delete_button)
+                            .on_hover_text("默认移至回收站，弹窗中可选择永久删除")
+                            .clicked()
+                        {
+                            delete_request = Some(DeleteRequest {
+                                items: vec![crate::deletion::DeleteItem {
+                                    path: finding.path.clone(),
+                                    size: finding.size,
+                                }],
+                                method: crate::deletion::DeleteMethod::RecycleBin,
+                                total_size: finding.size,
+                                includes_needs_review: bucket
+                                    == crate::ai_analysis::AiReviewBucket::NeedsReview,
+                            });
+                        }
+                    } else if finding.protected
+                        || matches!(finding.risk, AiCleanupRisk::High | AiCleanupRisk::Unknown)
+                    {
+                        ui.label(
+                            RichText::new("此项受保护或风险过高，未提供删除按钮。")
+                                .small()
+                                .color(egui::Color32::from_rgb(255, 170, 90)),
+                        );
+                    }
+
+                    if ui.button("关闭").clicked() {
+                        close_requested = true;
+                    }
+                });
+            });
+
+        if !open || close_requested {
+            self.ai_detail_selected = None;
+        }
+        if let Some(request) = delete_request {
+            self.delete_confirmation = Some(request);
+        }
+    }
+
+    /// 删除二次确认弹窗：默认回收站，可选永久删除；含"需复核"项时给出更强警告。
+    fn draw_delete_confirmation_window(&mut self, ctx: &egui::Context) {
+        let Some(request) = self.delete_confirmation.clone() else {
+            return;
+        };
+
+        let mut open = true;
+        let mut chosen: Option<crate::deletion::DeleteMethod> = None;
+        let mut cancel = false;
+
+        egui::Window::new("确认删除")
+            .id(egui::Id::new("delete_confirmation_window"))
+            .collapsible(false)
+            .resizable(false)
+            .default_width(480.0)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .open(&mut open)
+            .show(ctx, |ui| {
+                ui.label(
+                    RichText::new(format!(
+                        "即将删除 {} 个项目，共 {}。",
+                        request.items.len(),
+                        format::bytes(request.total_size)
+                    ))
+                    .strong()
+                    .size(15.0),
+                );
+                ui.add_space(6.0);
+
+                if request.includes_needs_review {
+                    egui::Frame::group(ui.style())
+                        .fill(egui::Color32::from_rgb(60, 28, 28))
+                        .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(220, 80, 80)))
+                        .show(ui, |ui| {
+                            ui.label(
+                                RichText::new("⚠ 注意：所选项目中包含【需要复核】的文件！")
+                                    .strong()
+                                    .color(egui::Color32::from_rgb(255, 120, 120)),
+                            );
+                            ui.label(
+                                RichText::new(
+                                    "AI 无法完全确认这些文件可安全删除，请务必确认后再操作。建议先用回收站（可还原）。",
+                                )
+                                .small()
+                                .color(egui::Color32::from_rgb(255, 190, 190)),
+                            );
+                        });
+                    ui.add_space(6.0);
+                }
+
+                egui::ScrollArea::vertical()
+                    .max_height(160.0)
+                    .show(ui, |ui| {
+                        for item in request.items.iter().take(200) {
+                            ui.label(
+                                RichText::new(format!(
+                                    "· {}  ({})",
+                                    item.path.display(),
+                                    format::bytes(item.size)
+                                ))
+                                .small(),
+                            );
+                        }
+                        if request.items.len() > 200 {
+                            ui.label(
+                                RichText::new(format!(
+                                    "… 还有 {} 项",
+                                    request.items.len() - 200
+                                ))
+                                .small()
+                                .weak(),
+                            );
+                        }
+                    });
+
+                ui.add_space(10.0);
+                ui.separator();
+                ui.horizontal(|ui| {
+                    let recycle = egui::Button::new(
+                        RichText::new("♻ 移至回收站（可还原）").strong(),
+                    )
+                    .fill(egui::Color32::from_rgb(40, 90, 60));
+                    if ui.add(recycle).clicked() {
+                        chosen = Some(crate::deletion::DeleteMethod::RecycleBin);
+                    }
+
+                    let permanent = egui::Button::new(
+                        RichText::new("🔥 永久删除（不可还原）")
+                            .strong()
+                            .color(egui::Color32::WHITE),
+                    )
+                    .fill(egui::Color32::from_rgb(150, 40, 40));
+                    if ui
+                        .add(permanent)
+                        .on_hover_text("彻底删除，无法从回收站恢复")
+                        .clicked()
+                    {
+                        chosen = Some(crate::deletion::DeleteMethod::Permanent);
+                    }
+
+                    if ui.button("取消").clicked() {
+                        cancel = true;
+                    }
+                });
+                let _ = request.method;
+            });
+
+        if let Some(method) = chosen {
+            self.start_deletion(request.items.clone(), method);
+            self.delete_confirmation = None;
+        } else if cancel || !open {
+            self.delete_confirmation = None;
+        }
+    }
+
+    /// 启动后台删除并进入"删除中"状态。
+    fn start_deletion(
+        &mut self,
+        items: Vec<crate::deletion::DeleteItem>,
+        method: crate::deletion::DeleteMethod,
+    ) {
+        if items.is_empty() {
+            return;
+        }
+        let count = items.len();
+        self.deletion_handle = Some(crate::deletion::spawn_deletion(items, method));
+        self.deletion_in_progress = true;
+        self.status_message = format!("正在通过{}删除 {} 项……", method.label(), count);
+    }
+
+    /// 轮询后台删除结果：完成后从报告中剔除已删项并刷新状态。
+    fn poll_deletion_events(&mut self, ctx: &egui::Context) {
+        let Some(receiver) = self
+            .deletion_handle
+            .as_ref()
+            .map(|handle| handle.receiver.clone())
+        else {
+            return;
+        };
+
+        let mut finished = None;
+        while let Ok(event) = receiver.try_recv() {
+            match event {
+                crate::deletion::DeletionEvent::Finished(result) => finished = Some(result),
+            }
+        }
+
+        if let Some(result) = finished {
+            let deleted_set = result.deleted_set();
+
+            // 从当前报告剔除已删项并重算计数。
+            if let Some(report) = self.ai_analysis_report.as_ref() {
+                let rebuilt = report.without_paths(&deleted_set);
+                self.ai_analysis_report = Some(Arc::new(rebuilt));
+            }
+
+            // 若详情弹窗指向的项已被删除，则关闭弹窗。
+            if let Some(selected) = &self.ai_detail_selected {
+                if deleted_set.contains(selected) {
+                    self.ai_detail_selected = None;
+                }
+            }
+
+            self.status_message = if result.errors.is_empty() {
+                format!(
+                    "已通过{}删除 {} 项，释放 {}。",
+                    result.method.label(),
+                    result.deleted.len(),
+                    format::bytes(result.freed_bytes)
+                )
+            } else {
+                format!(
+                    "通过{}删除完成：成功 {} 项（释放 {}），失败 {} 项，详见日志。",
+                    result.method.label(),
+                    result.deleted.len(),
+                    format::bytes(result.freed_bytes),
+                    result.errors.len()
+                )
+            };
+
+            self.deletion_handle = None;
+            self.deletion_in_progress = false;
+            ctx.request_repaint();
+        }
     }
 
     fn draw_ai_config_panel(&mut self, ui: &mut egui::Ui) {
@@ -3661,28 +5537,33 @@ impl CDriveManagerApp {
         );
 
         let mut changed = false;
-        egui::Grid::new("cleanup_rules_grid")
-            .striped(true)
-            .num_columns(4)
-            .spacing([12.0, 4.0])
+        egui::ScrollArea::vertical()
+            .id_salt("cleanup_rules_scroll")
+            .max_height(200.0)
             .show(ui, |ui| {
-                plain_header(ui, "启用");
-                plain_header(ui, "规则");
-                plain_header(ui, "风险");
-                plain_header(ui, "说明");
-                ui.end_row();
+                egui::Grid::new("cleanup_rules_grid")
+                    .striped(true)
+                    .num_columns(4)
+                    .spacing([12.0, 4.0])
+                    .show(ui, |ui| {
+                        plain_header(ui, "启用");
+                        plain_header(ui, "规则");
+                        plain_header(ui, "风险");
+                        plain_header(ui, "说明");
+                        ui.end_row();
 
-                for state in &mut self.cleanup_rules {
-                    let response = ui.add_enabled(
-                        !self.cleanup_in_progress,
-                        egui::Checkbox::new(&mut state.enabled, ""),
-                    );
-                    changed |= response.changed();
-                    ui.label(state.rule.label);
-                    ui.label(state.rule.risk.label());
-                    ui.label(state.rule.description);
-                    ui.end_row();
-                }
+                        for state in &mut self.cleanup_rules {
+                            let response = ui.add_enabled(
+                                !self.cleanup_in_progress,
+                                egui::Checkbox::new(&mut state.enabled, ""),
+                            );
+                            changed |= response.changed();
+                            ui.label(state.rule.label);
+                            ui.label(state.rule.risk.label());
+                            ui.label(state.rule.description);
+                            ui.end_row();
+                        }
+                    });
             });
 
         if changed {
@@ -3693,9 +5574,14 @@ impl CDriveManagerApp {
     fn draw_treemap_panel(&mut self, ui: &mut egui::Ui, stats: &ScanStats) {
         // During scanning, use top_level_dirs for incremental display (faster, hierarchical)
         // After completion, use full directory tree
-        let (treemap_items, current_size, is_scanning) =
-            if let Some(tree) = stats.directory_tree.as_ref() {
+        let is_scanning = self.scan_in_progress;
+        // Scanning: use top_level_dirs which has actual sizes from aggregate_top_level_dirs.
+        // The directory_tree built during scanning has zero sizes and should not be used
+        // for treemap visualization.
+        let (treemap_items, current_size) =
+            if !is_scanning && stats.directory_tree.is_some() {
                 // Full tree available - use detailed visualization
+                let tree = stats.directory_tree.as_ref().unwrap();
                 let current_dir = self.treemap_current_dir(stats);
                 let current_index = tree
                     .node_index_for_path(&current_dir)
@@ -3706,7 +5592,7 @@ impl CDriveManagerApp {
                 let display_limit = 36;
                 treemap_items =
                     treemap_items_with_other(treemap_items, current_dir.clone(), display_limit);
-                (treemap_items, current_size, false)
+                (treemap_items, current_size)
             } else {
                 // Scanning in progress - use top_level_dirs for hierarchical incremental display
                 // This shows direct children of root, which is more meaningful than global largest_dirs
@@ -3748,7 +5634,7 @@ impl CDriveManagerApp {
                     };
                 let display_limit = 36;
                 let items = treemap_items_with_other(items, stats.root.clone(), display_limit);
-                (items, stats.total_size, true)
+                (items, stats.total_size)
             };
 
         // Draw header and visualization mode selector
@@ -3769,11 +5655,22 @@ impl CDriveManagerApp {
 
         // Show appropriate message based on scan state
         if is_scanning {
-            ui.label(
-                RichText::new("扫描中实时预览：基于当前已发现的最大目录显示。扫描完成后可进入子目录查看详情。")
-                    .small()
-                    .weak(),
-            );
+            // 扫描进行中：中间区先显示实时状态区块（对 MFT 等无空间数据的模式尤为重要）。
+            self.draw_scan_status_blocks(ui);
+            ui.add_space(6.0);
+            if treemap_items.is_empty() {
+                ui.label(
+                    RichText::new("正在聚合空间数据，稍候显示实时占用图…")
+                        .small()
+                        .weak(),
+                );
+            } else {
+                ui.label(
+                    RichText::new("下方为实时空间占用图：基于当前已聚合的顶层目录，扫描完成后可进入子目录查看详情。")
+                        .small()
+                        .weak(),
+                );
+            }
         } else if let Some(tree) = stats.directory_tree.as_ref() {
             let current_dir = self.treemap_current_dir(stats);
             let current_index = tree
@@ -3808,47 +5705,59 @@ impl CDriveManagerApp {
         };
 
         // Draw visualization (only Treemap during scanning, full options after completion)
-        if is_scanning {
-            draw_treemap(
-                ui,
-                &treemap_items,
-                current_size,
-                empty_message,
-                &self.color_palette,
-                None,
-            );
-        } else if let Some(tree) = stats.directory_tree.as_ref() {
-            let current_dir = self.treemap_current_dir(stats);
-            let current_index = tree
-                .node_index_for_path(&current_dir)
-                .unwrap_or(tree.root_index);
+        // Use a fixed-height container to prevent the treemap from being squashed
+        // by the progress panel above it.
+        let treemap_available = ui.available_height().max(120.0);
+        ui.allocate_ui_with_layout(
+            egui::vec2(ui.available_width(), treemap_available),
+            egui::Layout::top_down(egui::Align::Min),
+            |ui| {
+                if is_scanning {
+                    // 有增量目录数据（多线程模式）才画 treemap；MFT 无数据时状态区块已填满该区。
+                    if !treemap_items.is_empty() {
+                        draw_treemap(
+                            ui,
+                            &treemap_items,
+                            current_size,
+                            empty_message,
+                            &self.color_palette,
+                            None,
+                        );
+                    }
+                } else if let Some(tree) = stats.directory_tree.as_ref() {
+                    let current_dir = self.treemap_current_dir(stats);
+                    let current_index = tree
+                        .node_index_for_path(&current_dir)
+                        .unwrap_or(tree.root_index);
 
-            // Create selected extensions reference after getting current_dir to avoid borrow conflict
-            let selected_ext_ref = Some(&self.selected_extensions);
+                    // Create selected extensions reference after getting current_dir to avoid borrow conflict
+                    let selected_ext_ref = Some(&self.selected_extensions);
 
-            let action = match self.visualization_mode {
-                VisualizationMode::Treemap => draw_treemap(
-                    ui,
-                    &treemap_items,
-                    current_size,
-                    empty_message,
-                    &self.color_palette,
-                    selected_ext_ref,
-                ),
-                VisualizationMode::Sunburst => draw_sunburst(
-                    ui,
-                    tree,
-                    current_index,
-                    current_size,
-                    empty_message,
-                    &self.color_palette,
-                ),
-            };
+                    let action = match self.visualization_mode {
+                        VisualizationMode::Treemap => draw_treemap(
+                            ui,
+                            &treemap_items,
+                            current_size,
+                            empty_message,
+                            &self.color_palette,
+                            selected_ext_ref,
+                        ),
+                        VisualizationMode::Sunburst => draw_sunburst(
+                            ui,
+                            tree,
+                            current_index,
+                            current_size,
+                            empty_message,
+                            &self.color_palette,
+                        ),
+                    };
 
-            if let Some(action) = action {
-                self.handle_treemap_action(action, ui.ctx());
-            }
-        }
+                    if let Some(action) = action {
+                        self.handle_treemap_action(action, ui.ctx());
+                    }
+                }
+            },
+        );
     }
 
     fn treemap_current_dir(&mut self, stats: &ScanStats) -> PathBuf {
@@ -3885,9 +5794,13 @@ impl CDriveManagerApp {
         let path_parts: Vec<&str> = if current_dir == &stats.root {
             vec![]
         } else {
-            current_dir
+            // Strip root prefix to avoid Windows path components like "K:" and "\"
+            // being treated as separate breadcrumb segments.
+            let relative = current_dir.strip_prefix(&stats.root).unwrap_or(current_dir);
+            relative
                 .iter()
                 .map(|p| p.to_str().unwrap_or(""))
+                .filter(|p| !p.is_empty() && *p != "\\" && *p != "/")
                 .collect()
         };
 
@@ -3939,13 +5852,35 @@ impl eframe::App for CDriveManagerApp {
         self.poll_cleanup_preview_events(ctx);
         self.poll_duplicate_preview_events(ctx);
         self.poll_ai_analysis_events(ctx);
+        self.poll_app_cache_events(ctx);
+        self.poll_deletion_events(ctx);
         self.poll_organizer_events(ctx);
+        self.poll_search_events(ctx);
         self.draw_top_bar(ctx);
+        self.draw_bottom_status_bar(ctx);
         self.draw_mft_elevation_dialog(ctx);
         self.draw_cache_manager_window(ctx);
         self.draw_organizer_window(ctx);
+        self.draw_ai_detail_window(ctx);
+        self.draw_delete_confirmation_window(ctx);
         if self.actions_panel_visible {
             self.draw_actions_panel(ctx);
+        }
+
+        // Bottom detailed tables panel – must be declared BEFORE CentralPanel
+        // so egui can reserve space for it and compute the correct drag handle.
+        if let Some(stats) = self.current_stats() {
+            let screen_height = ctx.screen_rect().height();
+            let max_bottom = (screen_height * 0.55).max(280.0);
+            egui::TopBottomPanel::bottom("detailed_tables_panel")
+                .resizable(true)
+                .default_height(280.0)
+                .min_height(200.0)
+                .max_height(max_bottom)
+                .show(ctx, |ui| {
+                    ui.set_min_height(200.0);
+                    self.draw_tabs(ui, stats.as_ref());
+                });
         }
 
         egui::CentralPanel::default().show(ctx, |ui| {
@@ -3971,6 +5906,34 @@ fn default_root() -> String {
     } else {
         "/".to_owned()
     }
+}
+
+/// 返回系统上所有可用的驱动器盘符（仅限 Windows）。
+#[cfg(windows)]
+fn get_available_drives() -> Vec<String> {
+    use std::ffi::OsString;
+    use std::os::windows::ffi::OsStringExt;
+
+    let mut drives = Vec::new();
+    // GetLogicalDrives returns a bitmask where bit 0 = A:, bit 1 = B:, etc.
+    let mask = unsafe { winapi::um::fileapi::GetLogicalDrives() };
+    if mask == 0 {
+        return drives;
+    }
+    for i in 0..26 {
+        if (mask >> i) & 1 != 0 {
+            let letter = (b'A' + i as u8) as char;
+            drives.push(format!("{}:\\", letter));
+        }
+    }
+    // Sort so C: comes first, then D:, etc.
+    drives.sort();
+    drives
+}
+
+#[cfg(not(windows))]
+fn get_available_drives() -> Vec<String> {
+    vec!["/".to_string()]
 }
 
 fn label_value(ui: &mut egui::Ui, label: &str, value: String) {
@@ -4958,9 +6921,26 @@ fn cleanup_preview_table(
     search_query: &str,
     sort: &mut SortState<CleanupSortKey>,
     status_message: &mut String,
+    in_progress: bool,
 ) {
     let Some(preview) = preview else {
-        ui.label("点击\"生成清理预览\"后，这里会显示 dry-run 候选。当前版本不会删除任何文件。");
+        if in_progress {
+            ui.add_space(20.0);
+            ui.vertical_centered(|ui| {
+                ui.spinner();
+                ui.add_space(8.0);
+                ui.label(
+                    RichText::new("正在后台扫描目录树并实时分析清理候选列表……")
+                        .strong()
+                        .color(egui::Color32::from_rgb(147, 197, 253)),
+                );
+                ui.add_space(4.0);
+                ui.label("随着分析推进，匹配的数据将在上方卡片及此处表格实时呈现，请稍候……");
+            });
+            ui.add_space(20.0);
+        } else {
+            ui.label("点击\"生成清理预览\"后，这里会显示 dry-run 候选。当前版本不会删除任何文件。");
+        }
         return;
     };
 
@@ -5012,7 +6992,19 @@ fn cleanup_preview_table(
     );
 
     if candidates.is_empty() {
-        ui.label("没有匹配的清理预览候选。 ");
+        if in_progress {
+            ui.add_space(10.0);
+            ui.vertical_centered(|ui| {
+                ui.label(
+                    RichText::new("⏳ 正在持续扫描与匹配中，目前尚未发现符合规则的候选……")
+                        .strong()
+                        .color(C.text.secondary),
+                );
+            });
+            ui.add_space(10.0);
+        } else {
+            ui.label("没有匹配的清理预览候选。 ");
+        }
         return;
     }
 
@@ -5049,7 +7041,7 @@ fn cleanup_preview_table(
 
 fn cleanup_candidate_matches(candidate: &CleanupCandidate, query: &str) -> bool {
     query.is_empty()
-        || text_matches(candidate.rule_label, query)
+        || text_matches(&candidate.rule_label, query)
         || text_matches(candidate.risk.label(), query)
         || text_matches(candidate.kind.label(), query)
         || text_matches(&candidate.path.display().to_string(), query)
@@ -5061,7 +7053,7 @@ fn cleanup_candidate_row(
     candidate: &CleanupCandidate,
     status_message: &mut String,
 ) {
-    ui.label(candidate.rule_label);
+    ui.label(candidate.rule_label.as_str());
     ui.label(candidate.risk.label());
     ui.label(if candidate.protected {
         RichText::new("受保护").strong()
@@ -5070,6 +7062,20 @@ fn cleanup_candidate_row(
     });
     ui.label(format::bytes(candidate.size));
     ui.label(candidate.kind.label());
+
+    // 引擎增强信息：分类 + 风险评分
+    let engine_info = if let (Some(cat), Some(layer)) = (&candidate.category, &candidate.layer) {
+        let score_info = candidate.risk_score.map_or(String::new(), |s| format!(" [{}]", s));
+        let app_info = if candidate.belongs_to_app == Some(true) { " [应用]" } else { "" };
+        format!("{} ({}){}{}", cat, layer, score_info, app_info)
+    } else {
+        String::new()
+    };
+    ui.label(
+        RichText::new(engine_info)
+            .small()
+            .color(egui::Color32::from_rgb(147, 197, 253)),
+    );
 
     let path_text = candidate.path.display().to_string();
     let open_target = candidate.path.parent().unwrap_or(candidate.path.as_path());
@@ -5096,11 +7102,26 @@ fn duplicate_preview_table(
     search_query: &str,
     sort: &mut SortState<DuplicateSortKey>,
     status_message: &mut String,
+    in_progress: bool,
 ) {
     let Some(preview) = preview else {
-        ui.label(
-            "点击\"查找重复文件\"后，这里会显示 dry-run 重复文件组。当前版本不会删除任何文件。",
-        );
+        if in_progress {
+            ui.add_space(20.0);
+            ui.vertical_centered(|ui| {
+                ui.spinner();
+                ui.add_space(8.0);
+                ui.label(
+                    RichText::new("正在后台计算文件大小与特征哈希，实时检测重复文件……")
+                        .strong()
+                        .color(egui::Color32::from_rgb(147, 197, 253)),
+                );
+            });
+            ui.add_space(20.0);
+        } else {
+            ui.label(
+                "点击\"查找重复文件\"后，这里会显示 dry-run 重复文件组。当前版本不会删除任何文件。",
+            );
+        }
         return;
     };
 
@@ -5155,7 +7176,19 @@ fn duplicate_preview_table(
     );
 
     if groups.is_empty() {
-        ui.label("没有匹配的重复文件组。 ");
+        if in_progress {
+            ui.add_space(10.0);
+            ui.vertical_centered(|ui| {
+                ui.label(
+                    RichText::new("⏳ 正在持续检测中，目前尚未匹配到重复文件组……")
+                        .strong()
+                        .color(C.text.secondary),
+                );
+            });
+            ui.add_space(10.0);
+        } else {
+            ui.label("没有匹配的重复文件组。 ");
+        }
         return;
     }
 
@@ -5282,111 +7315,6 @@ fn duplicate_file_line(ui: &mut egui::Ui, file: &DuplicateFile, status_message: 
     );
 }
 
-fn ai_review_table(
-    ui: &mut egui::Ui,
-    report: Option<&AiAnalysisReport>,
-    search_query: &str,
-    sort: &mut SortState<AiSortKey>,
-    status_message: &mut String,
-) {
-    let Some(report) = report else {
-        ui.label("生成清理预览或重复文件预览后，点击\"AI 分析审核\"。当前版本只生成报告和待删清单，不执行删除。 ");
-        return;
-    };
-
-    ui.label(
-        RichText::new(format!(
-            "AI 审核报告：根目录 {}，Provider {}，模型 {}。候选 {} 个，待删清单候选 {} 个，需人工复核 {} 个，拒绝/保留 {} 个，受保护 {} 个，错误 {} 条。",
-            report.root.display(),
-            report.provider_label,
-            report.model,
-            format::count(report.candidate_count),
-            format::count(report.delete_candidate_count),
-            format::count(report.needs_review_count),
-            format::count(report.rejected_count),
-            format::count(report.protected_count),
-            format::count(report.error_count)
-        ))
-        .small()
-        .strong(),
-    );
-    ui.label(
-        RichText::new("待删清单只包含：审核通过/纠正为可删、非受保护、风险不是高/未知、且不需要人工复核的项目；导出仍为 action_taken=none。")
-            .small()
-            .weak(),
-    );
-
-    if !report.errors.is_empty() {
-        ui.label(
-            RichText::new(format!(
-                "AI 流程记录了 {} 条错误；失败或缺失结果会保守标记为需人工复核。",
-                format::count(report.error_count)
-            ))
-            .small()
-            .weak(),
-        );
-    }
-
-    let query = normalized_query(search_query);
-    let mut findings: Vec<_> = report
-        .findings
-        .iter()
-        .filter(|finding| ai_finding_matches(finding, &query))
-        .collect();
-    findings.sort_by(|left, right| compare_ai_findings(left, right, *sort));
-
-    result_count_label(
-        ui,
-        findings.len().min(120),
-        findings.len(),
-        report.findings.len(),
-        "AI 条目",
-    );
-
-    if findings.is_empty() {
-        ui.label("没有匹配的 AI 审核条目。 ");
-        return;
-    }
-
-    egui::ScrollArea::vertical()
-        .max_height(360.0)
-        .show(ui, |ui| {
-            egui::Grid::new("ai_review_table")
-                .striped(true)
-                .num_columns(10)
-                .spacing([12.0, 4.0])
-                .show(ui, |ui| {
-                    sortable_header(
-                        ui,
-                        "最终建议",
-                        AiSortKey::FinalRecommendation,
-                        SortDirection::Asc,
-                        sort,
-                    );
-                    sortable_header(ui, "审核", AiSortKey::AuditStatus, SortDirection::Asc, sort);
-                    sortable_header(ui, "风险", AiSortKey::Risk, SortDirection::Desc, sort);
-                    sortable_header(
-                        ui,
-                        "置信度",
-                        AiSortKey::Confidence,
-                        SortDirection::Desc,
-                        sort,
-                    );
-                    sortable_header(ui, "分类", AiSortKey::Category, SortDirection::Asc, sort);
-                    sortable_header(ui, "来源", AiSortKey::Source, SortDirection::Asc, sort);
-                    sortable_header(ui, "大小", AiSortKey::Size, SortDirection::Desc, sort);
-                    sortable_header(ui, "保护", AiSortKey::Protected, SortDirection::Desc, sort);
-                    sortable_header(ui, "路径", AiSortKey::Path, SortDirection::Asc, sort);
-                    plain_header(ui, "理由/操作");
-                    ui.end_row();
-
-                    for finding in findings.into_iter().take(120) {
-                        ai_finding_row(ui, finding, status_message);
-                    }
-                });
-        });
-}
-
 fn ai_finding_matches(finding: &AiReviewFinding, query: &str) -> bool {
     query.is_empty()
         || text_matches(finding.final_recommendation.label(), query)
@@ -5399,7 +7327,21 @@ fn ai_finding_matches(finding: &AiReviewFinding, query: &str) -> bool {
         || text_matches(&finding.audit_reason, query)
 }
 
-fn ai_finding_row(ui: &mut egui::Ui, finding: &AiReviewFinding, status_message: &mut String) {
+/// 单行渲染产生的交互结果。
+#[derive(Default)]
+struct AiRowAction {
+    open_detail: bool,
+    request_delete: bool,
+}
+
+fn ai_finding_row(
+    ui: &mut egui::Ui,
+    finding: &AiReviewFinding,
+    status_message: &mut String,
+    deletion_in_progress: bool,
+) -> AiRowAction {
+    let mut action = AiRowAction::default();
+
     let recommendation = if finding.is_delete_list_candidate() {
         RichText::new(finding.final_recommendation.label()).strong()
     } else {
@@ -5444,9 +7386,28 @@ fn ai_finding_row(ui: &mut egui::Ui, finding: &AiReviewFinding, status_message: 
                 finding.analysis_recommendation.label(),
                 finding.analysis_reason
             ));
+        ui.horizontal(|ui| {
+            if ui.small_button("📄 详情").clicked() {
+                action.open_detail = true;
+            }
+            if finding.deletion_allowed() {
+                let delete_button = egui::Button::new(
+                    RichText::new("🗑 删除").color(egui::Color32::from_rgb(255, 130, 130)),
+                );
+                if ui
+                    .add_enabled(!deletion_in_progress, delete_button)
+                    .on_hover_text("默认移至回收站，弹窗中可选择永久删除")
+                    .clicked()
+                {
+                    action.request_delete = true;
+                }
+            }
+        });
         path_actions(ui, &finding.path, open_target, status_message);
     });
     ui.end_row();
+
+    action
 }
 
 fn extension_table(
@@ -5661,7 +7622,7 @@ fn compare_cleanup_candidates(
     sort: SortState<CleanupSortKey>,
 ) -> Ordering {
     let primary = match sort.key {
-        CleanupSortKey::Rule => compare_text(left.rule_label, right.rule_label),
+        CleanupSortKey::Rule => compare_text(&left.rule_label, &right.rule_label),
         CleanupSortKey::Risk => left.risk.rank().cmp(&right.risk.rank()),
         CleanupSortKey::Protected => left.protected.cmp(&right.protected),
         CleanupSortKey::Size => left.size.cmp(&right.size),

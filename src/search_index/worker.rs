@@ -1,4 +1,4 @@
-//! Background worker for maintaining the search index.
+//! Background worker for maintaining the tantivy search index.
 //!
 //! Provides background threads that:
 //! 1. Build the index from scan results
@@ -12,11 +12,7 @@ use std::thread;
 use crossbeam_channel::{Receiver, unbounded};
 
 use crate::model::ScanStats;
-use crate::search_index::db::{
-    build_index_from_scan, delete_entry, delete_entry_by_name, lookup_frn_path,
-    resolve_path_from_frn, search_by_name, upsert_entry, upsert_frn_path,
-    delete_frn_path, FileSearchResult,
-};
+use crate::search_index::indexer::{FileSearchResult, SearchIndexer};
 use crate::search_index::usn_journal::{spawn_usn_listener, UsnEvent, UsnListenerConfig};
 
 /// Events reported by the search index worker.
@@ -24,8 +20,6 @@ use crate::search_index::usn_journal::{spawn_usn_listener, UsnEvent, UsnListener
 pub enum SearchIndexEvent {
     /// Index build started.
     Building { root_key: String, total_files: u64 },
-    /// Progress update during index build.
-    Progress { root_key: String, processed: u64 },
     /// Index build completed.
     Finished { root_key: String, total_entries: u64 },
     /// Incremental update applied.
@@ -57,27 +51,50 @@ pub fn spawn_build_index(stats: Arc<ScanStats>) -> SearchIndexHandle {
     let worker_cancel = Arc::clone(&cancel_flag);
 
     thread::spawn(move || {
-        if worker_cancel.load(Ordering::Relaxed) {
-            return;
-        }
-
-        let root_key = crate::search_index::db::root_key(&stats.root);
+        let root_key = crate::search_index::indexer::root_key(&stats.root);
         let total_files = stats.file_count;
-
         let _ = sender.send(SearchIndexEvent::Building {
             root_key: root_key.clone(),
             total_files,
         });
 
-        match build_index_from_scan(&stats) {
-            Ok(total) => {
+        let indexer = match SearchIndexer::open() {
+            Ok(x) => x,
+            Err(e) => {
+                let _ = sender.send(SearchIndexEvent::Error(format!(
+                    "Failed to open search indexer: {e}"
+                )));
+                return;
+            }
+        };
+
+        let root_key_clone = root_key.clone();
+        let sender_clone = sender.clone();
+        let worker_cancel_clone = worker_cancel.clone();
+        let progress = move |p: u64, _total: u64| {
+            if p % 1000 == 0 && !worker_cancel_clone.load(Ordering::Relaxed) {
+                let _ = sender_clone.send(SearchIndexEvent::Updated {
+                    root_key: root_key_clone.clone(),
+                    changes: p,
+                });
+            }
+        };
+
+        if worker_cancel.load(Ordering::Relaxed) {
+            return;
+        }
+
+        match indexer.build_from_scan(&stats, &root_key, progress) {
+            Ok(cnt) => {
                 let _ = sender.send(SearchIndexEvent::Finished {
                     root_key,
-                    total_entries: total as u64,
+                    total_entries: cnt,
                 });
             }
             Err(e) => {
-                let _ = sender.send(SearchIndexEvent::Error(format!("Index build failed: {}", e)));
+                let _ = sender.send(SearchIndexEvent::Error(format!(
+                    "Index build failed: {e}"
+                )));
             }
         }
     });
@@ -95,6 +112,16 @@ pub fn spawn_usn_index_listener(
     let worker_cancel = Arc::clone(&cancel_flag);
 
     thread::spawn(move || {
+        let indexer = match SearchIndexer::open() {
+            Ok(x) => x,
+            Err(e) => {
+                let _ = sender.send(SearchIndexEvent::Error(format!(
+                    "Failed to open search indexer for USN listener: {e}"
+                )));
+                return;
+            }
+        };
+
         let config = UsnListenerConfig {
             drive_letter,
             cancel_flag: worker_cancel.clone(),
@@ -108,114 +135,11 @@ pub fn spawn_usn_index_listener(
                 break;
             }
 
-            match event {
-                UsnEvent::FileCreated { frn, parent_frn, file_name, is_directory } => {
-                    // Resolve parent path from FRN
-                    let parent_path = resolve_path_from_frn(&root_key, &parent_frn, &file_name)
-                        .ok()
-                        .flatten()
-                        .unwrap_or_else(|| format!("FRN:{}/{}", parent_frn, file_name));
-
-                    let path = std::path::Path::new(&parent_path).join(&file_name).to_string_lossy().to_string();
-
-                    // Upsert FRN mapping
-                    let _ = upsert_frn_path(&root_key, &frn, &path, Some(&parent_frn), is_directory);
-
-                    // Upsert search index
-                    if let Err(e) = upsert_entry(
-                        &root_key,
-                        &file_name,
-                        &path,
-                        &parent_path,
-                        std::path::Path::new(&file_name).extension().and_then(|e| e.to_str()),
-                        0,
-                        None,
-                        is_directory,
-                    ) {
-                        eprintln!("USN upsert error: {}", e);
-                    }
-                    total_changes += 1;
-                }
-                UsnEvent::FileDeleted { frn, parent_frn, file_name } => {
-                    // Look up the stored path before wiping the FRN map so we
-                    // can target the search-index row by path (the index keys
-                    // on path, not FRN).
-                    let stored_path = lookup_frn_path(&root_key, &frn);
-                    let _ = delete_frn_path(&root_key, &frn);
-
-                    // Delete from search index. Prefer the stored path; fall
-                    // back to the parent_frn-resolved path; finally fall back
-                    // to deleting by name under the resolved parent so we don't
-                    // leave orphan rows.
-                    let path = stored_path
-                        .or_else(|| {
-                            resolve_path_from_frn(&root_key, &parent_frn, &file_name)
-                                .ok()
-                                .flatten()
-                        });
-                    if let Some(p) = path {
-                        let _ = delete_entry(&p);
-                    } else {
-                        // Last resort: drop any rows whose path ends with the
-                        // deleted file name. This catches paths we never
-                        // resolved but still indexed under a FRN: stub.
-                        let _ = delete_entry_by_name(&root_key, &file_name);
-                    }
-                    total_changes += 1;
-                }
-                UsnEvent::FileModified { frn: _, parent_frn, file_name } => {
-                    // Re-resolve path and update
-                    let parent_path = resolve_path_from_frn(&root_key, &parent_frn, &file_name)
-                        .ok()
-                        .flatten()
-                        .unwrap_or_else(|| format!("FRN:{}/{}", parent_frn, file_name));
-
-                    let path = std::path::Path::new(&parent_path).join(&file_name).to_string_lossy().to_string();
-
-                    if let Err(e) = upsert_entry(
-                        &root_key,
-                        &file_name,
-                        &path,
-                        &parent_path,
-                        std::path::Path::new(&file_name).extension().and_then(|e| e.to_str()),
-                        0,
-                        None,
-                        false,
-                    ) {
-                        eprintln!("USN modify error: {}", e);
-                    }
-                    total_changes += 1;
-                }
-                UsnEvent::FileRenamed { old_frn, new_frn, parent_frn, file_name } => {
-                    // Delete old, insert new
-                    let _ = delete_frn_path(&root_key, &old_frn);
-
-                    let parent_path = resolve_path_from_frn(&root_key, &parent_frn, &file_name)
-                        .ok()
-                        .flatten()
-                        .unwrap_or_else(|| format!("FRN:{}/{}", parent_frn, file_name));
-
-                    let path = std::path::Path::new(&parent_path).join(&file_name).to_string_lossy().to_string();
-
-                    // Insert new FRN mapping
-                    let _ = upsert_frn_path(&root_key, &new_frn, &path, Some(&parent_frn), false);
-
-                    // Update search index
-                    let _ = upsert_entry(
-                        &root_key,
-                        &file_name,
-                        &path,
-                        &parent_path,
-                        std::path::Path::new(&file_name).extension().and_then(|e| e.to_str()),
-                        0,
-                        None,
-                        false,
-                    );
-                    total_changes += 1;
-                }
+            if let Err(e) = indexer.handle_usn_event(event, &root_key) {
+                eprintln!("USN event error: {e}");
             }
+            total_changes += 1;
 
-            // Report progress every 100 changes
             if total_changes.is_multiple_of(100) {
                 let _ = sender.send(SearchIndexEvent::Updated {
                     root_key: root_key.clone(),
@@ -233,7 +157,7 @@ pub fn spawn_usn_index_listener(
 pub enum SearchResult {
     /// Query completed; carries the matched rows.
     Ok { query: String, results: Vec<FileSearchResult> },
-    /// Search failed with a database error.
+    /// Search failed.
     Error(String),
 }
 
@@ -250,11 +174,7 @@ impl SearchHandle {
     }
 }
 
-/// Spawn a background search. The worker thread runs `search_by_name` against
-/// the FTS5-backed index and sends the result through the returned receiver.
-/// Cancellation is best-effort: SQLite itself can't be interrupted mid-query,
-/// but the flag is checked before the query starts so a queued-up result can be
-/// discarded by the caller when it arrives.
+/// Spawn a background search against the tantivy index.
 pub fn spawn_search(root_key: String, query: String, limit: usize) -> SearchHandle {
     let (sender, receiver) = unbounded::<SearchResult>();
     let cancel_flag = Arc::new(AtomicBool::new(false));
@@ -264,7 +184,16 @@ pub fn spawn_search(root_key: String, query: String, limit: usize) -> SearchHand
         if worker_cancel.load(Ordering::Relaxed) {
             return;
         }
-        match search_by_name(&root_key, &query, limit) {
+        let indexer = match SearchIndexer::open() {
+            Ok(x) => x,
+            Err(e) => {
+                let _ = sender.send(SearchResult::Error(format!(
+                    "Failed to open search indexer: {e}"
+                )));
+                return;
+            }
+        };
+        match indexer.search(&root_key, &query, limit) {
             Ok(results) => {
                 let _ = sender.send(SearchResult::Ok { query, results });
             }
