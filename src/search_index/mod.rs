@@ -6,7 +6,6 @@ mod schema;
 mod frn_db;
 mod query;
 mod indexer;
-mod db;
 mod usn_journal;
 mod worker;
 
@@ -20,7 +19,7 @@ pub use frn_db::{
 #[allow(unused_imports)]
 pub use query::{parse_query, parse_size, compile_query, QueryNode, CompareOp, DateValue, QueryParseError};
 #[allow(unused_imports)]
-pub use indexer::{SearchIndexer, root_key};
+pub use indexer::{SearchIndexer, root_key, FileSearchResult};
 #[allow(unused_imports)]
 pub use usn_journal::{spawn_usn_listener, UsnEvent, UsnListenerConfig, UsnListenerHandle};
 #[allow(unused_imports)]
@@ -28,14 +27,3 @@ pub use worker::{
     spawn_build_index, spawn_search, spawn_usn_index_listener, SearchHandle,
     SearchIndexEvent, SearchIndexHandle, SearchResult,
 };
-// 兼容旧 API (db.rs)
-#[allow(unused_imports)]
-pub use db::{
-    build_index_from_scan, delete_entry, delete_entry_by_name, index_count, index_exists,
-    init_index_tables, search_by_name, upsert_entry,
-    lookup_frn_path as db_lookup_frn_path, upsert_frn_path as db_upsert_frn_path,
-    resolve_path_from_frn as db_resolve_path_from_frn, delete_frn_path as db_delete_frn_path,
-};
-// FileSearchResult: 新索引统一使用 indexer 版本
-#[allow(unused_imports)]
-pub use indexer::FileSearchResult;

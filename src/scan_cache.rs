@@ -139,7 +139,9 @@ fn initialize_schema(connection: &Connection) -> rusqlite::Result<()> {
             error_count INTEGER NOT NULL,
             stats_json BLOB NOT NULL
         );",
-    )
+    )?;
+
+    Ok(())
 }
 
 fn root_key(path: &Path) -> String {

@@ -142,6 +142,7 @@ pub struct CDriveManagerApp {
     search_in_progress: bool,
     search_page: usize,
     usn_handle: Option<crate::search_index::SearchIndexHandle>,
+    build_handle: Option<crate::search_index::SearchIndexHandle>,
     /// In-flight asynchronous search. Replaced on each debounced query.
     search_handle: Option<crate::search_index::SearchHandle>,
     /// Debounce: timestamp of the most recent keystroke; search fires after
@@ -529,6 +530,7 @@ impl CDriveManagerApp {
             search_in_progress: false,
             search_page: 0,
             usn_handle: None,
+            build_handle: None,
             search_handle: None,
             search_last_input: None,
         };
@@ -1614,20 +1616,14 @@ impl CDriveManagerApp {
                         message.push_str(&format!(" SQLite 最新缓存写入失败：{:#}。", error));
                     }
                 }
-                // Build search index in background
-                let stats_arc = Arc::clone(&result.stats);
-                let _ = std::thread::spawn(move || {
-                    if let Err(e) = crate::search_index::build_index_from_scan(&stats_arc) {
-                        eprintln!("Search index build failed: {}", e);
-                    }
-                });
-                // Start USN Journal listener for real-time updates
+                // Build search index in background using worker
+                let build_handle = crate::search_index::spawn_build_index(Arc::clone(&result.stats));
+                self.build_handle = Some(build_handle);
                 if let Some(drive_letter) = result.stats.root.to_string_lossy().chars().next() {
                     let root_key = crate::search_index::root_key(&result.stats.root);
-                    let usn_handle = crate::search_index::spawn_usn_index_listener(root_key, drive_letter);
-                    // Store handle in app (we'd need to store it, but for now just let it run)
-                    // Note: In a real implementation, store usn_handle in the app struct
-                    std::mem::forget(usn_handle); // Prevent drop (leak intentionally - runs until app closes)
+                    self.usn_handle = Some(
+                        crate::search_index::spawn_usn_index_listener(root_key, drive_letter),
+                    );
                 }
 
                 self.status_message = message;
