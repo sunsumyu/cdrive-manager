@@ -409,6 +409,7 @@ mod tests {
 
     #[test]
     fn build_from_scan_indexes_files() {
+        let _lock = crate::search_index::test_lock::INDEX_TEST_LOCK.lock().unwrap();
         let indexer = setup_temp_index();
         let stats = make_test_stats();
         let count = indexer.build_from_scan(&stats, "c:/test", |_, _| {}).unwrap();
@@ -417,6 +418,7 @@ mod tests {
 
     #[test]
     fn search_by_keyword_returns_matches() {
+        let _lock = crate::search_index::test_lock::INDEX_TEST_LOCK.lock().unwrap();
         let indexer = setup_temp_index();
         let stats = make_test_stats();
         indexer.build_from_scan(&stats, "c:/test", |_, _| {}).unwrap();
@@ -427,6 +429,7 @@ mod tests {
 
     #[test]
     fn search_by_extension_returns_matches() {
+        let _lock = crate::search_index::test_lock::INDEX_TEST_LOCK.lock().unwrap();
         let indexer = setup_temp_index();
         let stats = make_test_stats();
         indexer.build_from_scan(&stats, "c:/test", |_, _| {}).unwrap();
@@ -437,6 +440,7 @@ mod tests {
 
     #[test]
     fn search_by_size_range() {
+        let _lock = crate::search_index::test_lock::INDEX_TEST_LOCK.lock().unwrap();
         let indexer = setup_temp_index();
         let stats = make_test_stats();
         indexer.build_from_scan(&stats, "c:/test", |_, _| {}).unwrap();
@@ -447,6 +451,7 @@ mod tests {
 
     #[test]
     fn search_by_regex() {
+        let _lock = crate::search_index::test_lock::INDEX_TEST_LOCK.lock().unwrap();
         let indexer = setup_temp_index();
         let stats = make_test_stats();
         indexer.build_from_scan(&stats, "c:/test", |_, _| {}).unwrap();
@@ -457,6 +462,7 @@ mod tests {
 
     #[test]
     fn delete_by_path_removes_document() {
+        let _lock = crate::search_index::test_lock::INDEX_TEST_LOCK.lock().unwrap();
         let indexer = setup_temp_index();
         let stats = make_test_stats();
         indexer.build_from_scan(&stats, "c:/test", |_, _| {}).unwrap();
@@ -469,6 +475,7 @@ mod tests {
 
     #[test]
     fn upsert_entry_adds_new_document() {
+        let _lock = crate::search_index::test_lock::INDEX_TEST_LOCK.lock().unwrap();
         let indexer = setup_temp_index();
         indexer.upsert_entry(
             "c:/test", "new.txt", "C:\\test\\new.txt",
@@ -481,6 +488,7 @@ mod tests {
 
     #[test]
     fn index_count_returns_correct_number() {
+        let _lock = crate::search_index::test_lock::INDEX_TEST_LOCK.lock().unwrap();
         let indexer = setup_temp_index();
         let stats = make_test_stats();
         indexer.build_from_scan(&stats, "c:/test", |_, _| {}).unwrap();

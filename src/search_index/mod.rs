@@ -9,6 +9,15 @@ mod indexer;
 mod usn_journal;
 mod worker;
 
+// 测试专用：进程级 LOCALAPPDATA 覆盖是全局的，所有涉及索引目录的测试
+// 必须共用同一把锁串行化，避免并行测试互相覆盖环境变量导致索引锁冲突。
+#[cfg(test)]
+pub(crate) mod test_lock {
+    use std::sync::Mutex;
+    /// 序列化所有会覆盖 LOCALAPPDATA 的搜索索引测试。
+    pub(crate) static INDEX_TEST_LOCK: Mutex<()> = Mutex::new(());
+}
+
 #[allow(unused_imports)]
 pub use schema::{create_schema, index_directory, frn_db_path, FieldId};
 #[allow(unused_imports)]
