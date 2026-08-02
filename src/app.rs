@@ -153,6 +153,7 @@ pub struct CDriveManagerApp {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ResultTab {
+    Search,
     Directories,
     Files,
     Types,
@@ -4180,6 +4181,7 @@ impl CDriveManagerApp {
 
     fn draw_tabs(&mut self, ui: &mut egui::Ui, stats: &ScanStats) {
         ui.horizontal(|ui| {
+            tab_button(ui, &mut self.selected_tab, ResultTab::Search, "搜索");
             tab_button(
                 ui,
                 &mut self.selected_tab,
@@ -4219,6 +4221,7 @@ impl CDriveManagerApp {
         ui.add_space(4.0);
 
         match self.selected_tab {
+            ResultTab::Search => self.draw_search_tab(ui),
             ResultTab::Directories => {
                 if let Some(path) = directory_table(
                     ui,
@@ -4379,17 +4382,27 @@ impl CDriveManagerApp {
         egui::ScrollArea::vertical()
             .id_salt("search_results_scroll")
             .show(ui, |ui| match view_mode {
-                SearchViewMode::List => self.render_search_results_list(ui, page_results, &query_lower),
-                SearchViewMode::Grid => self.render_search_results_grid(ui, page_results, &query_lower),
+                SearchViewMode::List => Self::render_search_results_list(
+                    ui,
+                    page_results,
+                    &query_lower,
+                    &mut self.status_message,
+                ),
+                SearchViewMode::Grid => Self::render_search_results_grid(
+                    ui,
+                    page_results,
+                    &query_lower,
+                    &mut self.status_message,
+                ),
             });
     }
 
     /// 列表视图: 紧凑表格(名称/路径/大小/类型)。
     fn render_search_results_list(
-        &self,
         ui: &mut egui::Ui,
         page_results: &[crate::search_index::FileSearchResult],
         query_lower: &str,
+        status_message: &mut String,
     ) {
         egui::Grid::new("search_results_grid")
             .striped(true)
@@ -4414,7 +4427,14 @@ impl CDriveManagerApp {
                         } else {
                             RichText::new(&result.name)
                         };
-                        ui.add(egui::Label::new(name_label).sense(egui::Sense::click()));
+                        let response = ui.add(egui::Label::new(name_label).sense(egui::Sense::click()));
+                        path_context_menu(
+                            response,
+                            Path::new(&result.path),
+                            Path::new(&result.path),
+                            &result.name,
+                            status_message,
+                        );
                     });
 
                     // Path with hover
@@ -4439,10 +4459,10 @@ impl CDriveManagerApp {
 
     /// 网格视图: 卡片式展示(名称 + 类型 + 大小 + 路径悬浮提示)。
     fn render_search_results_grid(
-        &self,
         ui: &mut egui::Ui,
         page_results: &[crate::search_index::FileSearchResult],
         query_lower: &str,
+        status_message: &mut String,
     ) {
         const CARD_W: f32 = 180.0;
         let available_w = ui.available_width().max(200.0);
@@ -4470,7 +4490,7 @@ impl CDriveManagerApp {
                         RichText::new(&result.name)
                     };
 
-                    let _card = egui::Frame::group(ui.style())
+                    let card_response = egui::Frame::group(ui.style())
                         .fill(ui.visuals().extreme_bg_color)
                         .corner_radius(6.0)
                         .inner_margin(egui::Margin::symmetric(8, 6))
@@ -4495,6 +4515,14 @@ impl CDriveManagerApp {
                         })
                         .response
                         .on_hover_text(&result.path);
+                    // 卡片右键菜单
+                    path_context_menu(
+                        card_response,
+                        Path::new(&result.path),
+                        Path::new(&result.path),
+                        &result.name,
+                        status_message,
+                    );
                     ui.end_row();
                 }
             });
