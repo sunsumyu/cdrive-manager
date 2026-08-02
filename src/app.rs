@@ -141,6 +141,7 @@ pub struct CDriveManagerApp {
     search_results: Vec<crate::search_index::FileSearchResult>,
     search_in_progress: bool,
     search_page: usize,
+    search_view_mode: SearchViewMode,
     usn_handle: Option<crate::search_index::SearchIndexHandle>,
     build_handle: Option<crate::search_index::SearchIndexHandle>,
     /// In-flight asynchronous search. Replaced on each debounced query.
@@ -166,6 +167,15 @@ enum ResultTab {
 enum VisualizationMode {
     Treemap,
     Sunburst,
+}
+
+/// 搜索结果展示视图模式。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SearchViewMode {
+    /// 列表视图: 紧凑的表格(名称/路径/大小/类型)。
+    List,
+    /// 网格视图: 卡片式缩略展示(名称 + 类型 + 大小)。
+    Grid,
 }
 
 /// AI 审核结果的分类筛选。
@@ -529,6 +539,7 @@ impl CDriveManagerApp {
             search_results: Vec::new(),
             search_in_progress: false,
             search_page: 0,
+            search_view_mode: SearchViewMode::List,
             usn_handle: None,
             build_handle: None,
             search_handle: None,
@@ -4294,6 +4305,17 @@ impl CDriveManagerApp {
                 self.perform_search();
                 self.search_page = 0;
             }
+            ui.separator();
+            // 视图模式切换: 列表 / 网格
+            ui.label("视图:");
+            let list_btn = egui::Button::new("☰ 列表").selected(self.search_view_mode == SearchViewMode::List);
+            if ui.add(list_btn).clicked() {
+                self.search_view_mode = SearchViewMode::List;
+            }
+            let grid_btn = egui::Button::new("▦ 网格").selected(self.search_view_mode == SearchViewMode::Grid);
+            if ui.add(grid_btn).clicked() {
+                self.search_view_mode = SearchViewMode::Grid;
+            }
             edit_response
         }).inner;
 
@@ -4352,55 +4374,129 @@ impl CDriveManagerApp {
         });
         ui.add_space(4.0);
 
+        let query_lower = self.search_query.to_ascii_lowercase();
+        let view_mode = self.search_view_mode;
         egui::ScrollArea::vertical()
             .id_salt("search_results_scroll")
+            .show(ui, |ui| match view_mode {
+                SearchViewMode::List => self.render_search_results_list(ui, page_results, &query_lower),
+                SearchViewMode::Grid => self.render_search_results_grid(ui, page_results, &query_lower),
+            });
+    }
+
+    /// 列表视图: 紧凑表格(名称/路径/大小/类型)。
+    fn render_search_results_list(
+        &self,
+        ui: &mut egui::Ui,
+        page_results: &[crate::search_index::FileSearchResult],
+        query_lower: &str,
+    ) {
+        egui::Grid::new("search_results_grid")
+            .striped(true)
+            .num_columns(4)
+            .spacing([12.0, 4.0])
             .show(ui, |ui| {
-                egui::Grid::new("search_results_grid")
-                    .striped(true)
-                    .num_columns(4)
-                    .spacing([12.0, 4.0])
-                    .show(ui, |ui| {
-                        // Header
-                        ui.label(RichText::new("名称").strong());
-                        ui.label(RichText::new("路径").strong());
-                        ui.label(RichText::new("大小").strong());
-                        ui.label(RichText::new("类型").strong());
-                        ui.end_row();
+                // Header
+                ui.label(RichText::new("名称").strong());
+                ui.label(RichText::new("路径").strong());
+                ui.label(RichText::new("大小").strong());
+                ui.label(RichText::new("类型").strong());
+                ui.end_row();
 
-                        for result in page_results {
-                            let query_lower = self.search_query.to_ascii_lowercase();
-
-                            // Name with highlighting
-                            ui.horizontal(|ui| {
-                                let name_label = if result.name.to_ascii_lowercase().contains(&query_lower) {
-                                    // Simple highlight: make matching text bold and blue
-                                    RichText::new(&result.name)
-                                        .strong()
-                                        .color(egui::Color32::from_rgb(100, 180, 255))
-                                } else {
-                                    RichText::new(&result.name)
-                                };
-                                ui.add(egui::Label::new(name_label).sense(egui::Sense::click()));
-                            });
-
-                            // Path with hover
-                            ui.label(result.parent_path.clone()).on_hover_text(&result.path);
-
-                            // Size
-                            ui.label(format::bytes(result.size));
-
-                            // Type
-                            if result.is_directory {
-                                ui.label("📁 目录");
-                            } else if !result.extension.is_empty() {
-                                ui.label(format!("📄 .{}", result.extension));
-                            } else {
-                                ui.label("📄 文件");
-                            }
-
-                            ui.end_row();
-                        }
+                for result in page_results {
+                    // Name with highlighting
+                    ui.horizontal(|ui| {
+                        let name_label = if result.name.to_ascii_lowercase().contains(query_lower) {
+                            // Simple highlight: make matching text bold and blue
+                            RichText::new(&result.name)
+                                .strong()
+                                .color(egui::Color32::from_rgb(100, 180, 255))
+                        } else {
+                            RichText::new(&result.name)
+                        };
+                        ui.add(egui::Label::new(name_label).sense(egui::Sense::click()));
                     });
+
+                    // Path with hover
+                    ui.label(result.parent_path.clone()).on_hover_text(&result.path);
+
+                    // Size
+                    ui.label(format::bytes(result.size));
+
+                    // Type
+                    if result.is_directory {
+                        ui.label("📁 目录");
+                    } else if !result.extension.is_empty() {
+                        ui.label(format!("📄 .{}", result.extension));
+                    } else {
+                        ui.label("📄 文件");
+                    }
+
+                    ui.end_row();
+                }
+            });
+    }
+
+    /// 网格视图: 卡片式展示(名称 + 类型 + 大小 + 路径悬浮提示)。
+    fn render_search_results_grid(
+        &self,
+        ui: &mut egui::Ui,
+        page_results: &[crate::search_index::FileSearchResult],
+        query_lower: &str,
+    ) {
+        const CARD_W: f32 = 180.0;
+        let available_w = ui.available_width().max(200.0);
+        let cols = ((available_w + 12.0) / (CARD_W + 12.0)).floor().max(1.0) as usize;
+
+        egui::Grid::new("search_results_grid_cards")
+            .spacing([12.0, 12.0])
+            .num_columns(cols)
+            .show(ui, |ui| {
+                for result in page_results {
+                    let icon = if result.is_directory {
+                        "📁"
+                    } else if !result.extension.is_empty() {
+                        "📄"
+                    } else {
+                        "📃"
+                    };
+
+                    // 卡片: 圆角背景 + 内容
+                    let name_rich = if result.name.to_ascii_lowercase().contains(query_lower) {
+                        RichText::new(&result.name)
+                            .strong()
+                            .color(egui::Color32::from_rgb(100, 180, 255))
+                    } else {
+                        RichText::new(&result.name)
+                    };
+
+                    let _card = egui::Frame::group(ui.style())
+                        .fill(ui.visuals().extreme_bg_color)
+                        .corner_radius(6.0)
+                        .inner_margin(egui::Margin::symmetric(8, 6))
+                        .show(ui, |ui| {
+                            ui.set_width(CARD_W);
+                            ui.horizontal(|ui| {
+                                ui.label(icon);
+                                ui.label(name_rich);
+                            });
+                            ui.add_space(2.0);
+                            ui.horizontal(|ui| {
+                                let size_text = if result.is_directory {
+                                    "目录".to_owned()
+                                } else {
+                                    format::bytes(result.size)
+                                };
+                                ui.label(RichText::new(size_text).small().weak());
+                                if !result.is_directory && !result.extension.is_empty() {
+                                    ui.label(RichText::new(format!(".{}", result.extension)).small().weak());
+                                }
+                            });
+                        })
+                        .response
+                        .on_hover_text(&result.path);
+                    ui.end_row();
+                }
             });
     }
 
