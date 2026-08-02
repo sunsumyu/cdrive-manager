@@ -2278,7 +2278,7 @@ impl CDriveManagerApp {
                                     ui.label("搜索：");
                                     ui.add(
                                         egui::TextEdit::singleline(&mut self.search_query)
-                                            .hint_text("输入关键词"),
+                                            .hint_text("关键词 / ext:pdf / size:>10MB"),
                                     );
                                 });
                                 ui.horizontal(|ui| {
@@ -4288,14 +4288,30 @@ impl CDriveManagerApp {
                     }
                 }
             }
+            ui.separator();
+            // 重建 tantivy 索引
+            let can_rebuild = self.stats.is_some() && self.build_handle.is_none();
+            if ui
+                .add_enabled(can_rebuild, egui::Button::new("重建索引"))
+                .on_hover_text("使用最近一次扫描结果重新构建搜索索引")
+                .clicked()
+            {
+                if let Some(stats) = &self.stats {
+                    self.build_handle =
+                        Some(crate::search_index::spawn_build_index(Arc::clone(stats)));
+                }
+            }
+            if self.build_handle.is_some() {
+                ui.spinner();
+            }
         });
         ui.add_space(8.0);
 
         let response = ui.horizontal(|ui| {
             ui.label("搜索：");
             let edit = egui::TextEdit::singleline(&mut self.search_query)
-                .hint_text("输入文件名或路径关键词（支持模糊匹配）")
-                .desired_width(400.0);
+                .hint_text("关键词 / 短语 / ext:pdf / size:>10MB / dm:today / regex:...")
+                .desired_width(460.0);
             let edit_response = ui.add(edit);
             if !self.search_query.is_empty() {
                 if ui.button("清空").clicked() {
@@ -4337,19 +4353,46 @@ impl CDriveManagerApp {
             }
         }
 
-        ui.add_space(8.0);
+        ui.add_space(4.0);
+
+        // 查询语法帮助
+        egui::CollapsingHeader::new("查询语法")
+            .default_open(false)
+            .show(ui, |ui| {
+                ui.add_space(2.0);
+                let help_lines = [
+                    "• 关键词: report (匹配名称/路径, 多个词默认 AND)",
+                    "• 短语: \"annual report\" (精确短语)",
+                    "• 扩展名: ext:pdf,doc",
+                    "• 大小: size:>10MB, size:1KB-10MB",
+                    "• 修改日期: dm:today, dm:>2024-01-01",
+                    "• 路径: path:Downloads",
+                    "• 正则: regex:^Report-\\d{4}",
+                    "• 布尔: AND / OR / NOT, 括号分组 (report OR 报表) NOT old",
+                ];
+                for line in help_lines {
+                    ui.label(RichText::new(line).small().weak());
+                }
+                ui.add_space(2.0);
+            });
+
+        ui.add_space(4.0);
 
         if self.search_query.trim().is_empty() {
             // 空查询状态：展示全部文件/目录
             if self.search_results.is_empty() && !self.search_in_progress {
-                ui.label(RichText::new("输入关键词搜索文件，或留空查看全部").small().weak());
+                ui.label(
+                    RichText::new("输入关键词即时搜索，支持 ext:/size:/dm:/path:/regex: 等高级语法。")
+                        .small()
+                        .weak(),
+                );
                 return;
             }
             // 继续渲染结果（全部文件列表）
         }
 
         if self.search_results.is_empty() && !self.search_in_progress {
-            ui.label("没有找到匹配的文件。");
+            ui.label("没有找到匹配的文件，试试调整关键词或查看上方查询语法。");
             return;
         }
 
@@ -4530,6 +4573,16 @@ impl CDriveManagerApp {
 
     fn perform_search(&mut self) {
         let query = self.search_query.trim().to_string();
+        if query.is_empty() {
+            // 空查询：清空结果并停止进行中的搜索（避免误触全量导出）。
+            self.search_results.clear();
+            self.search_in_progress = false;
+            self.search_last_input = None;
+            if let Some(h) = self.search_handle.take() {
+                h.cancel();
+            }
+            return;
+        }
         if query.len() < 2 {
             self.search_results.clear();
             self.search_in_progress = false;
@@ -4581,6 +4634,56 @@ impl CDriveManagerApp {
             if self.search_handle.is_some() {
                 ctx.request_repaint();
             }
+        }
+
+        // 排空索引构建事件：Finished/Error 后释放 build_handle，恢复“重建索引”按钮。
+        if self.build_handle.is_some() {
+            self.poll_build_events(ctx);
+        }
+    }
+
+    /// Drain the index-build channel; drops the handle once the build finishes.
+    fn poll_build_events(&mut self, ctx: &egui::Context) {
+        let Some(handle) = self.build_handle.as_ref() else {
+            return;
+        };
+        let mut done = false;
+        while let Ok(event) = handle.receiver.try_recv() {
+            match event {
+                crate::search_index::SearchIndexEvent::Building { root_key, total_files } => {
+                    self.status_message = format!(
+                        "正在构建搜索索引：{} 个文件（根目录 {}）",
+                        total_files, root_key
+                    );
+                }
+                crate::search_index::SearchIndexEvent::Finished {
+                    root_key,
+                    total_entries,
+                } => {
+                    self.status_message = format!(
+                        "搜索索引构建完成：{} 条记录（根目录 {}）",
+                        total_entries, root_key
+                    );
+                    done = true;
+                }
+                crate::search_index::SearchIndexEvent::Updated { root_key, changes } => {
+                    self.status_message = format!(
+                        "正在构建搜索索引：已处理 {} 条（根目录 {}）",
+                        changes, root_key
+                    );
+                }
+                crate::search_index::SearchIndexEvent::Error(e) => {
+                    self.status_message = format!("搜索索引构建失败：{}", e);
+                    done = true;
+                }
+            }
+        }
+        if done {
+            self.build_handle = None;
+            ctx.request_repaint();
+        } else if handle.receiver.is_empty() && self.build_handle.is_some() {
+            // 仍在构建中：保持 UI 刷新。
+            ctx.request_repaint();
         }
     }
 
