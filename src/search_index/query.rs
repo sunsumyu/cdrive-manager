@@ -10,7 +10,7 @@
 //! - 正则: regex:^Report-\d{4}
 //! - 布尔: AND, OR, NOT, 括号分组
 
-use chrono::{Datelike, NaiveDate, Timelike};
+use chrono::{Datelike, NaiveDate};
 use tantivy::schema::Schema;
 use tantivy::query::{
     AllQuery, BooleanQuery, FuzzyTermQuery, Occur, Query, RangeQuery,

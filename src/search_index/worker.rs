@@ -13,7 +13,7 @@ use crossbeam_channel::{Receiver, unbounded};
 
 use crate::model::ScanStats;
 use crate::search_index::indexer::{FileSearchResult, SearchIndexer};
-use crate::search_index::usn_journal::{spawn_usn_listener, UsnEvent, UsnListenerConfig};
+use crate::search_index::usn_journal::{spawn_usn_listener, UsnListenerConfig};
 
 /// Events reported by the search index worker.
 #[derive(Debug, Clone)]

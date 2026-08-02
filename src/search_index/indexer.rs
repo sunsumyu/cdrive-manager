@@ -6,7 +6,7 @@ use std::path::Path;
 use std::sync::{Arc, RwLock};
 use anyhow::{Context, Result};
 use tantivy::{
-    collector::TopDocs, doc, DocAddress,
+    collector::TopDocs, doc,
     directory::MmapDirectory,
     query::{Occur, TermQuery},
     schema::document::TantivyDocument,
@@ -19,7 +19,7 @@ use crate::search_index::query::{compile_query, parse_query};
 use crate::search_index::schema::{create_schema, index_directory, FieldId};
 use crate::search_index::usn_journal::UsnEvent;
 
-/// 搜索结果(与旧 API 兼容)。
+/// 单个文件搜索命中结果。
 #[derive(Debug, Clone)]
 pub struct FileSearchResult {
     pub name: String,
