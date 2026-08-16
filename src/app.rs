@@ -4396,13 +4396,16 @@ impl CDriveManagerApp {
             return;
         }
 
-        // Pagination
-        const PAGE_SIZE: usize = 100;
+        // Pagination — 网格视图每页更少，避免大卡片一页只显示几个
+        let page_size = match self.search_view_mode {
+            SearchViewMode::List => 100,
+            SearchViewMode::Grid => 30,
+        };
         let total = self.search_results.len();
-        let total_pages = (total + PAGE_SIZE - 1) / PAGE_SIZE;
-        let current_page = self.search_page.min(total_pages - 1);
-        let start = current_page * PAGE_SIZE;
-        let end = (start + PAGE_SIZE).min(total);
+        let total_pages = (total + page_size - 1) / page_size;
+        let current_page = self.search_page.min(total_pages.saturating_sub(1));
+        let start = current_page * page_size;
+        let end = (start + page_size).min(total);
         let page_results = &self.search_results[start..end];
 
         ui.horizontal(|ui| {
@@ -4539,18 +4542,25 @@ impl CDriveManagerApp {
                         .inner_margin(egui::Margin::symmetric(8, 6))
                         .show(ui, |ui| {
                             ui.set_width(CARD_W);
+                            // 名称行: 图标 + 名称
                             ui.horizontal(|ui| {
                                 ui.label(icon);
                                 ui.label(name_rich);
                             });
+                            // 路径行: 父目录 (截断显示)
+                            ui.label(
+                                RichText::new(&result.parent_path)
+                                    .small()
+                                    .weak(),
+                            ).on_hover_text(&result.path);
                             ui.add_space(2.0);
+                            // 底部行: 大小 + 类型
                             ui.horizontal(|ui| {
-                                let size_text = if result.is_directory {
-                                    "目录".to_owned()
+                                if result.is_directory {
+                                    ui.label(RichText::new("目录").small().weak());
                                 } else {
-                                    format::bytes(result.size)
-                                };
-                                ui.label(RichText::new(size_text).small().weak());
+                                    ui.label(RichText::new(format::bytes(result.size)).small().weak());
+                                }
                                 if !result.is_directory && !result.extension.is_empty() {
                                     ui.label(RichText::new(format!(".{}", result.extension)).small().weak());
                                 }
