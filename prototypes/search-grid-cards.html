@@ -1,0 +1,453 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>搜索结果网格卡片布局原型</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { font-family: 'Segoe UI', system-ui, sans-serif; background: #1a1d23; color: #e0e0e0; min-height: 100vh; }
+
+  /* ─── Header ─── */
+  .header { background: #252830; padding: 12px 20px; border-bottom: 1px solid #333; }
+  .header h1 { font-size: 16px; font-weight: 600; }
+  .header .subtitle { font-size: 12px; color: #888; margin-top: 4px; }
+  .search-bar { display: flex; gap: 8px; margin-top: 8px; }
+  .search-bar input { flex: 1; background: #1a1d23; border: 1px solid #444; border-radius: 6px; padding: 8px 12px; color: #fff; font-size: 14px; }
+  .search-bar input:focus { border-color: #6c8cff; outline: none; }
+  .stats { display: flex; gap: 16px; margin-top: 8px; font-size: 12px; color: #888; }
+
+  /* ─── Grid Container ─── */
+  .grid-container { padding: 20px; }
+  .grid-label { font-size: 13px; color: #6c8cff; font-weight: 600; margin-bottom: 12px; text-transform: uppercase; letter-spacing: 0.5px; }
+
+  /* ═══════════════════════════════════════════════
+     VARIANT A: Compact Info Grid
+     极简信息卡片, 紧凑布局, 文件类型图标 + 名称为核心
+     ═══════════════════════════════════════════════ */
+  .variant-a .grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(160px, 1fr));
+    gap: 8px;
+  }
+  .variant-a .card {
+    background: #252830;
+    border: 1px solid #333;
+    border-radius: 8px;
+    padding: 12px;
+    cursor: pointer;
+    transition: all 0.15s;
+    position: relative;
+  }
+  .variant-a .card:hover {
+    border-color: #6c8cff;
+    background: #2a2e38;
+  }
+  .variant-a .card .icon {
+    font-size: 28px;
+    margin-bottom: 6px;
+    display: block;
+  }
+  .variant-a .card .name {
+    font-size: 13px;
+    font-weight: 500;
+    line-height: 1.3;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .variant-a .card .meta {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-top: 6px;
+    font-size: 11px;
+    color: #888;
+  }
+  .variant-a .card .ext-badge {
+    background: #333;
+    padding: 1px 5px;
+    border-radius: 3px;
+    font-size: 10px;
+    text-transform: uppercase;
+  }
+  .variant-a .card .size-badge {
+    font-size: 11px;
+    color: #aaa;
+  }
+  .variant-a .card.dir .name { color: #6c8cff; }
+
+  /* ═══════════════════════════════════════════════
+     VARIANT B: Visual File Cards
+     大卡片, 大图标, 完整路径, 底部元数据栏
+     ═══════════════════════════════════════════════ */
+  .variant-b .grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+    gap: 12px;
+  }
+  .variant-b .card {
+    background: #252830;
+    border-radius: 10px;
+    overflow: hidden;
+    cursor: pointer;
+    transition: all 0.15s;
+    border: 1px solid transparent;
+  }
+  .variant-b .card:hover {
+    border-color: #6c8cff;
+    transform: translateY(-2px);
+    box-shadow: 0 4px 12px rgba(0,0,0,0.3);
+  }
+  .variant-b .card .card-body {
+    padding: 16px;
+    text-align: center;
+  }
+  .variant-b .card .icon {
+    font-size: 40px;
+    display: block;
+    margin-bottom: 10px;
+  }
+  .variant-b .card .name {
+    font-size: 14px;
+    font-weight: 600;
+    line-height: 1.3;
+    margin-bottom: 4px;
+    word-break: break-all;
+    display: -webkit-box;
+    -webkit-line-clamp: 2;
+    -webkit-box-orient: vertical;
+    overflow: hidden;
+  }
+  .variant-b .card .path {
+    font-size: 11px;
+    color: #666;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .variant-b .card .card-footer {
+    background: #1e2028;
+    padding: 8px 16px;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    font-size: 12px;
+    color: #888;
+  }
+  .variant-b .card.dir .name { color: #6c8cff; }
+  .variant-b .card .ext-tag {
+    background: #333;
+    padding: 2px 6px;
+    border-radius: 4px;
+    font-size: 10px;
+  }
+
+  /* ═══════════════════════════════════════════════
+     VARIANT C: Accent Sidebar Cards
+     左侧彩色边条按扩展名区分, 紧凑水平信息流
+     ═══════════════════════════════════════════════ */
+  .variant-c .grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+    gap: 10px;
+  }
+  .variant-c .card {
+    background: #252830;
+    border-radius: 8px;
+    display: flex;
+    overflow: hidden;
+    cursor: pointer;
+    transition: all 0.15s;
+    border: 1px solid #333;
+  }
+  .variant-c .card:hover {
+    border-color: #555;
+    background: #2a2e38;
+  }
+  .variant-c .card .accent {
+    width: 4px;
+    flex-shrink: 0;
+  }
+  .variant-c .card .accent.pdf { background: #e74c3c; }
+  .variant-c .card .accent.xlsx { background: #27ae60; }
+  .variant-c .card .accent.txt { background: #888; }
+  .variant-c .card .accent.doc { background: #3498db; }
+  .variant-c .card .accent.img { background: #e67e22; }
+  .variant-c .card .accent.dir { background: #6c8cff; }
+  .variant-c .card .accent.other { background: #555; }
+  .variant-c .card .card-content {
+    flex: 1;
+    padding: 10px 12px;
+    min-width: 0;
+  }
+  .variant-c .card .card-top {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+  .variant-c .card .icon { font-size: 20px; flex-shrink: 0; }
+  .variant-c .card .name {
+    font-size: 13px;
+    font-weight: 500;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    flex: 1;
+  }
+  .variant-c .card .card-bottom {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    margin-top: 4px;
+    font-size: 11px;
+    color: #888;
+  }
+  .variant-c .card .path {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    flex: 1;
+  }
+  .variant-c .card.dir .name { color: #6c8cff; }
+
+  /* ─── Bottom Switcher ─── */
+  .switcher {
+    position: fixed;
+    bottom: 20px;
+    left: 50%;
+    transform: translateX(-50%);
+    background: #333;
+    border: 1px solid #555;
+    border-radius: 12px;
+    padding: 8px 16px;
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    box-shadow: 0 4px 20px rgba(0,0,0,0.5);
+    z-index: 100;
+    user-select: none;
+  }
+  .switcher button {
+    background: none;
+    border: none;
+    color: #ccc;
+    font-size: 18px;
+    cursor: pointer;
+    padding: 4px 8px;
+    border-radius: 4px;
+    transition: background 0.15s;
+  }
+  .switcher button:hover { background: #444; }
+  .switcher .label {
+    font-size: 13px;
+    color: #aaa;
+    min-width: 200px;
+    text-align: center;
+  }
+  .switcher .label strong { color: #6c8cff; }
+
+  /* ─── Variant description ─── */
+  .desc {
+    background: #1e2028;
+    border: 1px solid #333;
+    border-radius: 8px;
+    padding: 12px 16px;
+    margin: 0 20px 12px;
+    font-size: 12px;
+    color: #aaa;
+    line-height: 1.5;
+  }
+  .desc strong { color: #6c8cff; }
+</style>
+</head>
+<body>
+
+<div class="header">
+  <h1>搜索结果 — 网格卡片布局原型</h1>
+  <div class="subtitle">3 个截然不同的卡片变体，通过底部栏切换比较</div>
+  <div class="search-bar">
+    <input type="text" value="report" placeholder="输入关键词搜索..." id="searchInput">
+  </div>
+  <div class="stats">
+    <span>📁 找到 9 个结果</span>
+    <span>|</span>
+    <span>当前视图: <strong id="viewLabel">A</strong></span>
+  </div>
+</div>
+
+<div id="descArea" class="desc"></div>
+<div class="grid-container" id="gridArea"></div>
+
+<div class="switcher">
+  <button onclick="prev()" title="上一个变体 (←)">&larr;</button>
+  <div class="label" id="switcherLabel"></div>
+  <button onclick="next()" title="下一个变体 (→)">&rarr;</button>
+</div>
+
+<script>
+// ─── Mock Data ───
+const FILES = [
+  { name: "report.pdf", path: "C:\\Users\\Docs\\report.pdf", parent: "C:\\Users\\Docs", extension: "pdf", size: 1048576, is_directory: false },
+  { name: "data.xlsx", path: "C:\\Users\\Docs\\data.xlsx", parent: "C:\\Users\\Docs", extension: "xlsx", size: 2048, is_directory: false },
+  { name: "notes.txt", path: "C:\\Users\\Docs\\sub\\notes.txt", parent: "C:\\Users\\Docs\\sub", extension: "txt", size: 64, is_directory: false },
+  { name: "Downloads", path: "C:\\Users\\Downloads", parent: "C:\\Users", extension: "", size: 0, is_directory: true },
+  { name: "presentation.pptx", path: "C:\\Users\\Docs\\presentation.pptx", parent: "C:\\Users\\Docs", extension: "pptx", size: 5242880, is_directory: false },
+  { name: "photo.jpg", path: "C:\\Users\\Photos\\photo.jpg", parent: "C:\\Users\\Photos", extension: "jpg", size: 3145728, is_directory: false },
+  { name: "readme.md", path: "C:\\Projects\\readme.md", parent: "C:\\Projects", extension: "md", size: 1024, is_directory: false },
+  { name: "Projects", path: "C:\\Users\\Projects", parent: "C:\\Users", extension: "", size: 0, is_directory: true },
+  { name: "config.json", path: "C:\\Projects\\config.json", parent: "C:\\Projects", extension: "json", size: 512, is_directory: false },
+];
+
+function formatBytes(b) {
+  if (b === 0) return "—";
+  if (b < 1024) return b + " B";
+  if (b < 1048576) return (b / 1024).toFixed(1) + " KB";
+  if (b < 1073741824) return (b / 1048576).toFixed(1) + " MB";
+  return (b / 1073741824).toFixed(1) + " GB";
+}
+
+function fileIcon(f) {
+  if (f.is_directory) return "📁";
+  const e = f.extension.toLowerCase();
+  if (e === "pdf") return "📕";
+  if (e === "xlsx" || e === "csv") return "📊";
+  if (e === "txt" || e === "md") return "📝";
+  if (["jpg","jpeg","png","gif","bmp","webp","svg"].includes(e)) return "🖼️";
+  if (["doc","docx"].includes(e)) return "📄";
+  if (["pptx","ppt"].includes(e)) return "📑";
+  if (["json","js","ts","rs","py","go","c","cpp","h"].includes(e)) return "⚙️";
+  if (["mp3","wav","flac","aac"].includes(e)) return "🎵";
+  if (["mp4","avi","mkv","mov"].includes(e)) return "🎬";
+  if (["zip","tar","gz","rar","7z"].includes(e)) return "📦";
+  return "📃";
+}
+
+function accentClass(f) {
+  if (f.is_directory) return "dir";
+  const e = f.extension.toLowerCase();
+  if (e === "pdf") return "pdf";
+  if (["xlsx","csv"].includes(e)) return "xlsx";
+  if (["txt","md"].includes(e)) return "txt";
+  if (["doc","docx","pptx","ppt"].includes(e)) return "doc";
+  if (["jpg","jpeg","png","gif","bmp","webp","svg"].includes(e)) return "img";
+  return "other";
+}
+
+// ─── Variants ───
+const variants = [
+  {
+    key: "A",
+    name: "紧凑信息网格",
+    desc: "<strong>紧凑信息网格</strong> — 极简卡片，文件类型图标+名称为核心，底部一行显示扩展名标签和大小。适合快速浏览大量文件，每屏可显示最多结果。信息密度最高。",
+    render(container) {
+      let html = '<div class="grid">';
+      for (const f of FILES) {
+        const dirCls = f.is_directory ? " dir" : "";
+        const extBadge = f.is_directory ? "" : `<span class="ext-badge">${f.extension}</span>`;
+        html += `
+          <div class="card${dirCls}" title="${f.path}">
+            <span class="icon">${fileIcon(f)}</span>
+            <div class="name">${f.name}</div>
+            <div class="meta">
+              ${extBadge}
+              <span class="size-badge">${f.is_directory ? "目录" : formatBytes(f.size)}</span>
+            </div>
+          </div>`;
+      }
+      html += '</div>';
+      container.innerHTML = html;
+    }
+  },
+  {
+    key: "B",
+    name: "视觉大卡片",
+    desc: "<strong>视觉大卡片</strong> — 大图标居中，名称 2 行截断，路径显示在下方。底部元数据栏显示大小和扩展名。适合文件较少时突出每个文件的视觉辨识度。悬停有上浮+阴影效果。",
+    render(container) {
+      let html = '<div class="grid">';
+      for (const f of FILES) {
+        const dirCls = f.is_directory ? " dir" : "";
+        const extTag = f.is_directory ? "" : `<span class="ext-tag">.${f.extension}</span>`;
+        html += `
+          <div class="card${dirCls}" title="${f.path}">
+            <div class="card-body">
+              <span class="icon">${fileIcon(f)}</span>
+              <div class="name">${f.name}</div>
+              <div class="path">${f.parent}</div>
+            </div>
+            <div class="card-footer">
+              <span>${f.is_directory ? "目录" : formatBytes(f.size)}</span>
+              ${extTag}
+            </div>
+          </div>`;
+      }
+      html += '</div>';
+      container.innerHTML = html;
+    }
+  },
+  {
+    key: "C",
+    name: "彩色侧边条",
+    desc: "<strong>彩色侧边条</strong> — 左侧 4px 彩色竖条按扩展名区分（红色=PDF，绿色=Excel，蓝色=Word，橙色=图片）。紧凑水平信息流，文件图标+名称+路径+大小在一行内展示。适合需要一眼区分文件类型的场景。",
+    render(container) {
+      let html = '<div class="grid">';
+      for (const f of FILES) {
+        const cls = accentClass(f);
+        html += `
+          <div class="card" title="${f.path}">
+            <div class="accent ${cls}"></div>
+            <div class="card-content">
+              <div class="card-top">
+                <span class="icon">${fileIcon(f)}</span>
+                <span class="name${f.is_directory ? '" style="color:#6c8cff' : ''}">${f.name}</span>
+              </div>
+              <div class="card-bottom">
+                <span class="path">${f.parent}</span>
+                <span style="flex-shrink:0">${f.is_directory ? "目录" : formatBytes(f.size)}</span>
+              </div>
+            </div>
+          </div>`;
+      }
+      html += '</div>';
+      container.innerHTML = html;
+    }
+  }
+];
+
+// ─── Switcher Logic ───
+let current = 0;
+
+function render() {
+  const v = variants[current];
+  document.getElementById("viewLabel").textContent = v.key;
+  document.getElementById("descArea").innerHTML = v.desc;
+  document.getElementById("switcherLabel").innerHTML = `<strong>${v.key}</strong> — ${v.name}`;
+  v.render(document.getElementById("gridArea"));
+  // Update URL
+  const url = new URL(window.location);
+  url.searchParams.set("variant", v.key);
+  window.history.replaceState({}, "", url);
+}
+
+function next() { current = (current + 1) % variants.length; render(); }
+function prev() { current = (current - 1 + variants.length) % variants.length; render(); }
+
+// Keyboard navigation
+document.addEventListener("keydown", (e) => {
+  if (e.target.tagName === "INPUT" || e.target.tagName === "TEXTAREA") return;
+  if (e.key === "ArrowRight") next();
+  if (e.key === "ArrowLeft") prev();
+});
+
+// Initialize from URL
+const params = new URLSearchParams(window.location);
+const initVariant = params.get("variant")?.toUpperCase();
+if (initVariant) {
+  const idx = variants.findIndex(v => v.key === initVariant);
+  if (idx >= 0) current = idx;
+}
+
+render();
+</script>
+</body>
+</html>
