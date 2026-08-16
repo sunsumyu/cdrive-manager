@@ -411,6 +411,11 @@ const DEFAULT_DUPLICATE_MIN_SIZE_BYTES: u64 = 1024;
 /// responsive while the user is still typing by avoiding a search per press.
 const SEARCH_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(150);
 
+/// 搜索视图模式偏好（0=列表, 1=网格），使用 thread_local 跨帧持久化。
+thread_local! {
+    static SEARCH_VIEW_MODE: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
+}
+
 impl CDriveManagerApp {
     pub fn new(_cc: &eframe::CreationContext<'_>) -> Self {
         #[cfg(windows)]
@@ -2274,26 +2279,16 @@ impl CDriveManagerApp {
                         egui::CollapsingHeader::new("搜索")
                             .default_open(true)
                             .show(ui, |ui| {
-                                ui.horizontal(|ui| {
-                                    ui.label("搜索：");
-                                    ui.add(
-                                        egui::TextEdit::singleline(&mut self.search_query)
-                                            .hint_text("关键词 / ext:pdf / size:>10MB"),
-                                    );
-                                });
-                                ui.horizontal(|ui| {
-                                    if ui.button("清空").clicked() {
-                                        self.search_query.clear();
-                                        self.search_results.clear();
-                                        self.search_page = 0;
-                                    }
-                                    if ui.button("搜索").clicked() {
-                                        self.perform_search();
-                                        self.search_page = 0;
-                                    }
-                                });
+                                ui.label(
+                                    RichText::new("点击「搜索」标签页使用全文搜索")
+                                        .small()
+                                        .weak(),
+                                );
                                 if !self.search_results.is_empty() {
-                                    ui.label(format!("找到 {} 个结果", self.search_results.len()));
+                                    ui.label(format!(
+                                        "当前结果: {} 条",
+                                        self.search_results.len()
+                                    ));
                                 }
                             });
 
@@ -4325,15 +4320,17 @@ impl CDriveManagerApp {
                 self.search_page = 0;
             }
             ui.separator();
-            // 视图模式切换: 列表 / 网格
+            // 视图模式切换: 列表 / 网格 (使用静态变量持久化偏好)
             ui.label("视图:");
             let list_btn = egui::Button::new("☰ 列表").selected(self.search_view_mode == SearchViewMode::List);
             if ui.add(list_btn).clicked() {
                 self.search_view_mode = SearchViewMode::List;
+                SEARCH_VIEW_MODE.with(|v| v.set(0));
             }
             let grid_btn = egui::Button::new("▦ 网格").selected(self.search_view_mode == SearchViewMode::Grid);
             if ui.add(grid_btn).clicked() {
                 self.search_view_mode = SearchViewMode::Grid;
+                SEARCH_VIEW_MODE.with(|v| v.set(1));
             }
             edit_response
         }).inner;
@@ -6089,6 +6086,14 @@ impl eframe::App for CDriveManagerApp {
         self.poll_deletion_events(ctx);
         self.poll_organizer_events(ctx);
         self.poll_search_events(ctx);
+        // 从静态变量加载搜索视图偏好
+        let saved_mode = SEARCH_VIEW_MODE.with(|v| v.get());
+        if saved_mode != 0 {
+            self.search_view_mode = match saved_mode {
+                1 => SearchViewMode::Grid,
+                _ => SearchViewMode::List,
+            };
+        }
         self.draw_top_bar(ctx);
         self.draw_bottom_status_bar(ctx);
         self.draw_mft_elevation_dialog(ctx);
